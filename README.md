@@ -1,6 +1,6 @@
-# LootScope v1.0.0 - Loot Drop Tracker for Ashita v4.30
+# LootScope v1.0.0 - Loot Drop Tracker for Ashita v4.3
 
-Loot drop tracker for Ashita v4.30 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
+Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
 
 ---
 
