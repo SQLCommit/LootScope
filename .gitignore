@@ -1,0 +1,18 @@
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+
+# Per-character settings
+settings/
+
+# Debug logs
+*.log
+
+# Screenshots and temp files
+*.png
+*.jpg
+*.tmp
+
+# Export files
+exports/
