@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.0.0 - SQLite3 Persistence Layer
+    LootScope v1.1.1 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +10,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.0.0
+    Version: 1.1.1
 ]]--
 
 require 'common';
@@ -37,10 +37,17 @@ db._batch_start = 0;
 local FLUSH_INTERVAL = 1.0;   -- seconds between forced commits
 local FLUSH_THRESHOLD = 20;   -- ops before forced commit
 
--- Cache dirty flags
-db.kills_dirty = true;
-db.drops_dirty = true;
-db.stats_dirty = true;
+-- Per-cache dirty flags (each consumer only clears its own flag)
+db.kills_dirty = true;          -- legacy: consumed by UI to detect any kill mutation
+db.drops_dirty = true;          -- legacy: consumed by UI to detect any drop mutation
+db.stats_dirty = true;          -- consumed by UI + analysis to detect stat mutations
+db.recent_drops_dirty = true;   -- get_recent_drops
+db.recent_feed_dirty = true;    -- get_recent_feed
+db.mob_stats_dirty = true;      -- get_mob_stats
+db.all_mob_stats_dirty = true;  -- get_all_mob_stats
+db.chest_stats_dirty = true;    -- get_chest_stats
+db.chest_events_cache_dirty = true;  -- get_recent_chest_events
+db.htbf_breakdown_dirty = true;      -- get_htbf_breakdown
 
 -- In-memory caches
 db.recent_drops_cache = nil;
@@ -53,7 +60,7 @@ db.all_mob_stats_cache_key = nil;
 db.zone_list_cache = nil;
 db.spawn_stats_cache = {};
 db.spawn_item_cache = {};
-db.missed_zone_cache = {};
+
 db.chest_events_cache = nil;
 db.chest_events_limit = 0;
 db.chest_events_dirty = true;
@@ -67,8 +74,7 @@ function db.init(base_path, char_folder)
     if (db.conn ~= nil) then return true; end  -- already initialized
     if (db._init_failed) then return false; end
 
-    -- Per-character subdirectory: config/addons/lootscope/<CharName>_<ServerId>/
-    -- Matches Ashita's settings library folder convention.
+    -- Per-character subdirectory matching Ashita's settings folder convention
     db.char_name = char_folder;
     local char_dir = base_path .. '\\' .. char_folder;
     ashita.fs.create_directory(char_dir);
@@ -85,10 +91,15 @@ function db.init(base_path, char_folder)
             -- Only migrate if new DB doesn't already exist
             local new_f = io.open(new_db_path, 'r');
             if (new_f == nil) then
-                os.rename(old_db_path, new_db_path);
-                -- Also move WAL/SHM companion files if they exist
-                pcall(os.rename, old_db_path .. '-wal', new_db_path .. '-wal');
-                pcall(os.rename, old_db_path .. '-shm', new_db_path .. '-shm');
+                local ok, err = os.rename(old_db_path, new_db_path);
+                if (ok) then
+                    -- Also move WAL/SHM companion files if they exist
+                    pcall(os.rename, old_db_path .. '-wal', new_db_path .. '-wal');
+                    pcall(os.rename, old_db_path .. '-shm', new_db_path .. '-shm');
+                else
+                    -- Rename failed — fall back to old path
+                    new_db_path = old_db_path;
+                end
             else
                 new_f:close();
             end
@@ -108,10 +119,7 @@ function db.init(base_path, char_folder)
         return false;
     end
 
-    -- WAL mode for concurrent read safety, busy_timeout for rare write contention
-    -- (e.g. if two addons in same process somehow race — defensive measure).
-    -- Wrap schema creation and migrations in pcall — a corrupt DB should degrade
-    -- gracefully rather than crash the addon.
+    -- WAL mode + busy_timeout for safety; pcall so a corrupt DB degrades gracefully
     local schema_ok, schema_err = pcall(function()
         db.conn:exec('PRAGMA journal_mode=WAL;');
         db.conn:exec('PRAGMA foreign_keys=ON;');
@@ -149,8 +157,9 @@ function db.init(base_path, char_folder)
             CREATE INDEX IF NOT EXISTS idx_kills_ts ON kills(timestamp);
             CREATE INDEX IF NOT EXISTS idx_kills_sid ON kills(mob_server_id);
             CREATE INDEX IF NOT EXISTS idx_kills_src ON kills(source_type);
+            CREATE INDEX IF NOT EXISTS idx_kills_content ON kills(content_type, zone_id);
             CREATE INDEX IF NOT EXISTS idx_drops_item ON drops(item_id);
-            CREATE INDEX IF NOT EXISTS idx_drops_kill ON drops(kill_id);
+            CREATE INDEX IF NOT EXISTS idx_drops_kill_item ON drops(kill_id, item_id);
         ]]);
 
         -- Migration: check existing kills columns in a single pass
@@ -189,13 +198,13 @@ function db.init(base_path, char_folder)
             db.conn:exec('ALTER TABLE kills ADD COLUMN is_distant INTEGER DEFAULT 0;');
         end
 
-        -- Migration: add mob_server_id index if missing
-        local has_sid_idx = false;
-        for row in db.conn:nrows("PRAGMA index_list(kills)") do
-            if (row.name == 'idx_kills_sid') then has_sid_idx = true; break; end
+        if (not kills_has.bf_name) then
+            db.conn:exec("ALTER TABLE kills ADD COLUMN bf_name TEXT DEFAULT '';");
+            db.conn:exec('ALTER TABLE kills ADD COLUMN bf_difficulty INTEGER DEFAULT 0;');
         end
-        if (not has_sid_idx) then
-            db.conn:exec('CREATE INDEX IF NOT EXISTS idx_kills_sid ON kills(mob_server_id);');
+
+        if (not kills_has.content_type) then
+            db.conn:exec("ALTER TABLE kills ADD COLUMN content_type TEXT DEFAULT '';");
         end
 
         -- Migration: check existing drops columns in a single pass
@@ -211,8 +220,35 @@ function db.init(base_path, char_folder)
             db.conn:exec("ALTER TABLE drops ADD COLUMN player_action INTEGER DEFAULT 0;");
         end
 
-        -- Migration: add missed_kills table for tracking distant party kills
-        -- (msg_id=37 "too far from battle") where mob identity is unknown
+        if (not drops_has.drop_order) then
+            db.conn:exec("ALTER TABLE drops ADD COLUMN drop_order INTEGER DEFAULT -1;");
+        end
+
+        -- Migration: unify Dynamis + Dynamis [D] into single 'Dynamis' content_type
+        local needs_dyn_rename = false;
+        for row in db.conn:nrows("SELECT 1 FROM kills WHERE content_type = 'Dynamis [D]' LIMIT 1") do
+            needs_dyn_rename = true;
+        end
+        if (needs_dyn_rename) then
+            db.conn:exec("UPDATE kills SET content_type = 'Dynamis' WHERE content_type = 'Dynamis [D]';");
+        end
+        local needs_dyn_backfill = false;
+        for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (39,40,41,42,134,135,185,186,187,188) LIMIT 1") do
+            needs_dyn_backfill = true;
+        end
+        if (needs_dyn_backfill) then
+            db.conn:exec([[
+                UPDATE kills SET content_type = 'Dynamis'
+                WHERE COALESCE(content_type, '') = ''
+                  AND zone_id IN (39, 40, 41, 42, 134, 135, 185, 186, 187, 188);
+            ]]);
+        end
+
+        -- Migration: composite idx_drops_kill_item (subsumes old idx_drops_kill)
+        db.conn:exec("DROP INDEX IF EXISTS idx_drops_kill;");
+        db.conn:exec("CREATE INDEX IF NOT EXISTS idx_drops_kill_item ON drops(kill_id, item_id);");
+
+        -- Migration: missed_kills table (distant party kills with no mob identity)
         db.conn:exec([[
             CREATE TABLE IF NOT EXISTS missed_kills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,9 +300,7 @@ function db.init(base_path, char_folder)
         for row in db.conn:nrows('SELECT COUNT(*) as c FROM missed_kills') do db._missed_kill_count = row.c; end
         for row in db.conn:nrows('SELECT COUNT(*) as c FROM chest_events') do db._chest_event_count = row.c; end
 
-        -- Close stale battlefield sessions (older than 4 hours).
-        -- If the addon crashed during a zone change, end_battlefield_session() never ran,
-        -- leaving orphaned rows with exited_at IS NULL that would poison future reconnects.
+        -- Close stale battlefield sessions (orphaned by crash/reload, older than 4h)
         local stale_cutoff = os_time() - (4 * 60 * 60);
         local stale_stmt = db.conn:prepare('UPDATE battlefield_sessions SET exited_at = entered_at WHERE exited_at IS NULL AND entered_at < ?');
         if (stale_stmt ~= nil) then
@@ -299,7 +333,14 @@ local function invalidate_all()
     db.kills_dirty = true;
     db.drops_dirty = true;
     db.stats_dirty = true;
+    db.recent_drops_dirty = true;
+    db.recent_feed_dirty = true;
+    db.mob_stats_dirty = true;
+    db.all_mob_stats_dirty = true;
     db.chest_events_dirty = true;
+    db.chest_events_cache_dirty = true;
+    db.chest_stats_dirty = true;
+    db.htbf_breakdown_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.mob_stats_cache = {};
@@ -308,15 +349,20 @@ local function invalidate_all()
     db.zone_list_cache = nil;
     db.spawn_stats_cache = {};
     db.spawn_item_cache = {};
-    db.missed_zone_cache = {};
+    
     db.chest_events_cache = nil;
     db.chest_stats_cache = nil;
+    db.htbf_breakdown_cache = {};
 end
 
 -- Kill recorded: invalidates kill-related caches + stats
 local function invalidate_kills()
     db.kills_dirty = true;
     db.stats_dirty = true;
+    db.recent_feed_dirty = true;
+    db.mob_stats_dirty = true;
+    db.all_mob_stats_dirty = true;
+    db.htbf_breakdown_dirty = true;
     db.recent_feed_cache = nil;
     db.all_mob_stats_cache = nil;
     db.all_mob_stats_cache_key = nil;
@@ -324,12 +370,18 @@ local function invalidate_kills()
     db.spawn_stats_cache = {};
     db.spawn_item_cache = {};
     db.zone_list_cache = nil;
+    db.htbf_breakdown_cache = {};
 end
 
 -- Drop recorded: invalidates drop-related caches + stats
 local function invalidate_drops()
     db.drops_dirty = true;
     db.stats_dirty = true;
+    db.recent_drops_dirty = true;
+    db.recent_feed_dirty = true;
+    db.mob_stats_dirty = true;
+    db.all_mob_stats_dirty = true;
+    db.htbf_breakdown_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.all_mob_stats_cache = nil;
@@ -342,6 +394,11 @@ end
 local function invalidate_drop_status()
     db.drops_dirty = true;
     db.stats_dirty = true;
+    db.recent_drops_dirty = true;
+    db.recent_feed_dirty = true;
+    db.mob_stats_dirty = true;
+    db.all_mob_stats_dirty = true;
+    db.htbf_breakdown_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.mob_stats_cache = {};
@@ -365,6 +422,8 @@ local function begin_batch()
     end
 end
 
+local _commit_warn_logged = false;
+
 local function maybe_commit()
     if (not db._in_transaction) then return; end
     db._batch_count = db._batch_count + 1;
@@ -372,6 +431,17 @@ local function maybe_commit()
         local ok = pcall(db.conn.exec, db.conn, 'COMMIT');
         if (ok) then
             db._in_transaction = false;
+            _commit_warn_logged = false;
+        else
+            -- Reset batch counters so next cycle retries after a fresh threshold
+            db._batch_count = 0;
+            db._batch_start = os.clock();
+            if (not _commit_warn_logged) then
+                _commit_warn_logged = true;
+                local chat = require 'chat';
+                print(chat.header('lootscope'):append(chat.error(
+                    'DB commit delayed (busy lock). Data is safe but buffered.')));
+            end
         end
     end
 end
@@ -412,8 +482,9 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
         INSERT INTO kills (mob_name, mob_server_id, zone_id, zone_name, th_level, source_type,
                            vana_weekday, vana_hour, moon_phase, moon_percent, timestamp,
                            killer_id, killer_name, th_action_type, th_action_id, weather,
-                           battlefield, level_cap, is_distant)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           battlefield, level_cap, is_distant,
+                           bf_name, bf_difficulty, content_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ]]);
     if (stmt == nil) then maybe_commit(); return nil; end
     stmt:bind_values(
@@ -426,42 +497,77 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
         ki.th_action_type or 0, ki.th_action_id or 0,
         vi.weather or -1,
         ki.battlefield, ki.level_cap,
-        ki.is_distant or 0
+        ki.is_distant or 0,
+        ki.bf_name or '', ki.bf_difficulty or 0,
+        ki.content_type or ''
     );
-    stmt:step();
+    local rc = stmt:step();
     stmt:finalize();
+    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    local rowid = db.conn:last_insert_rowid();
 
     db._kill_count = db._kill_count + 1;
     invalidate_kills();
     maybe_commit();
 
-    return db.conn:last_insert_rowid();
+    return rowid;
+end
+
+-- Patch a kill record when 0x0029 defeat arrives after 0x00D2 fallback created it.
+-- Clears is_distant flag and adds killer/TH metadata that the fallback path lacks.
+function db.patch_kill_on_defeat(kill_id, killer_id, killer_name, th_level, th_action_type, th_action_id)
+    if (db.conn == nil or kill_id == nil) then return; end
+
+    begin_batch();
+
+    local stmt = db.conn:prepare([[
+        UPDATE kills SET is_distant = 0,
+            killer_id = ?, killer_name = ?,
+            th_level = ?, th_action_type = ?, th_action_id = ?
+        WHERE id = ? AND is_distant = 1
+    ]]);
+    if (stmt == nil) then maybe_commit(); return; end
+    stmt:bind_values(
+        killer_id or 0, killer_name or '',
+        th_level or 0, th_action_type or 0, th_action_id or 0,
+        kill_id
+    );
+    stmt:step();
+    stmt:finalize();
+
+    if (db.conn:changes() > 0) then
+        invalidate_kills();
+    end
+
+    maybe_commit();
 end
 
 -------------------------------------------------------------------------------
 -- Drop Recording
 -------------------------------------------------------------------------------
 
-function db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, won)
+function db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, won, drop_order)
     if (db.conn == nil or kill_id == nil) then return nil; end
 
     begin_batch();
 
     local now = os_time();
     local stmt = db.conn:prepare([[
-        INSERT INTO drops (kill_id, pool_slot, item_id, item_name, quantity, won, lot_value, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        INSERT INTO drops (kill_id, pool_slot, item_id, item_name, quantity, won, lot_value, drop_order, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
     ]]);
     if (stmt == nil) then maybe_commit(); return nil; end
-    stmt:bind_values(kill_id, pool_slot, item_id, item_name, quantity or 1, won or 0, now);
-    stmt:step();
+    stmt:bind_values(kill_id, pool_slot, item_id, item_name, quantity or 1, won or 0, drop_order or -1, now);
+    local rc = stmt:step();
     stmt:finalize();
+    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    local rowid = db.conn:last_insert_rowid();
 
     db._drop_count = db._drop_count + 1;
     invalidate_drops();
     maybe_commit();
 
-    return db.conn:last_insert_rowid();
+    return rowid;
 end
 
 -------------------------------------------------------------------------------
@@ -525,8 +631,9 @@ function db.update_kill_mob_name(kill_id, mob_name)
     stmt:finalize();
 
     invalidate_kills();
-    -- Also invalidate drops cache since get_recent_drops JOINs kills for mob_name
+    -- Also invalidate drops (JOINs kills for mob_name)
     db.drops_dirty = true;
+    db.recent_drops_dirty = true;
     db.recent_drops_cache = nil;
     maybe_commit();
 end
@@ -568,16 +675,21 @@ function db.get_recent_drops(limit)
     if (db.conn == nil) then return T{}; end
 
     limit = limit or 100;
-    if (not db.drops_dirty and db.recent_drops_cache ~= nil and db.recent_drops_limit == limit) then
+    if (not db.recent_drops_dirty and db.recent_drops_cache ~= nil and db.recent_drops_limit == limit) then
         return db.recent_drops_cache;
     end
 
     local results = T{};
     local stmt = db.conn:prepare([[
-        SELECT d.*, COALESCE(k.battlefield, k.mob_name) AS mob_name, k.zone_name, k.zone_id, k.th_level, k.source_type,
+        SELECT d.*,
+               CASE WHEN k.source_type = 3 THEN COALESCE(k.battlefield, k.mob_name) ELSE k.mob_name END AS mob_name,
+               k.zone_name, k.zone_id, k.th_level, k.source_type,
                k.timestamp as kill_ts,
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
-               k.weather, k.killer_name
+               k.weather, k.killer_name,
+               k.bf_name, k.bf_difficulty,
+               COALESCE(k.battlefield, '') as battlefield,
+               COALESCE(k.content_type, '') as content_type
         FROM drops d
         JOIN kills k ON d.kill_id = k.id
         ORDER BY d.id DESC
@@ -592,7 +704,7 @@ function db.get_recent_drops(limit)
 
     db.recent_drops_cache = results;
     db.recent_drops_limit = limit;
-    db.drops_dirty = false;
+    db.recent_drops_dirty = false;
 
     return results;
 end
@@ -601,32 +713,37 @@ function db.get_recent_feed(limit)
     if (db.conn == nil) then return T{}; end
 
     limit = limit or 100;
-    if (not db.drops_dirty and not db.kills_dirty and not db.chest_events_dirty
-        and db.recent_feed_cache ~= nil and db.recent_feed_limit == limit) then
+    if (not db.recent_feed_dirty and db.recent_feed_cache ~= nil and db.recent_feed_limit == limit) then
         return db.recent_feed_cache;
     end
 
     local results = T{};
     local stmt = db.conn:prepare([[
         SELECT 'drop' as feed_type, d.timestamp as ts,
-               COALESCE(k.battlefield, k.mob_name) as mob_name,
+               CASE WHEN k.source_type = 3 THEN COALESCE(k.battlefield, k.mob_name) ELSE k.mob_name END as mob_name,
                k.zone_name, k.zone_id, k.th_level, k.source_type,
                d.item_name, d.item_id, d.quantity, d.won, d.pool_slot, d.kill_id,
                d.lot_value, d.winner_name,
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
                k.weather, k.killer_name,
-               0 as container_type, 0 as chest_result, 0 as gil_amount
+               0 as container_type, 0 as chest_result, 0 as gil_amount,
+               k.bf_name, k.bf_difficulty,
+               COALESCE(k.battlefield, '') as battlefield,
+               COALESCE(k.content_type, '') as content_type
         FROM drops d
         JOIN kills k ON d.kill_id = k.id
         UNION ALL
         SELECT 'kill' as feed_type, k.timestamp as ts,
-               COALESCE(k.battlefield, k.mob_name) as mob_name,
+               k.mob_name,
                k.zone_name, k.zone_id, k.th_level, k.source_type,
                NULL, 0, 0, 0, -1, k.id,
                0, '',
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
                k.weather, k.killer_name,
-               0, 0, 0
+               0, 0, 0,
+               k.bf_name, k.bf_difficulty,
+               COALESCE(k.battlefield, '') as battlefield,
+               COALESCE(k.content_type, '') as content_type
         FROM kills k
         WHERE NOT EXISTS (SELECT 1 FROM drops d WHERE d.kill_id = k.id)
         UNION ALL
@@ -636,7 +753,10 @@ function db.get_recent_feed(limit)
                0, '',
                0, ce.vana_weekday, ce.vana_hour, ce.moon_phase, ce.moon_percent,
                ce.weather, '' as killer_name,
-               ce.container_type, ce.result, ce.gil_amount
+               ce.container_type, ce.result, ce.gil_amount,
+               '' as bf_name, 0 as bf_difficulty,
+               '' as battlefield,
+               '' as content_type
         FROM chest_events ce
         ORDER BY ts DESC, kill_id DESC
         LIMIT ?
@@ -650,18 +770,16 @@ function db.get_recent_feed(limit)
 
     db.recent_feed_cache = results;
     db.recent_feed_limit = limit;
-    db.kills_dirty = false;
-    db.drops_dirty = false;
-    db.chest_events_dirty = false;
+    db.recent_feed_dirty = false;
 
     return results;
 end
 
-function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
+function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_difficulty)
     if (db.conn == nil) then return nil; end
 
-    local key = (mob_name or '') .. '_' .. tostring(zone_id or 0) .. '_' .. tostring(source_filter or -1) .. '_' .. tostring(level_cap or 'nil');
-    if (not db.stats_dirty and db.mob_stats_cache[key] ~= nil) then
+    local key = (mob_name or '') .. '_' .. tostring(zone_id or 0) .. '_' .. tostring(source_filter or -1) .. '_' .. tostring(level_cap or 'nil') .. '_' .. tostring(bf_difficulty or 'nil');
+    if (not db.mob_stats_dirty and db.mob_stats_cache[key] ~= nil) then
         return db.mob_stats_cache[key];
     end
 
@@ -669,10 +787,18 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
 
     -- BCNM mode: match by battlefield name instead of mob_name
     local is_bcnm = (source_filter == 2);
+    local is_htbf = (source_filter == 3);
+    local is_content = (source_filter ~= nil and source_filter >= 4 and source_filter <= 7);
+    local is_all_bf = (source_filter == 8);
+    local is_all_inst = (source_filter == 9);
+    local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis' };
     local kill_query, item_query;
 
-    if (is_bcnm) then
-        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE COALESCE(battlefield, \'Unknown BCNM\') = ? AND zone_id = ? AND source_type = 3';
+    if (is_htbf) then
+        -- HTBF: match by bf_name + zone + bf_difficulty. level_cap param carries bf_difficulty.
+        local bf_name_expr = "COALESCE(NULLIF(bf_name, ''), COALESCE(battlefield, 'Unknown HTBF'))";
+        local k_bf_name_expr = "COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF'))";
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE ' .. bf_name_expr .. ' = ? AND zone_id = ? AND bf_difficulty = ?';
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
@@ -681,7 +807,21 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
                    SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3
+            WHERE ]] .. k_bf_name_expr .. [[ = ? AND k.zone_id = ? AND k.bf_difficulty = ?
+            GROUP BY d.item_id ORDER BY times_dropped DESC
+        ]];
+    elseif (is_bcnm) then
+        -- BCNM: must match get_all_mob_stats(2) which filters source_type=3 AND bf_difficulty=0
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE COALESCE(battlefield, \'Unknown BCNM\') = ? AND zone_id = ? AND source_type = 3 AND bf_difficulty = 0';
+        item_query = [[
+            SELECT d.item_id, d.item_name,
+                   COUNT(*) as times_dropped,
+                   SUM(d.quantity) as total_qty,
+                   SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+            FROM drops d
+            JOIN kills k ON d.kill_id = k.id
+            WHERE COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3 AND k.bf_difficulty = 0
         ]];
         -- Add level_cap filter if present
         if (level_cap ~= nil) then
@@ -692,8 +832,9 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
             item_query = item_query .. ' AND k.level_cap IS NULL';
         end
         item_query = item_query .. ' GROUP BY d.item_id ORDER BY times_dropped DESC';
-    else
-        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ?';
+    elseif (is_content) then
+        local ct = content_type_map[source_filter];
+        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') = '" .. ct .. "'";
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
@@ -702,7 +843,72 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
                    SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE k.mob_name = ? AND k.zone_id = ?
+            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') = ']] .. ct .. [['
+            GROUP BY d.item_id
+            ORDER BY times_dropped DESC
+        ]];
+    elseif (is_all_bf) then
+        -- All Battlefields: match by battlefield name + level_cap + bf_difficulty
+        local bf_expr = "COALESCE(NULLIF(bf_name, ''), COALESCE(battlefield, mob_name))";
+        local k_bf_expr = "COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name))";
+        local lc = level_cap or 0;
+        local bd = bf_difficulty or 0;
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE ' .. bf_expr .. ' = ? AND zone_id = ? AND COALESCE(level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(bf_difficulty, 0) = ' .. tostring(bd);
+        item_query = [[
+            SELECT d.item_id, d.item_name,
+                   COUNT(*) as times_dropped,
+                   SUM(d.quantity) as total_qty,
+                   SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+            FROM drops d
+            JOIN kills k ON d.kill_id = k.id
+            WHERE ]] .. k_bf_expr .. [[ = ? AND k.zone_id = ? AND COALESCE(k.level_cap, 0) = ]] .. tostring(lc) .. [[ AND COALESCE(k.bf_difficulty, 0) = ]] .. tostring(bd) .. [[
+
+            GROUP BY d.item_id
+            ORDER BY times_dropped DESC
+        ]];
+    elseif (is_all_inst) then
+        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+        item_query = [[
+            SELECT d.item_id, d.item_name,
+                   COUNT(*) as times_dropped,
+                   SUM(d.quantity) as total_qty,
+                   SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+            FROM drops d
+            JOIN kills k ON d.kill_id = k.id
+            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')
+            GROUP BY d.item_id
+            ORDER BY times_dropped DESC
+        ]];
+    elseif (source_filter == 1) then
+        -- Chest/Coffer: must match get_all_mob_stats(1) which filters source_type IN (1,2)
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND source_type IN (1, 2)';
+        item_query = [[
+            SELECT d.item_id, d.item_name,
+                   COUNT(*) as times_dropped,
+                   SUM(d.quantity) as total_qty,
+                   SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+            FROM drops d
+            JOIN kills k ON d.kill_id = k.id
+            WHERE k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2)
+            GROUP BY d.item_id
+            ORDER BY times_dropped DESC
+        ]];
+    else
+        -- Field (value 0): exclude content-tagged kills AND non-mob source types
+        -- Matches get_all_mob_stats() Field branch: source_type = 0
+        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND source_type = 0 AND COALESCE(content_type, '') = ''";
+        item_query = [[
+            SELECT d.item_id, d.item_name,
+                   COUNT(*) as times_dropped,
+                   SUM(d.quantity) as total_qty,
+                   SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+            FROM drops d
+            JOIN kills k ON d.kill_id = k.id
+            WHERE k.mob_name = ? AND k.zone_id = ? AND k.source_type = 0 AND COALESCE(k.content_type, '') = ''
             GROUP BY d.item_id
             ORDER BY times_dropped DESC
         ]];
@@ -711,10 +917,12 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
     -- Kill count (from kills table)
     local stmt = db.conn:prepare(kill_query);
     if (stmt == nil) then return result; end
-    if (is_bcnm and level_cap ~= nil) then
+    if (is_htbf) then
+        stmt:bind_values(mob_name, zone_id, level_cap);  -- level_cap = bf_difficulty for HTBF
+    elseif (is_bcnm and level_cap ~= nil) then
         stmt:bind_values(mob_name, zone_id, level_cap);
     else
-        stmt:bind_values(mob_name, zone_id);
+        stmt:bind_values(mob_name, zone_id);  -- is_all_bf: level_cap/bf_difficulty inlined in query
     end
     for row in stmt:nrows() do
         result.kills = row.c;
@@ -722,14 +930,13 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
     end
     stmt:finalize();
 
-    -- Chest/Coffer mode: add chest_events (failures + gil) as additional attempts.
-    -- "Treasure Chest" → container_type 1, "Treasure Coffer" → container_type 2.
+    -- Chest/Coffer mode: add chest_events as additional attempts
     if (source_filter == 1) then
         local ctype = nil;
         if (mob_name == 'Treasure Chest') then ctype = 1;
         elseif (mob_name == 'Treasure Coffer') then ctype = 2; end
         if (ctype ~= nil) then
-            -- Exclude illusions (result=4) from attempt count — illusions aren't real chests
+            -- Exclude illusions (result=4) from attempt count
             local ce_stmt = db.conn:prepare(
                 'SELECT COUNT(*) as c FROM chest_events WHERE zone_id = ? AND container_type = ? AND result != 4');
             if (ce_stmt ~= nil) then
@@ -750,20 +957,21 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
     -- Per-item breakdown
     local stmt2 = db.conn:prepare(item_query);
     if (stmt2 == nil) then return result; end
-    if (is_bcnm and level_cap ~= nil) then
+    if (is_htbf) then
+        stmt2:bind_values(mob_name, zone_id, level_cap);  -- level_cap = bf_difficulty for HTBF
+    elseif (is_bcnm and level_cap ~= nil) then
         stmt2:bind_values(mob_name, zone_id, level_cap);
     else
-        stmt2:bind_values(mob_name, zone_id);
+        stmt2:bind_values(mob_name, zone_id);  -- is_all_bf: level_cap/bf_difficulty inlined in query
     end
     local nearby_kills = result.kills - result.distant_kills;
     for row in stmt2:nrows() do
         local nearby_dropped = row.nearby_times_dropped or row.times_dropped;
         -- Primary rate: nearby kills only (unbiased)
         row.drop_rate = (nearby_kills > 0) and (nearby_dropped / nearby_kills) * 100 or 0;
-        -- Combined rate: all kills including distant (biased — distant kills are a self-selected sample with drops)
+        -- Combined rate: includes distant kills (biased — distant kills always have drops)
         row.combined_rate = (result.kills > 0) and (row.times_dropped / result.kills) * 100 or -1;
-        -- Gil (item_id 65535) is shown in the breakdown but excluded from
-        -- aggregate drop counts so it doesn't inflate item drop rates.
+        -- Gil (65535): shown in breakdown but excluded from aggregate counts
         if (row.item_id == 65535) then
             row.is_gil_drop = true;
             row.drop_rate = -1;  -- suppress % display
@@ -775,35 +983,52 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
     end
     stmt2:finalize();
 
-    -- Enhance mob gil entry with min/max/avg amount (same style as chest gil)
+    -- Enhance mob gil entry with min/max/avg amount
     for _, item in ipairs(result.items) do
         if (item.is_gil_drop and item.times_dropped > 0) then
             local gil_q;
-            if (is_bcnm) then
+            local gil_params;
+            if (is_htbf) then
+                local k_bf = "COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF'))";
+                gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND ' .. k_bf .. ' = ? AND k.zone_id = ? AND k.bf_difficulty = ?';
+                gil_params = { mob_name, zone_id, level_cap };
+            elseif (is_bcnm) then
                 gil_q = [[
                     SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil
                     FROM drops d JOIN kills k ON d.kill_id = k.id
-                    WHERE d.item_id = 65535 AND COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3
+                    WHERE d.item_id = 65535 AND COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3 AND k.bf_difficulty = 0
                 ]];
                 if (level_cap ~= nil) then
                     gil_q = gil_q .. ' AND k.level_cap = ?';
+                    gil_params = { mob_name, zone_id, level_cap };
                 else
                     gil_q = gil_q .. ' AND k.level_cap IS NULL';
+                    gil_params = { mob_name, zone_id };
                 end
+            elseif (is_content) then
+                local ct = content_type_map[source_filter];
+                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') = '" .. ct .. "'";
+                gil_params = { mob_name, zone_id };
+            elseif (is_all_bf) then
+                local k_bf = "COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name))";
+                local lc = level_cap or 0;
+                local bd = bf_difficulty or 0;
+                gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND ' .. k_bf .. ' = ? AND k.zone_id = ? AND COALESCE(k.level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(k.bf_difficulty, 0) = ' .. tostring(bd);
+                gil_params = { mob_name, zone_id };
+            elseif (is_all_inst) then
+                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+                gil_params = { mob_name, zone_id };
+            elseif (source_filter == 1) then
+                gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2)';
+                gil_params = { mob_name, zone_id };
             else
-                gil_q = [[
-                    SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil
-                    FROM drops d JOIN kills k ON d.kill_id = k.id
-                    WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ?
-                ]];
+                -- Field: exclude content-tagged kills
+                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND k.source_type = 0 AND COALESCE(k.content_type, '') = ''";
+                gil_params = { mob_name, zone_id };
             end
             local gs = db.conn:prepare(gil_q);
             if (gs ~= nil) then
-                if (is_bcnm and level_cap ~= nil) then
-                    gs:bind_values(mob_name, zone_id, level_cap);
-                else
-                    gs:bind_values(mob_name, zone_id);
-                end
+                gs:bind_values(unpack(gil_params));
                 for gr in gs:nrows() do
                     local avg = math.floor(item.total_qty / item.times_dropped);
                     local mn = gr.min_gil or 0;
@@ -820,8 +1045,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
         end
     end
 
-    -- Chest/Coffer mode: add chest event details (gil, failures) as synthetic "items"
-    -- so they appear in the expanded per-item breakdown alongside pool drops.
+    -- Chest/Coffer mode: add chest events as synthetic items in breakdown
     if (source_filter == 1) then
         local ctype = nil;
         if (mob_name == 'Treasure Chest') then ctype = 1;
@@ -879,6 +1103,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap)
     end
 
     db.mob_stats_cache[key] = result;
+    db.mob_stats_dirty = false;
     return result;
 end
 
@@ -887,7 +1112,7 @@ function db.get_all_mob_stats(source_filter)
 
     -- Cache key includes source_filter to avoid stale results across views
     local cache_key = tostring(source_filter or -1);
-    if (not db.stats_dirty and db.all_mob_stats_cache ~= nil
+    if (not db.all_mob_stats_dirty and db.all_mob_stats_cache ~= nil
         and db.all_mob_stats_cache_key == cache_key) then
         return db.all_mob_stats_cache;
     end
@@ -896,16 +1121,28 @@ function db.get_all_mob_stats(source_filter)
     local where_clause = '';
 
     if (source_filter == 0) then
-        where_clause = ' WHERE k.source_type = 0';
+        where_clause = " WHERE k.source_type = 0 AND COALESCE(k.content_type, '') = ''";
     elseif (source_filter == 1) then
         where_clause = ' WHERE k.source_type IN (1, 2)';
     elseif (source_filter == 2) then
-        where_clause = ' WHERE k.source_type = 3';
+        where_clause = ' WHERE k.source_type = 3 AND k.bf_difficulty = 0';
+    elseif (source_filter == 3) then
+        where_clause = ' WHERE k.bf_difficulty > 0';
+    elseif (source_filter == 4) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = 'Omen'";
+    elseif (source_filter == 5) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = 'Ambuscade'";
+    elseif (source_filter == 6) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = 'Sortie'";
+    elseif (source_filter == 7) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = 'Dynamis'";
+    elseif (source_filter == 8) then
+        where_clause = ' WHERE (k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0';
+    elseif (source_filter == 9) then
+        where_clause = " WHERE COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
     end
 
-    -- BCNM view: group by battlefield name instead of mob_name (all are "Armoury Crate")
-    -- Gil drops (item_id=65535) are excluded from drop_count/unique_items so they
-    -- don't inflate item drop rates.
+    -- BCNM/HTBF view: group by battlefield name; gil excluded from drop counts
     local query;
     if (source_filter == 2) then
         query = [[
@@ -920,6 +1157,39 @@ function db.get_all_mob_stats(source_filter)
             LEFT JOIN drops d ON d.kill_id = k.id
         ]] .. where_clause .. [[
             GROUP BY COALESCE(k.battlefield, 'Unknown BCNM'), k.zone_id, k.level_cap
+            ORDER BY kill_count DESC
+        ]];
+    elseif (source_filter == 3) then
+        -- HTBF view: group by bf_name + difficulty, include BOTH mob kills and crate drops
+        query = [[
+            SELECT COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF')) as mob_name,
+                   k.zone_name, k.zone_id, k.bf_difficulty,
+                   COUNT(DISTINCT k.id) as kill_count,
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
+                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
+                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
+                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+            FROM kills k
+            LEFT JOIN drops d ON d.kill_id = k.id
+        ]] .. where_clause .. [[
+            GROUP BY COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF')), k.zone_id, k.bf_difficulty
+            ORDER BY kill_count DESC
+        ]];
+    elseif (source_filter == 8) then
+        -- All Battlefields: group by battlefield name + level_cap + bf_difficulty
+        -- BCNMs have level_cap, HTBFs have bf_difficulty — both shown as separate columns
+        query = [[
+            SELECT COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name)) as mob_name,
+                   k.zone_name, k.zone_id, k.level_cap, k.bf_difficulty,
+                   COUNT(DISTINCT k.id) as kill_count,
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
+                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
+                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
+                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+            FROM kills k
+            LEFT JOIN drops d ON d.kill_id = k.id
+        ]] .. where_clause .. [[
+            GROUP BY COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name)), k.zone_id, k.level_cap, k.bf_difficulty
             ORDER BY kill_count DESC
         ]];
     else
@@ -946,8 +1216,7 @@ function db.get_all_mob_stats(source_filter)
     end
     stmt:finalize();
 
-    -- Chest/Coffer mode: add chest_events (failures + gil) as additional attempts.
-    -- Without this, kill_count only reflects item drops → drop rate is always ~100%.
+    -- Chest/Coffer mode: add chest_events as additional attempts
     if (source_filter == 1) then
         -- Build lookup: "mob_name|zone_id" → index in results
         local lookup = {};
@@ -958,7 +1227,7 @@ function db.get_all_mob_stats(source_filter)
         -- Map container_type to mob_name used in kills table
         local ctype_to_name = { [1] = 'Treasure Chest', [2] = 'Treasure Coffer' };
 
-        -- Exclude illusions (result=4) from attempt count — illusions aren't real chests
+        -- Exclude illusions (result=4) from attempt count
         local ce_stmt = db.conn:prepare([[
             SELECT zone_id, zone_name, container_type,
                    COUNT(*) as event_count,
@@ -1017,8 +1286,49 @@ function db.get_all_mob_stats(source_filter)
 
     db.all_mob_stats_cache = results;
     db.all_mob_stats_cache_key = cache_key;
-    db.stats_dirty = false;
+    db.all_mob_stats_dirty = false;
 
+    return results;
+end
+
+-------------------------------------------------------------------------------
+-- HTBF Difficulty Breakdown (per mob/zone, grouped by difficulty)
+-------------------------------------------------------------------------------
+
+-- Cache for HTBF breakdown data
+db.htbf_breakdown_cache = {};
+
+function db.get_htbf_breakdown(mob_name, zone_id)
+    if (db.conn == nil) then return nil; end
+
+    local key = (mob_name or '') .. '_' .. tostring(zone_id or 0);
+    if (not db.htbf_breakdown_dirty and db.htbf_breakdown_cache[key] ~= nil) then
+        return db.htbf_breakdown_cache[key];
+    end
+
+    local results = T{};
+    local stmt = db.conn:prepare([[
+        SELECT k.bf_difficulty, k.bf_name,
+               COUNT(DISTINCT k.id) as kill_count,
+               COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
+               COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items
+        FROM kills k
+        LEFT JOIN drops d ON d.kill_id = k.id
+        WHERE COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF')) = ? AND k.zone_id = ? AND k.source_type = 3
+              AND k.bf_difficulty > 0
+        GROUP BY k.bf_difficulty
+        ORDER BY k.bf_difficulty ASC
+    ]]);
+    if (stmt == nil) then return results; end
+    stmt:bind_values(mob_name, zone_id);
+    for row in stmt:nrows() do
+        row.avg_drops = row.kill_count > 0 and (row.drop_count / row.kill_count) or 0;
+        results:append(row);
+    end
+    stmt:finalize();
+
+    db.htbf_breakdown_cache[key] = results;
+    db.htbf_breakdown_dirty = false;
     return results;
 end
 
@@ -1043,34 +1353,15 @@ function db.record_missed_kill(zone_id, zone_name)
     local stmt = db.conn:prepare('INSERT INTO missed_kills (zone_id, zone_name, timestamp) VALUES (?, ?, ?)');
     if (stmt == nil) then maybe_commit(); return; end
     stmt:bind_values(zone_id, zone_name, os_time());
-    stmt:step();
+    local rc = stmt:step();
     stmt:finalize();
+    if (rc ~= sqlite3.DONE) then maybe_commit(); return; end
 
     db._missed_kill_count = db._missed_kill_count + 1;
-    db.missed_zone_cache = {};
-    -- Zone missed kills are informational only (no mob identity) — they don't
-    -- affect per-mob rate calculations, so no stats cache invalidation needed.
+    
+    -- Informational only (no mob identity) — no stats invalidation needed
 
     maybe_commit();
-end
-
-function db.get_missed_kills_for_zone(zone_id)
-    if (db.conn == nil) then return 0; end
-
-    if (db.missed_zone_cache[zone_id] ~= nil) then
-        return db.missed_zone_cache[zone_id];
-    end
-
-    local count = 0;
-    local stmt = db.conn:prepare('SELECT COUNT(*) as c FROM missed_kills WHERE zone_id = ?');
-    if (stmt ~= nil) then
-        stmt:bind_values(zone_id);
-        for row in stmt:nrows() do count = row.c; end
-        stmt:finalize();
-    end
-
-    db.missed_zone_cache[zone_id] = count;
-    return count;
 end
 
 -------------------------------------------------------------------------------
@@ -1224,8 +1515,22 @@ local function build_export_filters(filters)
         params[#params + 1] = f.zone_id;
     end
 
-    if (f.source_type_list ~= nil) then
-        -- Multi-value source filter (e.g. Chest + Coffer)
+    if (f.content_type ~= nil and f.content_type ~= '') then
+        conditions[#conditions + 1] = "COALESCE(k.content_type, '') = ?";
+        params[#params + 1] = f.content_type;
+    elseif (f.field_only) then
+        -- Field = mob kills with no instanced content
+        conditions[#conditions + 1] = "k.source_type = 0 AND COALESCE(k.content_type, '') = ''";
+    elseif (f.bf_all) then
+        -- All BF / BCNM: content_type='BCNM' catches mob kills + crate drops
+        conditions[#conditions + 1] = "COALESCE(k.content_type, '') = 'BCNM'";
+        if (f.bf_difficulty_eq ~= nil) then
+            conditions[#conditions + 1] = 'k.bf_difficulty = ?';
+            params[#params + 1] = f.bf_difficulty_eq;
+        end
+    elseif (f.htbf_only) then
+        conditions[#conditions + 1] = "COALESCE(k.content_type, '') = 'BCNM' AND k.bf_difficulty > 0";
+    elseif (f.source_type_list ~= nil) then
         local placeholders = {};
         for _, v in ipairs(f.source_type_list) do
             placeholders[#placeholders + 1] = '?';
@@ -1357,12 +1662,14 @@ end
 local function build_chest_event_union(filters)
     local f = filters or {};
 
-    -- Include chest events when: source is All (nil), Chest/Coffer list, or explicit Chest(1)/Coffer(2)
-    local is_all = (f.source_type == nil and f.source_type_list == nil);
+    -- Include chest events when source is All, Chest/Coffer list, or explicit Chest(1)/Coffer(2)
+    -- Exclude for Field/BF/HTBF/content_type filters (no chest events in those contexts)
+    local is_all = (f.source_type == nil and f.source_type_list == nil
+        and not f.field_only and not f.bf_all and not f.htbf_only
+        and (f.content_type == nil or f.content_type == ''));
     local is_chest_source = (f.source_type == 1 or f.source_type == 2);
     local is_chest_list = (f.source_type_list ~= nil);
     if (not is_all and not is_chest_source and not is_chest_list) then
-        -- Source is Mob or BCNM — no chest events
         return nil, {};
     end
 
@@ -1464,6 +1771,8 @@ local function build_chest_event_union(filters)
         .. ' 0 AS th_level, ce.container_type AS source_type,'
         .. ' ce.vana_weekday, ce.vana_hour, ce.moon_phase, ce.moon_percent,'
         .. " 0 AS killer_id, '' AS killer_name, 0 AS th_action_type, 0 AS th_action_id, ce.weather,"
+        .. " '' AS bf_name, 0 AS bf_difficulty, '' AS content_type,"
+        .. ' 0 AS is_distant, NULL AS level_cap,'
         .. " CASE ce.result"
         .. " WHEN 0 THEN 'Gil'"
         .. " WHEN 1 THEN 'Lockpick Failed'"
@@ -1499,6 +1808,9 @@ function db.get_filtered_export(filters, limit)
         .. ' k.zone_name, k.zone_id, k.th_level, k.source_type,'
         .. ' k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,'
         .. ' k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,'
+        .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
+        .. " COALESCE(k.content_type, '') AS content_type,"
+        .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
         .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
         .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
         .. ' d.timestamp AS drop_timestamp'
@@ -1686,21 +1998,29 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
         vi.weather or -1,
         now
     );
-    stmt:step();
+    local rc = stmt:step();
     stmt:finalize();
+    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    local rowid = db.conn:last_insert_rowid();
 
     db._chest_event_count = db._chest_event_count + 1;
     db.chest_events_dirty = true;
+    db.chest_events_cache_dirty = true;
+    db.chest_stats_dirty = true;
     db.chest_events_cache = nil;
     db.chest_stats_cache = nil;
-    -- Also invalidate feed + stats caches since chest events appear in Live Feed and Statistics
+    -- Also invalidate feed + stats (chest events appear in both)
+    db.recent_feed_dirty = true;
     db.recent_feed_cache = nil;
     db.kills_dirty = true;
     db.stats_dirty = true;
+    db.all_mob_stats_dirty = true;
+    db.mob_stats_dirty = true;
+    db.mob_stats_cache = {};
 
     maybe_commit();
 
-    return db.conn:last_insert_rowid();
+    return rowid;
 end
 
 -------------------------------------------------------------------------------
@@ -1711,7 +2031,7 @@ function db.get_recent_chest_events(limit)
     if (db.conn == nil) then return T{}; end
 
     limit = limit or 100;
-    if (not db.chest_events_dirty and db.chest_events_cache ~= nil and db.chest_events_limit == limit) then
+    if (not db.chest_events_cache_dirty and db.chest_events_cache ~= nil and db.chest_events_limit == limit) then
         return db.chest_events_cache;
     end
 
@@ -1728,20 +2048,19 @@ function db.get_recent_chest_events(limit)
 
     db.chest_events_cache = results;
     db.chest_events_limit = limit;
-    db.chest_events_dirty = false;
+    db.chest_events_cache_dirty = false;
     return results;
 end
 
 function db.get_chest_stats()
     if (db.conn == nil) then return T{}; end
 
-    if (db.chest_stats_cache ~= nil and not db.chest_events_dirty) then
+    if (db.chest_stats_cache ~= nil and not db.chest_stats_dirty) then
         return db.chest_stats_cache;
     end
 
     local results = T{};
-    -- total_events excludes illusions (result=4) — illusions aren't real chests.
-    -- fail_illusion is still queried separately for display but not counted in totals.
+    -- Illusions (result=4) excluded from totals but queried separately for display
     local stmt = db.conn:prepare([[
         SELECT zone_id, zone_name, container_type,
                SUM(CASE WHEN result != 4 THEN 1 ELSE 0 END) as total_events,
@@ -1767,6 +2086,7 @@ function db.get_chest_stats()
     stmt:finalize();
 
     db.chest_stats_cache = results;
+    db.chest_stats_dirty = false;
     return results;
 end
 
@@ -1821,6 +2141,9 @@ function db.stream_export_all(write_row)
                k.th_level, k.source_type, k.vana_weekday, k.vana_hour,
                k.moon_phase, k.moon_percent, k.timestamp AS k_timestamp,
                k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,
+               COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,
+               COALESCE(k.content_type, '') AS content_type,
+               COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,
                d.item_name, d.item_id, d.pool_slot, d.quantity,
                d.won, d.lot_value, d.timestamp AS d_timestamp,
                d.winner_id, d.winner_name, d.player_lot, d.player_action
@@ -1859,6 +2182,11 @@ function db.stream_export_all(write_row)
                 th_action_type  = row.th_action_type,
                 th_action_id    = row.th_action_id,
                 weather         = row.weather,
+                bf_name         = row.bf_name,
+                bf_difficulty   = row.bf_difficulty,
+                content_type    = row.content_type,
+                is_distant      = row.is_distant,
+                level_cap       = row.level_cap,
             };
         end
 
@@ -1897,6 +2225,9 @@ function db.stream_filtered_export(filters, write_row)
         .. ' k.zone_name, k.zone_id, k.th_level, k.source_type,'
         .. ' k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,'
         .. ' k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,'
+        .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
+        .. " COALESCE(k.content_type, '') AS content_type,"
+        .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
         .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
         .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
         .. ' d.timestamp AS drop_timestamp'

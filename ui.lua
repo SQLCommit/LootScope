@@ -1,10 +1,10 @@
 --[[
-    LootScope v1.0.0 - UI Module
-    ImGui dashboard with Live Feed, Statistics, Export, and Settings tabs.
-    Includes compact mode for minimal overlay.
+    LootScope v1.1.1 - UI Module
+    ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
+    and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.0.0
+    Version: 1.1.1
 ]]--
 
 require 'common';
@@ -29,6 +29,7 @@ local tostring = tostring;
 local db = nil;
 local tracker = nil;
 local s = nil;  -- settings reference
+local analysis = nil;  -- slot analysis module (may be nil if load failed)
 
 -- UI-local state
 local is_open = { true };
@@ -56,10 +57,12 @@ local stats_expanded_spawns = {};  -- [mob_key .. '_' .. server_id] = true if sp
 local stats_cache_data = nil;       -- cached filtered+sorted result
 local stats_cache_zone = -1;        -- zone filter when cache was built
 local stats_cache_dirty = true;     -- tracks if db.stats_dirty changed
-local stats_source_filter = 0;      -- 0=Mob, 1=Chest/Coffer, 2=BCNM
+local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst
+local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer
 local stats_cache_source = -1;      -- source filter when cache was built
 local stats_name_filter = nil;       -- name filter for BCNM/Chest-Coffer (nil = all)
 local stats_cache_name = nil;        -- name filter when cache was built
+local stats_detail_cache = {};       -- [row_key] -> { mob_stats, htbf_data, spawn_stats, spawn_items }
 
 -- Zone combo cache (shared by Export tab)
 local zone_combo_cache = '';
@@ -82,7 +85,7 @@ local ef = {
     show_preview    = { true },
     -- Kill filter widgets
     zone_idx        = { 0 },
-    source_idx      = { 0 },       -- 0=All, 1=Mob, 2=Chest, 3=Coffer, 4=BCNM
+    source_idx      = { 0 },       -- 0=All, 1=Mob, 2=Chest, 3=Coffer, 4=BCNM, 5=HTBF
     mob_buf         = { '' },
     mob_buf_size    = 128,
     th_min          = { 0 },
@@ -120,12 +123,9 @@ local ef = {
     player_action_combo = 'All\0Lotted\0Passed\0\0',
     player_action_map   = { [0]=nil, [1]=1, [2]=0 },
     PREVIEW_LIMIT   = 100,
-    -- UX 4: Active filter summary
     filter_summary  = '',
-    -- UX 7: Date validation error flags
     date_from_err   = false,
     date_to_err     = false,
-    -- Fix 3: Store last-applied filters for streaming export
     last_filters    = nil,
     -- Auto-update state
     auto_dirty      = false,
@@ -133,9 +133,72 @@ local ef = {
     text_edit_time  = 0,
 };
 
+-- Slot Analysis tab state — consolidated into one table (upvalue hygiene)
+local an = {
+    category        = 0,       -- same as stats: 0=Field, 1=BF, 2=Inst, 3=Chest
+    source_filter   = 0,
+    zone_filter     = -1,
+    name_filter     = nil,
+    mob_filter      = nil,     -- selected mob_name
+    mob_level_cap   = nil,     -- for BCNM/HTBF
+    effective_sf    = nil,     -- remapped source_filter for All BF entries (2=BCNM, 3=HTBF)
+    mob_idx         = { 0 },   -- combo selection index
+    result          = nil,     -- analysis.compute() output
+    mob_stats       = nil,     -- db.get_mob_stats() for selected mob
+    cache_dirty     = true,
+    analysis_inited = false,
+    ci_sort_col     = 0,
+    ci_sort_asc     = false,
+    co_sort_col     = 0,
+    co_sort_asc     = false,
+    -- Filter combo cache (reuses build_stats_filter pattern)
+    filter_combo    = { str = '', entries = nil, src = -1 },
+    -- Mob combo cache
+    mob_combo       = { str = '', mobs = nil, key = '' },
+};
+
 -- Reset confirmation input buffer
 local reset_confirm_buf = { '' };
 local reset_confirm_buf_size = 32;
+
+-- Reusable widget buffers (avoid per-frame table allocation in render functions)
+local stats_filter_idx = { 0 };
+local an_mob_sel = { 0 };
+local set_int_buf = { 0 };        -- Settings tab: SliderInt buffer
+local set_float_buf = { 0.0 };    -- Settings tab: SliderFloat buffer
+local set_bool_buf = { false };    -- Settings tab: Checkbox buffer
+
+-- Static sort key maps for sortable analysis tables (hoisted to avoid per-frame allocation)
+local ci_sort_keys = { 'item_name', 'drops', 'rate', 'ci_lower', 'ci_upper', 'ci_width', 'ci_width' };
+local co_sort_keys = { 'name_a', 'name_b', 'observed', 'expected', 'deviation', 'order_consistency' };
+
+-- Reset slot analysis filters when switching category (file scope to avoid per-frame closure)
+local function reset_an_filter(new_source)
+    an.source_filter = new_source;
+    an.cache_dirty = true;
+    an.zone_filter = -1;
+    an.name_filter = nil;
+    an.mob_filter = nil;
+    an.mob_level_cap = nil;
+    an.effective_sf = nil;
+    an.mob_idx[1] = 0;
+    an.result = nil;
+    an.mob_stats = nil;
+    an.ci_sort_col = 0;
+    an.ci_sort_asc = false;
+    an.co_sort_col = 0;
+    an.co_sort_asc = false;
+    an.mob_combo = { str = '', mobs = nil, key = '' };
+end
+
+-- Reset statistics filters when switching category (file scope to avoid per-frame closure)
+local function reset_stats_filter(new_source)
+    stats_source_filter = new_source;
+    stats_cache_dirty = true;
+    stats_expanded_mob = nil;
+    stats_zone_filter = -1;
+    stats_name_filter = nil;
+end
 
 -------------------------------------------------------------------------------
 -- Helpers
@@ -195,6 +258,18 @@ local COLOR_RED_MUTED   = { 1.0, 0.4, 0.4, 0.8 };
 local COLOR_BLUE_MUTED  = { 0.6, 0.8, 1.0, 0.7 };
 local COLOR_WARN        = { 1.0, 0.5, 0.0, 1.0 };
 local COLOR_ERR         = { 1.0, 0.3, 0.3, 1.0 };
+local COLOR_LIGHT_GRAY  = { 0.8, 0.8, 0.8, 1.0 };
+local COLOR_CONTENT     = { 0.5, 0.8, 1.0, 1.0 };
+local COLOR_GRAY        = { 0.7, 0.7, 0.7, 1.0 };
+
+-- HTBF difficulty badge colors
+local difficulty_colors = {
+    [1] = { 1.0, 0.3, 0.3, 1.0 },  -- VD (red)
+    [2] = { 1.0, 0.6, 0.2, 1.0 },  -- D (orange)
+    [3] = { 1.0, 1.0, 0.4, 1.0 },  -- N (yellow)
+    [4] = { 0.4, 1.0, 0.4, 1.0 },  -- E (green)
+    [5] = { 0.4, 0.8, 1.0, 1.0 },  -- VE (light blue)
+};
 
 local status_tips = {
     [ 1] = 'Got: Item obtained by a player.',
@@ -214,7 +289,7 @@ local feed_col_defs = {
     { key = 'time',       label = 'Time',    flags = FW,      width = 45,  tip = 'Real time the drop/kill occurred' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, or BCNM' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'qty',        label = 'Qty',     flags = FW,      width = 30,  tip = 'Quantity of the item dropped' },
     { key = 'th',         label = 'TH',      flags = FW,      width = 25,  tip = 'Treasure Hunter level active on the mob' },
@@ -236,7 +311,7 @@ local compact_col_defs = {
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, or BCNM' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
     { key = 'qty',        label = 'Qty',     flags = FW + DH, width = 25,  tip = 'Quantity of the item dropped' },
     { key = 'th',         label = 'TH',      flags = FW,      width = 22,  tip = 'Treasure Hunter level active on the mob' },
     { key = 'status',     label = 'Status',  flags = FW + DH, width = 30,  tip = 'Won, Lost, or still in pool' },
@@ -267,7 +342,7 @@ local export_col_defs = {
     { label = 'Mob SID', flags = EP_FW+EP_DSC+EP_DH,        width = 50,  id = 3,  tip = 'Server entity ID of the defeated mob' },
     { label = 'Zone',    flags = EP_FW+EP_ASC,              width = 90,  id = 4,  tip = 'Zone where the kill happened' },
     { label = 'ZoneID',  flags = EP_FW+EP_ASC+EP_DH,        width = 38,  id = 5,  tip = 'Numeric zone ID' },
-    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source: Mob, Chest, Coffer, or BCNM' },
+    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
     { label = 'TH',      flags = EP_FW+EP_DSC,              width = 25,  id = 7,  tip = 'Treasure Hunter level active on the mob' },
     { label = 'Killer',  flags = EP_FW+EP_ASC,              width = 75,  id = 8,  tip = 'Entity that dealt the killing blow' },
     { label = 'TH Act',  flags = EP_FW+EP_ASC+EP_DH,        width = 55,  id = 9,  tip = 'Action type that last procced TH (melee, ranged, spell, etc.)' },
@@ -277,16 +352,21 @@ local export_col_defs = {
     { label = 'Moon',    flags = EP_FW+EP_ASC,              width = 90,  id = 13, tip = 'Moon phase at time of kill' },
     { label = 'Moon%',   flags = EP_FW+EP_DSC,              width = 42,  id = 14, tip = 'Moon illumination percentage (0-100)' },
     { label = 'Weather', flags = EP_FW+EP_ASC,              width = 80,  id = 15, tip = 'Weather condition at time of kill' },
-    { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 16, tip = 'Item that appeared in the treasure pool' },
-    { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 17, tip = 'Numeric item ID from the game database' },
-    { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 18, tip = 'Quantity of the item dropped' },
-    { label = 'Lot',     flags = EP_FW+EP_DSC,              width = 30,  id = 19, tip = 'Winning lot value (0-999)' },
-    { label = 'Status',  flags = EP_FW+EP_DSC,              width = 40,  id = 20, tip = 'Won, Lost, Inv Full, Zoned, or Pending' },
-    { label = 'Win ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 45,  id = 21, tip = 'Server entity ID of the player who won the item' },
-    { label = 'Winner',  flags = EP_FW+EP_ASC,              width = 75,  id = 22, tip = 'Player who won the item' },
-    { label = 'P.Lot',   flags = EP_FW+EP_DSC+EP_DH,        width = 35,  id = 23, tip = 'Your lot value on this item' },
-    { label = 'P.Act',   flags = EP_FW+EP_DSC+EP_DH,        width = 32,  id = 24, tip = 'Your action: 1=Lotted, 0=Passed' },
-    { label = 'Drop At', flags = EP_FW+EP_DSC,              width = 55,  id = 25, tip = 'Time the drop appeared in the treasure pool' },
+    { label = 'BF Name', flags = EP_FW+EP_ASC+EP_DH,        width = 80,  id = 16, tip = 'Battlefield name (HTBF only)' },
+    { label = 'Diff',    flags = EP_FW+EP_ASC+EP_DH,        width = 30,  id = 17, tip = 'HTBF difficulty: VD, D, N, E, VE' },
+    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, Dynamis (Omen/Ambuscade/Sortie WIP)' },
+    { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 19, tip = 'Item that appeared in the treasure pool' },
+    { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 20, tip = 'Numeric item ID from the game database' },
+    { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 21, tip = 'Quantity of the item dropped' },
+    { label = 'Lot',     flags = EP_FW+EP_DSC,              width = 30,  id = 22, tip = 'Winning lot value (0-999)' },
+    { label = 'Status',  flags = EP_FW+EP_DSC,              width = 40,  id = 23, tip = 'Won, Lost, Inv Full, Zoned, or Pending' },
+    { label = 'Win ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 45,  id = 24, tip = 'Server entity ID of the player who won the item' },
+    { label = 'Winner',  flags = EP_FW+EP_ASC,              width = 75,  id = 25, tip = 'Player who won the item' },
+    { label = 'P.Lot',   flags = EP_FW+EP_DSC+EP_DH,        width = 35,  id = 26, tip = 'Your lot value on this item' },
+    { label = 'P.Act',   flags = EP_FW+EP_DSC+EP_DH,        width = 32,  id = 27, tip = 'Your action: 1=Lotted, 0=Passed' },
+    { label = 'Drop At', flags = EP_FW+EP_DSC,              width = 55,  id = 28, tip = 'Time the drop appeared in the treasure pool' },
+    { label = 'Distant',flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 29, tip = 'Distant kill: drops seen but no defeat message (biased sample)' },
+    { label = 'Lvl Cap',flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 30, tip = 'BCNM level cap (20/40/60/75 or uncapped)' },
 };
 
 -- Render header row with tooltips from col_defs[].tip
@@ -302,7 +382,7 @@ local function render_header_row(col_defs)
     end
 end
 
--- Shared zone combo builder (Perf 4)
+-- Shared zone combo builder
 local function get_zone_combo()
     local zones = db.get_zone_list();
     if (zones == zone_combo_zones) then
@@ -321,10 +401,11 @@ end
 -------------------------------------------------------------------------------
 -- Initialization
 -------------------------------------------------------------------------------
-function ui.init(db_ref, tracker_ref, settings_ref)
+function ui.init(db_ref, tracker_ref, settings_ref, analysis_ref)
     db = db_ref;
     tracker = tracker_ref;
     s = settings_ref;
+    analysis = analysis_ref;
     compact_mode = s.compact_mode or false;
 end
 
@@ -385,8 +466,7 @@ local function render_live_feed()
     local show_empty = (s ~= nil) and s.show_empty_kills;
     local show_gil   = (s == nil) or (s.show_gil_drops ~= false);
 
-    -- Always use the unified feed (includes kills, drops, AND chest events).
-    -- Filter client-side based on settings. Cached to avoid per-frame T{} allocation.
+    -- Unified feed (kills + drops + chest events), filtered client-side
     local raw_feed = db.get_recent_feed(limit);
     local feed;
     if (show_empty and show_gil) then
@@ -443,6 +523,7 @@ local function render_live_feed()
 
         local is_empty_kill = (row.feed_type == 'kill');
         local is_chest_event = (row.feed_type == 'chest');
+        local has_bf = (row.battlefield ~= nil and row.battlefield ~= '');
 
         -- Time (tooltip: Vana'diel time + moon + weather)
         imgui.TableNextColumn();
@@ -545,13 +626,30 @@ local function render_live_feed()
                 imgui.SetTooltip(tip);
             end
         else
+            local bf_diff = tonumber(row.bf_difficulty);
             local src_color = source_colors[row.source_type] or source_colors[0];
-            local src_label = tracker.get_source_label(row.source_type);
+            local src_label = tracker.get_source_label(row.source_type, bf_diff);
+            local ct = row.content_type or '';
             if (row.source_type ~= 0) then
                 imgui.TextColored(src_color, '[' .. src_label .. '] ');
                 imgui.SameLine(0, 0);
+            elseif (has_bf) then
+                -- Mob kill inside a BCNM/HTBF — show battlefield prefix
+                local bf_label = (bf_diff ~= nil and bf_diff > 0) and 'HTBF' or 'BCNM';
+                imgui.TextColored(source_colors[3], '[' .. bf_label .. '] ');
+                imgui.SameLine(0, 0);
+            elseif (ct ~= '') then
+                -- Content type badge (Omen, Sortie, Dynamis, Ambuscade)
+                imgui.TextColored(COLOR_CONTENT, '[' .. ct .. '] ');
+                imgui.SameLine(0, 0);
             end
             imgui.Text(row.mob_name or '');
+            -- HTBF difficulty badge (inline after mob name)
+            if (bf_diff ~= nil and bf_diff > 0) then
+                imgui.SameLine(0, 4);
+                local dc = difficulty_colors[bf_diff] or COLOR_GRAY;
+                imgui.TextColored(dc, '[' .. tracker.get_difficulty_label(bf_diff) .. ']');
+            end
             if imgui.IsItemHovered() then
                 local tip = row.mob_name or '';
                 if (row.mob_server_id ~= nil and row.mob_server_id > 0) then
@@ -559,6 +657,19 @@ local function render_live_feed()
                 end
                 if (row.zone_name ~= nil and row.zone_name ~= '') then
                     tip = tip .. '\nZone: ' .. row.zone_name;
+                end
+                if (has_bf) then
+                    tip = tip .. '\nBattlefield: ' .. row.battlefield;
+                end
+                if (bf_diff ~= nil and bf_diff > 0) then
+                    tip = tip .. '\nDifficulty: ' .. tracker.get_difficulty_full_label(bf_diff);
+                    local bf_name = row.bf_name;
+                    if (bf_name ~= nil and bf_name ~= '') then
+                        tip = tip .. '\nHTBF: ' .. bf_name;
+                    end
+                end
+                if (ct ~= '') then
+                    tip = tip .. '\nContent: ' .. ct;
                 end
                 imgui.SetTooltip(tip);
             end
@@ -577,8 +688,23 @@ local function render_live_feed()
             end
             imgui.TextColored(src_chest_color, tracker.get_container_label(row.container_type));
         else
-            local src_c = source_colors[row.source_type] or source_colors[0];
-            imgui.TextColored(src_c, tracker.get_source_label(row.source_type));
+            local bf_d = tonumber(row.bf_difficulty);
+            local src_c;
+            local src_l;
+            local row_ct = row.content_type or '';
+            if (row.source_type == 0 and has_bf) then
+                -- Mob kill inside battlefield: show BCNM/HTBF label
+                src_c = source_colors[3];
+                src_l = (bf_d ~= nil and bf_d > 0) and 'HTBF' or 'BCNM';
+            elseif (row.source_type == 0 and row_ct ~= '') then
+                -- Mob kill inside content zone: show content type
+                src_c = COLOR_CONTENT;
+                src_l = row_ct;
+            else
+                src_c = source_colors[row.source_type] or source_colors[0];
+                src_l = tracker.get_source_label(row.source_type, bf_d);
+            end
+            imgui.TextColored(src_c, src_l);
         end
 
         -- Item (colored by status, or "No Drop" for empty kills, or chest result)
@@ -725,7 +851,7 @@ end
 -------------------------------------------------------------------------------
 -- Tab 2: Statistics
 -------------------------------------------------------------------------------
-local function sort_stats(data, col, asc, is_bcnm, is_chest)
+local function sort_stats(data, col, asc, is_bcnm, is_chest, is_htbf)
     table.sort(data, function(a, b)
         local va, vb;
         if (col == 0) then
@@ -733,13 +859,15 @@ local function sort_stats(data, col, asc, is_bcnm, is_chest)
         elseif (col == 1) then
             va, vb = a.zone_name, b.zone_name;
         elseif (col == 2) then
-            if (is_bcnm) then
+            if (is_htbf) then
+                va, vb = (a.bf_difficulty or 0), (b.bf_difficulty or 0);
+            elseif (is_bcnm) then
                 va, vb = (a.level_cap or 999), (b.level_cap or 999);
             else
                 va, vb = a.kill_count, b.kill_count;
             end
         elseif (col == 3) then
-            if (is_bcnm) then
+            if (is_bcnm or is_htbf) then
                 va, vb = a.kill_count, b.kill_count;
             else
                 va, vb = a.unique_items, b.unique_items;
@@ -747,7 +875,7 @@ local function sort_stats(data, col, asc, is_bcnm, is_chest)
         elseif (col == 4) then
             if (is_chest) then
                 va, vb = (a.gil_count or 0), (b.gil_count or 0);
-            elseif (is_bcnm) then
+            elseif (is_bcnm or is_htbf) then
                 va, vb = a.unique_items, b.unique_items;
             else
                 va, vb = (a.unique_spawns or 0), (b.unique_spawns or 0);
@@ -758,6 +886,8 @@ local function sort_stats(data, col, asc, is_bcnm, is_chest)
             else
                 va, vb = a.avg_drops, b.avg_drops;
             end
+        elseif (col == 7) then
+            va, vb = (a.bf_difficulty or 0), (b.bf_difficulty or 0);
         else
             return false;
         end
@@ -803,7 +933,7 @@ local function build_stats_filter(source_filter)
             end
         end
         table.sort(entries, function(a, b) return a.label < b.label; end);
-    else
+    elseif (source_filter == 2) then
         -- BCNM: unique zone + name combos
         for _, row in ipairs(all_stats) do
             local key = tostring(row.zone_id) .. '_' .. (row.mob_name or '');
@@ -814,6 +944,29 @@ local function build_stats_filter(source_filter)
                     zone_id = row.zone_id,
                     name = row.mob_name,
                 });
+            end
+        end
+        table.sort(entries, function(a, b) return a.label < b.label; end);
+    elseif (source_filter == 3) then
+        -- HTBF: unique zone + bf_name combos
+        for _, row in ipairs(all_stats) do
+            local key = tostring(row.zone_id) .. '_' .. (row.mob_name or '');
+            if (not seen[key]) then
+                seen[key] = true;
+                entries:append({
+                    label = row.zone_name .. ' - ' .. row.mob_name,
+                    zone_id = row.zone_id,
+                    name = row.mob_name,
+                });
+            end
+        end
+        table.sort(entries, function(a, b) return a.label < b.label; end);
+    else
+        -- Content types (Dynamis; Omen/Ambuscade/Sortie WIP): unique zones
+        for _, row in ipairs(all_stats) do
+            if (not seen[row.zone_id]) then
+                seen[row.zone_id] = true;
+                entries:append({ label = row.zone_name, zone_id = row.zone_id, name = nil });
             end
         end
         table.sort(entries, function(a, b) return a.label < b.label; end);
@@ -832,80 +985,19 @@ local function build_stats_filter(source_filter)
 end
 
 local function render_statistics()
-    -- Propagate DB dirty flag before anything consumes it
-    if (db.stats_dirty) then
-        stats_cache_dirty = true;
-    end
-
-    -- Build context-sensitive filter combo for current source type
-    local filter_str, entries = build_stats_filter(stats_source_filter);
-
-    -- Filter combo (flush-left, no label)
-    local placeholder, combo_width;
-    if (stats_source_filter == 0) then
-        placeholder = 'Select a zone...';
-        combo_width = 180;
-    elseif (stats_source_filter == 2) then
-        placeholder = 'Select a battlefield...';
-        combo_width = 280;
-    elseif (stats_source_filter == 1) then
-        placeholder = 'Select a zone...';
-        combo_width = 180;
-    else
-        placeholder = 'Select a source...';
-        combo_width = 250;
-    end
-
-    local combo_str = placeholder .. '\0' .. filter_str;
-
-    -- Map current filter state to combo index
-    local filter_idx = { 0 };  -- 0 = placeholder
-    if (stats_zone_filter == 0 and stats_name_filter == nil) then
-        filter_idx[1] = 1;  -- "All"
-    elseif (stats_zone_filter ~= nil and stats_zone_filter > 0) then
-        for i, e in ipairs(entries) do
-            if (e.zone_id == stats_zone_filter) then
-                if (stats_source_filter == 0 or stats_source_filter == 1 or e.name == stats_name_filter) then
-                    filter_idx[1] = i + 1;
-                    break;
-                end
-            end
-        end
-    end
-
-    imgui.PushItemWidth(combo_width);
-    if imgui.Combo('##stats_filter', filter_idx, combo_str) then
-        if (filter_idx[1] == 0) then
-            stats_zone_filter = -1;
-            stats_name_filter = nil;
-        elseif (filter_idx[1] == 1) then
-            stats_zone_filter = 0;
-            stats_name_filter = nil;
-        else
-            local entry = entries[filter_idx[1] - 1];
-            stats_zone_filter = entry.zone_id;
-            stats_name_filter = entry.name;
-        end
-        stats_cache_dirty = true;
-    end
-    imgui.PopItemWidth();
-
-    -- Source type radio buttons with per-category tooltips
-    imgui.SameLine(); imgui.Spacing(); imgui.SameLine();
-
-    if imgui.RadioButton('Mob', stats_source_filter == 0) then
-        stats_source_filter = 0;
-        stats_cache_dirty = true;
-        stats_expanded_mob = nil;
-        stats_zone_filter = -1;
-        stats_name_filter = nil;
+    -- Row 1: Category radio buttons (Field | Battlefields | Instances | Chest/Coffer)
+    if imgui.RadioButton('Field', stats_category == 0) then
+        stats_category = 0;
+        reset_stats_filter(0);
     end
     imgui.SameLine();
     imgui.TextDisabled('(?)');
     if imgui.IsItemHovered() then
         imgui.SetTooltip(
-            'Mob Statistics\n'
+            'Field Statistics (Open-World Mobs)\n'
             .. '------------------------------\n'
+            .. 'Mob kills outside instanced content.\n'
+            .. 'Excludes Dynamis and other instanced content.\n\n'
             .. 'Nearby Rate = drops from nearby kills / nearby kills\n'
             .. 'Combined Rate = all drops / all kills (blue, biased)\n\n'
             .. 'Edge Cases:\n\n'
@@ -928,43 +1020,56 @@ local function render_statistics()
     end
 
     imgui.SameLine();
-    if imgui.RadioButton('BCNM', stats_source_filter == 2) then
-        stats_source_filter = 2;
-        stats_cache_dirty = true;
-        stats_expanded_mob = nil;
-        stats_zone_filter = -1;
-        stats_name_filter = nil;
+    if imgui.RadioButton('Battlefields', stats_category == 1) then
+        stats_category = 1;
+        reset_stats_filter(8);  -- default to All Battlefields
     end
     imgui.SameLine();
     imgui.TextDisabled('(?)');
     if imgui.IsItemHovered() then
         imgui.SetTooltip(
-            'BCNM Statistics\n'
+            'Battlefield Statistics (BCNM + HTBF)\n'
             .. '------------------------------\n'
-            .. 'Groups by battlefield name, not mob name\n'
-            .. '(all BCNM drops come from Armoury Crate).\n\n'
-            .. '  BCNM Name Detection\n'
-            .. '  Captured from "Entering the battlefield for X!"\n'
-            .. '  chat message on entry.\n\n'
-            .. '  Level Cap\n'
-            .. '  Detected by comparing job level before and after\n'
-            .. '  entry. KSNMs show no cap (uncapped).\n\n'
+            .. 'Burning Circle Notorious Monsters and\n'
+            .. 'High-Tier Battlefields (difficulty-based).\n\n'
+            .. '  BCNM\n'
+            .. '  Groups by battlefield name (drops from chest).\n'
+            .. '  Name from entry chat message.\n'
+            .. '  Level cap detected from job level change.\n'
+            .. '  KSNMs show no cap (uncapped).\n\n'
+            .. '  HTBF\n'
+            .. '  Groups by battlefield name + difficulty.\n'
+            .. '  Items drop directly after kill (no chest).\n'
+            .. '  VD, D, N, E, VE detected from 0x005C packet.\n'
+            .. '  Name resolved from zone dialog DAT files.\n\n'
             .. '  Addon Reload Recovery\n'
-            .. '  Battlefield session persisted to DB. On reload,\n'
-            .. '  buff icon 254 confirms active BCNM, name\n'
-            .. '  recovered from DB.\n\n'
-            .. '  Pre-Feature Data\n'
-            .. '  Data recorded before this feature shows as\n'
-            .. '  "Unknown BCNM" with zone name.');
+            .. '  Session persisted to DB. On reload, buff icon\n'
+            .. '  254 confirms active battlefield, name recovered.');
     end
 
     imgui.SameLine();
-    if imgui.RadioButton('Chest/Coffer', stats_source_filter == 1) then
-        stats_source_filter = 1;
-        stats_cache_dirty = true;
-        stats_expanded_mob = nil;
-        stats_zone_filter = -1;
-        stats_name_filter = nil;
+    if imgui.RadioButton('Instances', stats_category == 2) then
+        stats_category = 2;
+        reset_stats_filter(7);  -- default to Dynamis (only supported instance)
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Instance Statistics\n'
+            .. '------------------------------\n'
+            .. 'Currently supports Dynamis only.\n'
+            .. 'Dynamis detected by zone name prefix.\n\n'
+            .. '  Dynamis — Original (10 zones) + Divergence (4 zones)\n\n'
+            .. 'Ambuscade, Omen, and Sortie are WIP —\n'
+            .. 'more packet research needed.\n\n'
+            .. 'All kills are grouped by mob name per zone.');
+    end
+
+    imgui.SameLine();
+    if imgui.RadioButton('Chest/Coffer', stats_category == 3) then
+        stats_category = 3;
+        reset_stats_filter(1);
     end
     imgui.SameLine();
     imgui.TextDisabled('(?)');
@@ -991,6 +1096,68 @@ local function render_statistics()
             .. '  timers (respawn ~3min, illusion 30-60min).');
     end
 
+    -- Row 2: Sub-filter radio buttons (only for Battlefields and Instances)
+    if (stats_category == 1) then
+        -- Battlefields: All | BCNM | HTBF
+        if imgui.RadioButton('All##bf', stats_source_filter == 8) then
+            reset_stats_filter(8);
+        end
+        imgui.SameLine();
+        if imgui.RadioButton('BCNM', stats_source_filter == 2) then
+            reset_stats_filter(2);
+        end
+        imgui.SameLine();
+        if imgui.RadioButton('HTBF', stats_source_filter == 3) then
+            reset_stats_filter(3);
+        end
+    elseif (stats_category == 2) then
+        -- Instances: Dynamis only for now; Ambuscade/Omen/Sortie are WIP
+        if imgui.RadioButton('Dynamis', stats_source_filter == 7) then
+            reset_stats_filter(7);
+        end
+        imgui.SameLine();
+        imgui.TextDisabled('Ambuscade / Omen / Sortie (WIP)');
+    end
+
+    -- Row 3: Zone/battlefield filter combo
+    local filter_str, entries = build_stats_filter(stats_source_filter);
+
+    local combo_width = 300;
+
+    local combo_str = 'Filter...\0' .. filter_str;
+
+    -- Map current filter state to combo index
+    stats_filter_idx[1] = 0;  -- 0 = placeholder
+    if (stats_zone_filter == 0 and stats_name_filter == nil) then
+        stats_filter_idx[1] = 1;  -- "All"
+    elseif (stats_zone_filter ~= nil and stats_zone_filter > 0) then
+        for i, e in ipairs(entries) do
+            if (e.zone_id == stats_zone_filter) then
+                if (stats_source_filter == 0 or stats_source_filter == 1 or stats_source_filter >= 4 or e.name == stats_name_filter) then
+                    stats_filter_idx[1] = i + 1;
+                    break;
+                end
+            end
+        end
+    end
+
+    imgui.PushItemWidth(combo_width);
+    if imgui.Combo('##stats_filter', stats_filter_idx, combo_str) then
+        if (stats_filter_idx[1] == 0) then
+            stats_zone_filter = -1;
+            stats_name_filter = nil;
+        elseif (stats_filter_idx[1] == 1) then
+            stats_zone_filter = 0;
+            stats_name_filter = nil;
+        else
+            local entry = entries[stats_filter_idx[1] - 1];
+            stats_zone_filter = entry.zone_id;
+            stats_name_filter = entry.name;
+        end
+        stats_cache_dirty = true;
+    end
+    imgui.PopItemWidth();
+
     imgui.Separator();
 
     -- No filter selected yet
@@ -1000,6 +1167,8 @@ local function render_statistics()
     end
 
     local is_bcnm = (stats_source_filter == 2);
+    local is_htbf = (stats_source_filter == 3);
+    local is_all_bf = (stats_source_filter == 8);
     local is_chest_mode = (stats_source_filter == 1);
 
     -- Rebuild cache if data changed, filter changed, or source filter changed
@@ -1018,16 +1187,16 @@ local function render_statistics()
             end
         end
 
-        sort_stats(filtered, stats_sort_col, stats_sort_asc, is_bcnm, is_chest_mode);
+        sort_stats(filtered, stats_sort_col, stats_sort_asc, is_bcnm or is_all_bf, is_chest_mode, is_htbf);
         stats_cache_data = filtered;
         stats_cache_zone = stats_zone_filter;
         stats_cache_source = stats_source_filter;
         stats_cache_name = stats_name_filter;
         stats_cache_dirty = false;
+        stats_detail_cache = {};  -- invalidate detail cache when stats data changes
     end
 
-    -- For Chest/Coffer mode, chest_events are merged into the main table rows
-    -- so we always have data if any chest activity occurred.
+    -- Chest/Coffer mode merges chest_events into table rows
     local has_pool_data = (stats_cache_data ~= nil and #stats_cache_data > 0);
 
     if (not has_pool_data) then
@@ -1044,14 +1213,31 @@ local function render_statistics()
         + ImGuiTableFlags_Sortable
         + ImGuiTableFlags_ScrollY;
 
-    -- BCNM view:   Battlefield | Zone | Lv Cap  | Runs  | Unique Items | Avg Drops
-    -- Chest view:  Container   | Zone | Opens   | Items | Gil          | Failures
-    -- Mob view:    Mob Name    | Zone | Kills   | Unique Items | Spawns | Avg Drops
-    local num_cols = 6;
+    -- BCNM view:   Battlefield | Zone | Lv Cap     | Runs  | Unique Items | Avg Drops
+    -- HTBF view:   Battlefield | Zone | Difficulty | Runs  | Unique Items | Avg Drops
+    -- All BF view: Battlefield | Zone | Runs       | Unique Items | Avg Drops | (empty)
+    -- Chest view:  Container   | Zone | Opens      | Items | Gil          | Failures
+    -- Mob view:    Mob Name    | Zone | Kills      | Unique Items | Spawns | Avg Drops
+    local num_cols = is_all_bf and 7 or 6;
     if not imgui.BeginTable('stats_table', num_cols, table_flags, { 0, 0 }) then return; end
 
     imgui.TableSetupScrollFreeze(0, 1);
-    if (is_bcnm) then
+    if (is_all_bf) then
+        imgui.TableSetupColumn('Battlefield',  ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 0);
+        imgui.TableSetupColumn('Zone',         ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 1);
+        imgui.TableSetupColumn('Lv Cap',       ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortAscending, 45, 2);
+        imgui.TableSetupColumn('Difficulty',   ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortAscending, 65, 7);
+        imgui.TableSetupColumn('Runs',         ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_DefaultSort + ImGuiTableColumnFlags_PreferSortDescending, 40, 3);
+        imgui.TableSetupColumn('Unique Items', ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortDescending, 80, 4);
+        imgui.TableSetupColumn('Avg Drops',    ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortDescending, 65, 5);
+    elseif (is_htbf) then
+        imgui.TableSetupColumn('Battlefield',  ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 0);
+        imgui.TableSetupColumn('Zone',         ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 1);
+        imgui.TableSetupColumn('Difficulty',   ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortAscending, 65, 2);
+        imgui.TableSetupColumn('Runs',         ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_DefaultSort + ImGuiTableColumnFlags_PreferSortDescending, 40, 3);
+        imgui.TableSetupColumn('Unique Items', ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortDescending, 80, 4);
+        imgui.TableSetupColumn('Avg Drops',    ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortDescending, 65, 5);
+    elseif (is_bcnm) then
         imgui.TableSetupColumn('Battlefield',  ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 0);
         imgui.TableSetupColumn('Zone',         ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 1);
         imgui.TableSetupColumn('Lv Cap',       ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortAscending, 45, 2);
@@ -1085,7 +1271,7 @@ local function render_statistics()
             if (col ~= stats_sort_col or asc ~= stats_sort_asc) then
                 stats_sort_col = col;
                 stats_sort_asc = asc;
-                sort_stats(stats_cache_data, col, asc, is_bcnm, is_chest_mode);
+                sort_stats(stats_cache_data, col, asc, is_bcnm or is_all_bf, is_chest_mode, is_htbf);
             end
         end
     end
@@ -1093,7 +1279,15 @@ local function render_statistics()
     for _, row in ipairs(stats_cache_data) do
         imgui.TableNextRow();
 
-        local row_key = row.mob_name .. '_' .. tostring(row.zone_id) .. '_' .. tostring(row.level_cap or 'nil');
+        local row_disambig;
+        if (is_all_bf) then
+            row_disambig = tostring(row.level_cap or 0) .. '_' .. tostring(row.bf_difficulty or 0);
+        elseif (is_htbf) then
+            row_disambig = tostring(row.bf_difficulty or 0);
+        else
+            row_disambig = tostring(row.level_cap or 'nil');
+        end
+        local row_key = row.mob_name .. '_' .. tostring(row.zone_id) .. '_' .. row_disambig;
         local is_expanded = (stats_expanded_mob == row_key);
 
         -- Column 1: Mob Name / Battlefield Name
@@ -1114,7 +1308,59 @@ local function render_statistics()
         imgui.TableNextColumn();
         imgui.Text(row.zone_name);
 
-        if (is_bcnm) then
+        if (is_all_bf) then
+            -- Column 3: Level Cap
+            imgui.TableNextColumn();
+            if (row.level_cap ~= nil and row.level_cap > 0) then
+                imgui.Text('Lv' .. tostring(row.level_cap));
+            else
+                imgui.TextDisabled('--');
+            end
+
+            -- Column 4: Difficulty
+            imgui.TableNextColumn();
+            local abd = row.bf_difficulty or 0;
+            if (abd > 0) then
+                local dc = difficulty_colors[abd] or COLOR_GRAY;
+                imgui.TextColored(dc, tracker.get_difficulty_full_label(abd));
+            else
+                imgui.TextDisabled('--');
+            end
+
+            -- Column 5: Runs
+            imgui.TableNextColumn();
+            imgui.Text(tostring(row.kill_count));
+
+            -- Column 6: Unique Items
+            imgui.TableNextColumn();
+            imgui.Text(tostring(row.unique_items));
+
+            -- Column 7: Avg Drops
+            imgui.TableNextColumn();
+            imgui.Text(string_format('%.1f', row.avg_drops));
+        elseif (is_htbf) then
+            -- Column 3: Difficulty
+            imgui.TableNextColumn();
+            local h_diff = row.bf_difficulty or 0;
+            if (h_diff > 0) then
+                local dc = difficulty_colors[h_diff] or COLOR_GRAY;
+                imgui.TextColored(dc, tracker.get_difficulty_full_label(h_diff));
+            else
+                imgui.TextDisabled('--');
+            end
+
+            -- Column 4: Runs (kill_count)
+            imgui.TableNextColumn();
+            imgui.Text(tostring(row.kill_count));
+
+            -- Column 5: Unique Items
+            imgui.TableNextColumn();
+            imgui.Text(tostring(row.unique_items));
+
+            -- Column 6: Avg Drops
+            imgui.TableNextColumn();
+            imgui.Text(string_format('%.1f', row.avg_drops));
+        elseif (is_bcnm) then
             -- Column 3: Level Cap
             imgui.TableNextColumn();
             if (row.level_cap ~= nil) then
@@ -1219,7 +1465,14 @@ local function render_statistics()
 
         -- Expanded: per-item breakdown + collapsible per-spawn tree
         if is_expanded then
-            local mob_stats = db.get_mob_stats(row.mob_name, row.zone_id, stats_source_filter, row.level_cap);
+            local detail_cap = is_htbf and row.bf_difficulty or row.level_cap;
+            local detail_bf_diff = is_all_bf and (row.bf_difficulty or 0) or nil;
+            local detail = stats_detail_cache[row_key];
+            if (detail == nil) then
+                detail = { mob_stats = db.get_mob_stats(row.mob_name, row.zone_id, stats_source_filter, detail_cap, detail_bf_diff) };
+                stats_detail_cache[row_key] = detail;
+            end
+            local mob_stats = detail.mob_stats;
             if (mob_stats ~= nil and mob_stats.items ~= nil) then
                 local mob_distant = mob_stats.distant_kills or 0;
 
@@ -1242,12 +1495,24 @@ local function render_statistics()
 
                     imgui.TableNextColumn();
 
-                    if (is_bcnm) then
+                    if (is_bcnm or is_htbf) then
+                        imgui.TableNextColumn(); -- lv cap / difficulty
+                    elseif (is_all_bf) then
                         imgui.TableNextColumn(); -- lv cap
+                        imgui.TableNextColumn(); -- difficulty
                     end
 
                     imgui.TableNextColumn();
-                    imgui.TextDisabled(tostring(item.times_dropped) .. 'x');
+                    if (mob_distant > 0 and item.nearby_times_dropped ~= nil) then
+                        local distant_d = item.times_dropped - item.nearby_times_dropped;
+                        imgui.TextDisabled(tostring(item.nearby_times_dropped) .. 'x');
+                        if (distant_d > 0) then
+                            imgui.SameLine(0, 2);
+                            imgui.TextColored(COLOR_BLUE_MUTED, '(+' .. tostring(distant_d) .. ')');
+                        end
+                    else
+                        imgui.TextDisabled(tostring(item.times_dropped) .. 'x');
+                    end
 
                     imgui.TableNextColumn();
                     if (item.drop_rate < 0 or item.item_id == 65535) then
@@ -1262,8 +1527,8 @@ local function render_statistics()
                         imgui.TextColored(COLOR_BLUE_MUTED, string_format('(%.1f%%)', item.combined_rate));
                         if imgui.IsItemHovered() then
                             imgui.SetTooltip(string_format(
-                                'Nearby: %d / %d = %.1f%%\n'
-                                .. 'Combined: %d / %d = %.1f%%\n\n'
+                                'Nearby: %d / %d = %.1f%%%%\n'
+                                .. 'Combined: %d / %d = %.1f%%%%\n\n'
                                 .. 'Includes %d distant kill(s) with drops for this mob.\n'
                                 .. 'Distant kills are a biased sample (only seen\n'
                                 .. 'because they dropped loot). Nearby rate is unbiased.',
@@ -1278,7 +1543,7 @@ local function render_statistics()
                     if (is_chest_mode) then
                         imgui.TableNextColumn();
                         imgui.TableNextColumn();
-                    elseif (not is_bcnm) then
+                    elseif (not is_bcnm and not is_htbf and not is_all_bf) then
                         imgui.TableNextColumn();
                         imgui.TableNextColumn();
                         if (item.times_dropped > 0 and item.total_qty ~= item.times_dropped) then
@@ -1293,11 +1558,57 @@ local function render_statistics()
                 end
             end
 
-            -- Per-spawn breakdown (only for Mob view — not applicable for BCNM or Chest/Coffer)
-            -- Show section when multiple spawn IDs exist (raw count).
+            -- HTBF difficulty breakdown (only for BCNM view — shows per-difficulty stats)
+            if (is_bcnm) then
+                if (detail.htbf_data == nil) then
+                    detail.htbf_data = db.get_htbf_breakdown(row.mob_name, row.zone_id) or {};
+                end
+                local htbf_data = detail.htbf_data;
+                if (htbf_data ~= nil and #htbf_data > 0) then
+                    imgui.TableNextRow();
+                    imgui.TableNextColumn();
+                    imgui.TextDisabled('  -- Difficulty Breakdown --');
+                    imgui.TableNextColumn();
+                    imgui.TableNextColumn();
+                    imgui.TableNextColumn();
+                    imgui.TableNextColumn();
+                    imgui.TableNextColumn();
+
+                    for _, hrow in ipairs(htbf_data) do
+                        imgui.TableNextRow();
+
+                        imgui.TableNextColumn();
+                        local dc = difficulty_colors[hrow.bf_difficulty] or COLOR_GRAY;
+                        local dlabel = tracker.get_difficulty_full_label(hrow.bf_difficulty);
+                        imgui.TextColored(dc, '    [' .. tracker.get_difficulty_label(hrow.bf_difficulty) .. '] ' .. dlabel);
+                        if imgui.IsItemHovered() and (hrow.bf_name ~= nil and hrow.bf_name ~= '') then
+                            imgui.SetTooltip('Battlefield: ' .. hrow.bf_name);
+                        end
+
+                        imgui.TableNextColumn(); -- zone (blank)
+
+                        imgui.TableNextColumn(); -- lv cap (blank)
+
+                        imgui.TableNextColumn(); -- runs
+                        imgui.TextDisabled(tostring(hrow.kill_count));
+
+                        imgui.TableNextColumn(); -- unique items
+                        imgui.TextDisabled(tostring(hrow.unique_items));
+
+                        imgui.TableNextColumn(); -- avg drops
+                        imgui.TextDisabled(string_format('%.1f', hrow.avg_drops));
+                    end
+                end
+            end
+
+            -- Per-spawn breakdown (only for Mob view — not applicable for BF or Chest/Coffer)
+            -- Show section when spawn IDs have item drops.
             -- Hide individual spawns that only have gil drops (0 unique items).
-            if (not is_bcnm and not is_chest_mode) then
-                local raw_spawn_stats = db.get_spawn_stats(row.mob_name, row.zone_id);
+            if (not is_bcnm and not is_htbf and not is_all_bf and not is_chest_mode) then
+                if (detail.raw_spawn_stats == nil) then
+                    detail.raw_spawn_stats = db.get_spawn_stats(row.mob_name, row.zone_id) or {};
+                end
+                local raw_spawn_stats = detail.raw_spawn_stats;
                 local spawn_stats = T{};
                 if (raw_spawn_stats ~= nil) then
                     for _, sp in ipairs(raw_spawn_stats) do
@@ -1306,7 +1617,7 @@ local function render_statistics()
                         end
                     end
                 end
-                if (raw_spawn_stats ~= nil and #raw_spawn_stats > 1 and #spawn_stats > 0) then
+                if (raw_spawn_stats ~= nil and #spawn_stats > 0) then
                     local spawn_section_key = row_key;
                     local spawn_section_open = stats_expanded_spawn_section[spawn_section_key] or false;
 
@@ -1355,7 +1666,12 @@ local function render_statistics()
 
                             -- Per-spawn item breakdown (deepest level)
                             if spawn_open then
-                                local spawn_items = db.get_spawn_item_stats(row.mob_name, row.zone_id, spawn.mob_server_id);
+                                local si_key = tostring(spawn.mob_server_id);
+                                if (detail.spawn_items == nil) then detail.spawn_items = {}; end
+                                if (detail.spawn_items[si_key] == nil) then
+                                    detail.spawn_items[si_key] = db.get_spawn_item_stats(row.mob_name, row.zone_id, spawn.mob_server_id);
+                                end
+                                local spawn_items = detail.spawn_items[si_key];
                                 if (#spawn_items > 0) then
                                     for _, si in ipairs(spawn_items) do
                                         imgui.TableNextRow();
@@ -1438,21 +1754,33 @@ local function apply_filters()
         zone_id = apply_zones[ef.zone_idx[1]].zone_id;
     end
 
-    -- CQ 4: nil instead of -1 for unfiltered source
-    -- Combo: 0=All, 1=Mob(0), 2=Chest/Coffer(1+2), 3=BCNM(3)
+    -- Combo: 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6=Dynamis
+    -- Filters by content_type so BF mob kills are grouped with their content.
     local source_type = nil;
-    local source_type_list = nil;  -- for multi-value filter (chest+coffer)
+    local source_type_list = nil;
+    local content_type = nil;
+    local field_only = false;
+    local bf_all = false;
+    local bf_difficulty_eq = nil;  -- nil=any, 0=BCNM, >0 not used (htbf uses gt)
+    local htbf_only = false;
     if (ef.source_idx[1] == 1) then
-        source_type = 0;   -- Mob
+        field_only = true;         -- source_type=0 AND content_type=''
     elseif (ef.source_idx[1] == 2) then
         source_type_list = { 1, 2 };  -- Chest + Coffer
     elseif (ef.source_idx[1] == 3) then
-        source_type = 3;   -- BCNM
+        bf_all = true;             -- content_type='BCNM' (mob kills + crate drops)
+    elseif (ef.source_idx[1] == 4) then
+        bf_all = true;             -- content_type='BCNM' AND bf_difficulty=0
+        bf_difficulty_eq = 0;
+    elseif (ef.source_idx[1] == 5) then
+        htbf_only = true;          -- content_type='BCNM' AND bf_difficulty>0
+    elseif (ef.source_idx[1] == 6) then
+        content_type = 'Dynamis';
     end
 
     local status = af_status_map[ef.status_idx[1]];
 
-    -- UX 7: Date validation
+    -- Date validation
     local date_from = parse_date(ef.date_from[1]);
     local date_to   = parse_date(ef.date_to[1]);
     ef.date_from_err = (ef.date_from[1] ~= '' and date_from == nil);
@@ -1507,6 +1835,11 @@ local function apply_filters()
         zone_id         = zone_id,
         source_type     = source_type,
         source_type_list = source_type_list,
+        field_only      = field_only,
+        bf_all          = bf_all,
+        bf_difficulty_eq = bf_difficulty_eq,
+        htbf_only       = htbf_only,
+        content_type    = content_type,
         mob_search      = ef.mob_buf[1] or '',
         th_min          = ef.th_min[1],
         mob_sid         = mob_sid,
@@ -1533,17 +1866,17 @@ local function apply_filters()
         chest_result    = chest_result,
     };
 
-    -- Fix 3: Store filters for streaming export, use COUNT + LIMIT
+    -- Store filters for streaming export
     ef.last_filters = filters;
     ef.row_count = db.get_filtered_export_count(filters);
     ef.data = db.get_filtered_export(filters, ef.PREVIEW_LIMIT);
     ef.sort_col = 0;
     ef.sort_asc = false;
 
-    -- UX 3: Auto-show preview after Apply
+    -- Auto-show preview after Apply
     ef.show_preview[1] = true;
 
-    -- Perf 5: Pre-format timestamps
+    -- Pre-format timestamps
     for _, row in ipairs(ef.data) do
         row._fmt_time = os_date('%m/%d %H:%M', row.timestamp or 0);
         row._fmt_full = os_date('%Y-%m-%d %H:%M:%S', row.timestamp or 0);
@@ -1551,15 +1884,23 @@ local function apply_filters()
             and os_date('%H:%M:%S', row.drop_timestamp) or '-';
     end
 
-    -- UX 4: Active filter summary
+    -- Build active filter summary
     local parts = {};
     if (zone_id >= 0 and ef.zone_idx[1] <= #apply_zones) then
         parts[#parts + 1] = 'Zone: ' .. apply_zones[ef.zone_idx[1]].zone_name;
     end
-    if (source_type_list ~= nil) then
+    if (content_type ~= nil) then
+        parts[#parts + 1] = 'Source: ' .. content_type;
+    elseif (field_only) then
+        parts[#parts + 1] = 'Source: Field';
+    elseif (bf_all and bf_difficulty_eq == 0) then
+        parts[#parts + 1] = 'Source: BCNM';
+    elseif (bf_all) then
+        parts[#parts + 1] = 'Source: All BF';
+    elseif (htbf_only) then
+        parts[#parts + 1] = 'Source: HTBF';
+    elseif (source_type_list ~= nil) then
         parts[#parts + 1] = 'Source: Chest/Coffer';
-    elseif (source_type ~= nil) then
-        parts[#parts + 1] = 'Source: ' .. tracker.get_source_label(source_type);
     end
     if (ef.mob_buf[1] ~= nil and ef.mob_buf[1] ~= '') then
         parts[#parts + 1] = 'Mob: "' .. ef.mob_buf[1] .. '"';
@@ -1624,12 +1965,12 @@ local function render_advanced_export_window()
             imgui.Text('Source:');
             imgui.SameLine(col2);
             imgui.PushItemWidth(w2);
-            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Mob\0Chest/Coffer\0BCNM\0\0') then
+            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0\0') then
                 ef.auto_dirty = true;
             end
             imgui.PopItemWidth();
             if imgui.IsItemHovered() then
-                imgui.SetTooltip('Filter by source type (Mob, Chest/Coffer, BCNM).');
+                imgui.SetTooltip('Filter by content type.\nField = open-world mobs (no instances).\nAll BF = BCNM + HTBF combined.');
             end
 
             -- Row 2: Mob + Item
@@ -1865,7 +2206,14 @@ local function render_advanced_export_window()
             if (auto_trigger) then
                 ef.auto_dirty = false;
                 ef.text_dirty = false;
-                apply_filters();
+                -- Skip query on invalid dates; still update error flags for red indicator
+                local bad_from = (ef.date_from[1] ~= '' and parse_date(ef.date_from[1]) == nil);
+                local bad_to   = (ef.date_to[1] ~= '' and parse_date(ef.date_to[1]) == nil);
+                ef.date_from_err = bad_from;
+                ef.date_to_err   = bad_to;
+                if (not bad_from and not bad_to) then
+                    apply_filters();
+                end
             end
 
             -- Apply / Reset / Show Preview buttons + row count
@@ -1935,7 +2283,7 @@ local function render_advanced_export_window()
                 imgui.TextDisabled('Showing: ' .. format_count(ef.row_count) .. ' rows');
             end
 
-            -- UX 4: Active filter summary
+            -- Active filter summary
             if (ef.filter_summary ~= '') then
                 imgui.TextDisabled(ef.filter_summary);
             end
@@ -1955,15 +2303,14 @@ local function render_advanced_export_window()
                     + ImGuiTableFlags_Sortable
                     + ImGuiTableFlags_ScrollX
                     + ImGuiTableFlags_ScrollY
-                    + ImGuiTableFlags_Hideable;  -- UX 6
+                    + ImGuiTableFlags_Hideable;
 
                 -- ScrollY requires explicit height; y=0 sizes the table to zero.
                 -- Use remaining content region so the table fills available space.
                 local _, avail_h = imgui.GetContentRegionAvail();
                 if (avail_h < 60) then avail_h = 60; end  -- minimum usable height
 
-                -- 26 sortable columns — mirrors all CSV export fields
-                if imgui.BeginTable('export_preview', 26, table_flags, { 0, avail_h }) then
+                if imgui.BeginTable('export_preview', #export_col_defs, table_flags, { 0, avail_h }) then
                     imgui.TableSetupScrollFreeze(1, 1); -- freeze Kill ID column + header row
 
                     for _, def in ipairs(export_col_defs) do
@@ -2000,16 +2347,21 @@ local function render_advanced_export_window()
                                     elseif (col == 13) then va, vb = (a.moon_phase or -1),     (b.moon_phase or -1);
                                     elseif (col == 14) then va, vb = (a.moon_percent or -1),   (b.moon_percent or -1);
                                     elseif (col == 15) then va, vb = (a.weather or -1),        (b.weather or -1);
-                                    elseif (col == 16) then va, vb = (a.item_name or ''),      (b.item_name or '');
-                                    elseif (col == 17) then va, vb = (a.item_id or 0),         (b.item_id or 0);
-                                    elseif (col == 18) then va, vb = (a.quantity or 0),        (b.quantity or 0);
-                                    elseif (col == 19) then va, vb = (a.lot_value or 0),       (b.lot_value or 0);
-                                    elseif (col == 20) then va, vb = (a.won or 0),             (b.won or 0);
-                                    elseif (col == 21) then va, vb = (a.winner_id or 0),       (b.winner_id or 0);
-                                    elseif (col == 22) then va, vb = (a.winner_name or ''),    (b.winner_name or '');
-                                    elseif (col == 23) then va, vb = (a.player_lot or 0),      (b.player_lot or 0);
-                                    elseif (col == 24) then va, vb = (a.player_action or 0),   (b.player_action or 0);
-                                    elseif (col == 25) then va, vb = (a.drop_timestamp or 0),  (b.drop_timestamp or 0);
+                                    elseif (col == 16) then va, vb = (a.bf_name or ''),        (b.bf_name or '');
+                                    elseif (col == 17) then va, vb = (a.bf_difficulty or 0),   (b.bf_difficulty or 0);
+                                    elseif (col == 18) then va, vb = (a.content_type or ''),   (b.content_type or '');
+                                    elseif (col == 19) then va, vb = (a.item_name or ''),      (b.item_name or '');
+                                    elseif (col == 20) then va, vb = (a.item_id or 0),         (b.item_id or 0);
+                                    elseif (col == 21) then va, vb = (a.quantity or 0),        (b.quantity or 0);
+                                    elseif (col == 22) then va, vb = (a.lot_value or 0),       (b.lot_value or 0);
+                                    elseif (col == 23) then va, vb = (a.won or 0),             (b.won or 0);
+                                    elseif (col == 24) then va, vb = (a.winner_id or 0),       (b.winner_id or 0);
+                                    elseif (col == 25) then va, vb = (a.winner_name or ''),    (b.winner_name or '');
+                                    elseif (col == 26) then va, vb = (a.player_lot or 0),      (b.player_lot or 0);
+                                    elseif (col == 27) then va, vb = (a.player_action or 0),   (b.player_action or 0);
+                                    elseif (col == 28) then va, vb = (a.drop_timestamp or 0),  (b.drop_timestamp or 0);
+                                    elseif (col == 29) then va, vb = (a.is_distant or 0),      (b.is_distant or 0);
+                                    elseif (col == 30) then va, vb = (a.level_cap or 0),       (b.level_cap or 0);
                                     else return false;
                                     end
                                     if asc then return va < vb; else return va > vb; end
@@ -2028,7 +2380,7 @@ local function render_advanced_export_window()
                         imgui.TableNextColumn();
                         imgui.TextDisabled(tostring(row.kill_id or 0));
 
-                        -- Time (date + time) — Perf 5: use pre-formatted strings
+                        -- Time (date + time)
                         imgui.TableNextColumn();
                         imgui.TextDisabled(row._fmt_time or os_date('%m/%d %H:%M', row.timestamp or 0));
                         if imgui.IsItemHovered() then
@@ -2053,7 +2405,7 @@ local function render_advanced_export_window()
 
                         imgui.TableNextColumn();
                         local src_color = source_colors[row.source_type] or source_colors[0];
-                        imgui.TextColored(src_color, tracker.get_source_label(row.source_type));
+                        imgui.TextColored(src_color, tracker.get_source_label(row.source_type, tonumber(row.bf_difficulty)));
 
                         imgui.TableNextColumn();
                         if ((row.th_level or 0) > 0) then
@@ -2126,6 +2478,33 @@ local function render_advanced_export_window()
                         local w = tonumber(row.weather);
                         if (w ~= nil and w >= 0) then
                             imgui.Text(tracker.get_weather_label(w));
+                        else
+                            imgui.TextDisabled('-');
+                        end
+
+                        -- BF Name
+                        imgui.TableNextColumn();
+                        local bfn = row.bf_name or '';
+                        if (bfn ~= '') then
+                            imgui.Text(bfn);
+                        else
+                            imgui.TextDisabled('-');
+                        end
+
+                        -- Difficulty
+                        imgui.TableNextColumn();
+                        local bfd = tonumber(row.bf_difficulty) or 0;
+                        if (bfd > 0) then
+                            imgui.Text(tracker.get_difficulty_label(bfd));
+                        else
+                            imgui.TextDisabled('-');
+                        end
+
+                        -- Content Type
+                        imgui.TableNextColumn();
+                        local ct = row.content_type or '';
+                        if (ct ~= '') then
+                            imgui.Text(ct);
                         else
                             imgui.TextDisabled('-');
                         end
@@ -2208,19 +2587,37 @@ local function render_advanced_export_window()
                             imgui.TextDisabled('-');
                         end
 
-                        -- Drop Time — Perf 5: use pre-formatted string
+                        -- Drop Time
                         imgui.TableNextColumn();
                         if (is_empty) then
                             imgui.TextDisabled('-');
                         else
                             imgui.TextDisabled(row._fmt_drop or '-');
                         end
+
+                        -- Distant kill
+                        imgui.TableNextColumn();
+                        local dist = tonumber(row.is_distant) or 0;
+                        if (dist > 0) then
+                            imgui.TextColored({ 0.4, 0.7, 1.0, 1.0 }, 'Yes');
+                        else
+                            imgui.TextDisabled('-');
+                        end
+
+                        -- Level cap
+                        imgui.TableNextColumn();
+                        local lcap = tonumber(row.level_cap);
+                        if (lcap ~= nil and lcap > 0) then
+                            imgui.Text(tostring(lcap));
+                        else
+                            imgui.TextDisabled('-');
+                        end
                     end
 
                     imgui.EndTable();
                 end
 
-                -- Preview limit notice now shown in the button bar above (Fix 1 & 2)
+                -- Preview limit notice shown in button bar above
             end
 
         end
@@ -2242,6 +2639,1155 @@ local function render_advanced_export_window()
     end
     imgui.End();
 end
+
+-------------------------------------------------------------------------------
+-- Slot Analysis Tab
+-------------------------------------------------------------------------------
+
+-- Color constants for slot analysis (pre-allocated)
+local COLOR_YELLOW  = { 1.0, 0.9, 0.3, 1.0 };
+local COLOR_CYAN    = { 0.4, 0.9, 1.0, 1.0 };
+
+--- Build zone/battlefield filter combo for slot analysis (mirrors stats filter).
+local function build_an_filter(source_filter)
+    if (an.filter_combo.src == source_filter
+        and an.filter_combo.entries ~= nil
+        and not db.stats_dirty and not an.cache_dirty) then
+        return an.filter_combo.str, an.filter_combo.entries;
+    end
+
+    local all_stats = db.get_all_mob_stats(source_filter);
+    local entries = T{};
+    local seen = {};
+
+    if (source_filter == 2 or source_filter == 3 or source_filter == 8) then
+        -- BCNM/HTBF/All BF: unique battlefield + zone + level_cap/difficulty combos
+        for _, row in ipairs(all_stats) do
+            -- sf=2: cap=level_cap, sf=3: cap=bf_difficulty, sf=8: detect per row
+            local lc = row.level_cap or 0;
+            local bd = row.bf_difficulty or 0;
+            local cap, eff_sf;
+            if (source_filter == 3 or (source_filter == 8 and bd > 0)) then
+                cap = bd;
+                eff_sf = 3;  -- HTBF path
+            else
+                cap = lc;
+                eff_sf = 2;  -- BCNM path
+            end
+
+            local key = tostring(row.zone_id) .. '_' .. (row.mob_name or '') .. '_' .. tostring(lc) .. '_' .. tostring(bd);
+            if (not seen[key]) then
+                seen[key] = true;
+                local label = row.zone_name .. ' - ' .. row.mob_name;
+                if (bd > 0) then
+                    label = label .. ' [' .. tracker.get_difficulty_label(bd) .. ']';
+                elseif (lc > 0) then
+                    label = label .. ' (Lv' .. tostring(lc) .. ')';
+                end
+                entries:append({
+                    label = label,
+                    zone_id = row.zone_id,
+                    name = row.mob_name,
+                    level_cap = cap,
+                    effective_sf = eff_sf,
+                });
+            end
+        end
+    else
+        -- All other types: unique zones
+        for _, row in ipairs(all_stats) do
+            if (not seen[row.zone_id]) then
+                seen[row.zone_id] = true;
+                entries:append({ label = row.zone_name, zone_id = row.zone_id, name = nil });
+            end
+        end
+        -- Chest/Coffer: also include zones with only chest_events
+        if (source_filter == 1) then
+            local chest_stats = db.get_chest_stats();
+            for _, row in ipairs(chest_stats) do
+                if (not seen[row.zone_id]) then
+                    seen[row.zone_id] = true;
+                    entries:append({ label = row.zone_name or '', zone_id = row.zone_id, name = nil });
+                end
+            end
+        end
+    end
+    table.sort(entries, function(a, b) return a.label < b.label; end);
+
+    local parts = { 'Select...' };
+    for _, e in ipairs(entries) do
+        parts[#parts + 1] = e.label;
+    end
+
+    an.filter_combo.str = table.concat(parts, '\0') .. '\0\0';
+    an.filter_combo.entries = entries;
+    an.filter_combo.src = source_filter;
+
+    return an.filter_combo.str, an.filter_combo.entries;
+end
+
+--- Build mob name combo for a selected zone/battlefield.
+local function build_mob_combo(source_filter, zone_id, name_filter)
+    local cache_key = tostring(source_filter) .. '_' .. tostring(zone_id) .. '_' .. tostring(name_filter or '');
+    if (an.mob_combo.key == cache_key and an.mob_combo.mobs ~= nil and not db.stats_dirty and not an.cache_dirty) then
+        return an.mob_combo.str, an.mob_combo.mobs;
+    end
+
+    local all_stats = db.get_all_mob_stats(source_filter);
+    local mobs = T{};
+    local seen = {};
+
+    for _, row in ipairs(all_stats) do
+        if (row.zone_id == zone_id) then
+            local match = true;
+            if (name_filter ~= nil and name_filter ~= '') then
+                if (source_filter == 2) then
+                    match = (row.mob_name == name_filter);
+                elseif (source_filter == 3) then
+                    match = (row.mob_name == name_filter);
+                end
+            end
+            if (match and not seen[row.mob_name]) then
+                seen[row.mob_name] = true;
+                local total = row.kill_count or 0;
+                local distant = row.distant_kills or 0;
+                mobs:append({
+                    mob_name  = row.mob_name,
+                    zone_id   = row.zone_id,
+                    kills     = total - distant,
+                    level_cap = row.level_cap or row.bf_difficulty,
+                });
+            end
+        end
+    end
+
+    -- Sort by kill count descending (most data first)
+    table.sort(mobs, function(a, b) return a.kills > b.kills; end);
+
+    local parts = { 'Select mob...' };
+    for _, m in ipairs(mobs) do
+        parts[#parts + 1] = m.mob_name .. ' (' .. tostring(m.kills) .. ' kills)';
+    end
+
+    an.mob_combo.str = table.concat(parts, '\0') .. '\0\0';
+    an.mob_combo.mobs = mobs;
+    an.mob_combo.key = cache_key;
+
+    return an.mob_combo.str, an.mob_combo.mobs;
+end
+
+--- Render Section 1: Confidence Intervals.
+local function render_ci_section(result, kills)
+    local ci = result.confidence;
+    if (#ci == 0) then
+        imgui.TextDisabled('No item drops recorded.');
+        return;
+    end
+
+    local kw = result.is_battlefield and 'runs' or 'kills';
+    if (kills < analysis.MIN_KILLS_CI) then
+        imgui.TextColored(COLOR_WARN, string_format(
+            'Low sample size (%d %s). Results below %d %s may be unreliable — more data improves accuracy.',
+            kills, kw, analysis.MIN_KILLS_CI, kw));
+    end
+
+    local flags = bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg, ImGuiTableFlags_Sortable,
+        ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY,
+        ImGuiTableFlags_Resizable, ImGuiTableFlags_Reorderable);
+    if imgui.BeginTable('##ci_table', 7, flags, { 0, math_min(#ci * 24 + 28, 300) }) then
+        imgui.TableSetupColumn('Item', ImGuiTableColumnFlags_DefaultSort, 150);
+        imgui.TableSetupColumn('Drops', ImGuiTableColumnFlags_PreferSortDescending, 50);
+        imgui.TableSetupColumn('Rate', ImGuiTableColumnFlags_PreferSortDescending, 55);
+        imgui.TableSetupColumn('CI Low', ImGuiTableColumnFlags_PreferSortAscending, 55);
+        imgui.TableSetupColumn('CI High', ImGuiTableColumnFlags_PreferSortDescending, 55);
+        imgui.TableSetupColumn('Width', ImGuiTableColumnFlags_PreferSortAscending, 55);
+        imgui.TableSetupColumn('Reliability', 0, 70);
+        imgui.TableHeadersRow();
+
+        -- Read sort specs and sort only when spec changes (no per-frame sort)
+        local sort_specs = imgui.TableGetSortSpecs();
+        if (sort_specs ~= nil and sort_specs.Specs ~= nil) then
+            local new_col = sort_specs.Specs.ColumnIndex + 1;
+            local new_asc = (sort_specs.Specs.SortDirection == 1);
+            if (new_col ~= an.ci_sort_col or new_asc ~= an.ci_sort_asc) then
+                an.ci_sort_col = new_col;
+                an.ci_sort_asc = new_asc;
+                local key = ci_sort_keys[new_col];
+                if (key ~= nil) then
+                    if (new_asc) then
+                        table.sort(ci, function(a, b) return a[key] < b[key]; end);
+                    else
+                        table.sort(ci, function(a, b) return a[key] > b[key]; end);
+                    end
+                end
+            end
+        end
+
+        for _, row in ipairs(ci) do
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.Text(row.item_name);
+            imgui.TableNextColumn(); imgui.Text(tostring(row.drops));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format('Item dropped %d times out of %d nearby %s.', row.drops, row.kills, kw));
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', row.rate * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format('Observed rate: %d / %d = %.2f%%%%\nThis is the raw observed rate (drops / %s).', row.drops, row.kills, row.rate * 100, kw));
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', row.ci_lower * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Lower bound of the 95%% confidence interval.\nThe true drop rate is very likely above this value.');
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', row.ci_upper * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Upper bound of the 95%% confidence interval.\nThe true drop rate is very likely below this value.');
+            end
+
+            -- Width color-coded
+            imgui.TableNextColumn();
+            local width_pct = row.ci_width * 100;
+            local width_color = COLOR_GREEN;
+            if (width_pct > 15) then width_color = COLOR_RED;
+            elseif (width_pct > 5) then width_color = COLOR_WARN; end
+            imgui.TextColored(width_color, string_format('%.1f%%', width_pct));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'CI Width = upper bound - lower bound = %.1f%%%%\n'
+                    .. 'Narrower = more precise estimate.\n\n'
+                    .. 'Green: < 5%%%%  |  Yellow: 5-15%%%%  |  Red: > 15%%%%',
+                    width_pct));
+            end
+
+            -- Reliability badge
+            imgui.TableNextColumn();
+            local rel_label, rel_color;
+            if (width_pct <= 5) then
+                rel_label = 'High'; rel_color = COLOR_GREEN;
+            elseif (width_pct <= 15) then
+                rel_label = 'Medium'; rel_color = COLOR_WARN;
+            else
+                rel_label = 'Low'; rel_color = COLOR_RED;
+            end
+            imgui.TextColored(rel_color, rel_label);
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    '%d drops / %d %s = %.1f%%%%\n95%%%% CI: [%.1f%%%%, %.1f%%%%] (width %.1f%%%%)\n\n%s',
+                    row.drops, row.kills, kw, row.rate * 100,
+                    row.ci_lower * 100, row.ci_upper * 100, width_pct,
+                    width_pct > 15 and ('More ' .. kw .. ' needed for tighter estimate.') or 'Estimate is reliable.'));
+            end
+        end
+        imgui.EndTable();
+    end
+end
+
+--- Render Section 2: Slot Count Estimation.
+local function render_slot_section(result)
+    local se = result.slot_estimate;
+    if (se == nil) then return; end
+
+    -- Headline: Estimated Slots (best evidence from all metrics)
+    local est_slots = math.max(se.max_observed, math.ceil(se.rate_sum));
+    imgui.TextColored(COLOR_GREEN, string_format('Estimated Slots: %d', est_slots));
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(string_format(
+            'Best estimate based on strongest evidence:\n' ..
+            '  - Max items in one kill: %d (hard lower bound)\n' ..
+            '  - Ceil of rate sum: %d (from %.2f total)\n' ..
+            '  - Unique items seen: %d (upper bound)\n\n' ..
+            'True slot count is between %d and %d.',
+            se.max_observed, math.ceil(se.rate_sum), se.rate_sum,
+            se.unique_items, est_slots, se.unique_items
+        ));
+    end
+    imgui.Spacing();
+
+    local tflags = bit.bor(ImGuiTableFlags_SizingFixedFit, ImGuiTableFlags_NoHostExtendX);
+    if imgui.BeginTable('##slot_tbl', 2, tflags) then
+        imgui.TableSetupColumn('Label', 0, 200);
+        imgui.TableSetupColumn('Value', 0, 250);
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Unique items seen:');
+        imgui.TableNextColumn(); imgui.Text(tostring(se.unique_items));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Total distinct items (excluding gil) dropped by this mob.\nThis is the upper bound on how many drop slots exist.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Max items in one kill:');
+        imgui.TableNextColumn(); imgui.Text(tostring(se.max_observed));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Hard lower bound on the number of independent drop slots.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Sum of all rates:');
+        imgui.TableNextColumn();
+        local rate_color = (se.rate_sum > 1.0) and COLOR_GREEN or COLOR_LIGHT_GRAY;
+        imgui.TextColored(rate_color, string_format('%.2f', se.rate_sum));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('If > 1.0, items MUST be on separate independent slots.\nHigher values = more evidence for multiple slots.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Avg items per kill:');
+        imgui.TableNextColumn(); imgui.Text(string_format('%.2f', se.avg_items_per_kill));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Average number of items (excluding gil) per kill.\nHigher values suggest more active drop slots.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Separator(); imgui.Text('Empty kills (observed):');
+        imgui.TableNextColumn(); imgui.Separator();
+        imgui.Text(string_format('%d (%.1f%%)', se.empty_observed_count, se.empty_observed_rate * 100));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(string_format(
+                'Kills where zero items dropped (excluding gil).\n'
+                .. '%d out of %d kills (%.1f%%%%).\n\n'
+                .. 'Compare with expected rate below to evaluate model fit.',
+                se.empty_observed_count, se.total_kills, se.empty_observed_rate * 100));
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Empty kills (expected):');
+        imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', se.empty_expected_rate * 100));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Predicted from independent slot model:\nProduct of (1 - rate_i) for all items.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Model fit:');
+        imgui.TableNextColumn();
+        local dev = math.abs(se.empty_observed_rate - se.empty_expected_rate);
+        local fit_label, fit_color;
+        if (dev < 0.05) then
+            fit_label = 'Good'; fit_color = COLOR_GREEN;
+        elseif (dev < 0.15) then
+            fit_label = 'Fair'; fit_color = COLOR_WARN;
+        else
+            fit_label = 'Poor'; fit_color = COLOR_RED;
+        end
+        imgui.TextColored(fit_color, string_format('%s (%.1f%%%% deviation)', fit_label, dev * 100));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Compares observed vs predicted empty kill rate.\nGood = independent slot model fits well.\nPoor = slots may not be independent (shared slots?).');
+        end
+
+        imgui.EndTable();
+    end
+end
+
+--- Render Section 3: Items-Per-Kill Distribution.
+local function render_distribution_section(result)
+    local dist = result.distribution;
+    if (dist == nil or #dist.bins == 0) then
+        imgui.TextDisabled('No distribution data.');
+        return;
+    end
+
+    local is_bf = result.is_battlefield;
+    local kill_word = is_bf and 'encounter' or 'kill';
+
+    local bins = dist.bins;
+    local max_k = #bins;
+
+    -- Build float arrays for PlotHistogram (cached on dist to avoid per-frame alloc)
+    if (dist._obs_vals == nil) then
+        local obs = {};
+        local exp = {};
+        local mr = 0;
+        for i = 1, max_k do
+            obs[i] = bins[i].obs_rate;
+            exp[i] = bins[i].exp_rate;
+            if (bins[i].obs_rate > mr) then mr = bins[i].obs_rate; end
+            if (bins[i].exp_rate > mr) then mr = bins[i].exp_rate; end
+        end
+        dist._obs_vals = obs;
+        dist._exp_vals = exp;
+        dist._max_rate = mr;
+    end
+    local obs_vals = dist._obs_vals;
+    local exp_vals = dist._exp_vals;
+    local max_rate = dist._max_rate;
+
+    -- Two histograms side by side
+    imgui.Text('Observed:');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Actual distribution of items dropped per ' .. kill_word .. '.\nEach bar = how often that many items dropped.');
+    end
+    imgui.SameLine(215);
+    imgui.Text('Expected (independent model):');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Predicted distribution if all drop slots are\nindependent (Poisson Binomial model).\nShould match observed if model is correct.');
+    end
+
+    imgui.PlotHistogram('##obs_hist', obs_vals, max_k, 0, '', 0, max_rate * 1.2, { 200, 80 });
+    if imgui.IsItemHovered() then
+        local tip_parts = {};
+        for i = 1, max_k do
+            tip_parts[#tip_parts + 1] = string_format('%d items: %.1f%%%%', bins[i].items, bins[i].obs_rate * 100);
+        end
+        imgui.SetTooltip(table.concat(tip_parts, '\n'));
+    end
+    imgui.SameLine();
+    imgui.PlotHistogram('##exp_hist', exp_vals, max_k, 0, '', 0, max_rate * 1.2, { 200, 80 });
+    if imgui.IsItemHovered() then
+        local tip_parts = {};
+        for i = 1, max_k do
+            tip_parts[#tip_parts + 1] = string_format('%d items: %.1f%%%%', bins[i].items, bins[i].exp_rate * 100);
+        end
+        imgui.SetTooltip(table.concat(tip_parts, '\n'));
+    end
+
+    imgui.Spacing();
+
+    -- Comparison table
+    local tflags = bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg, ImGuiTableFlags_SizingStretchProp);
+    if imgui.BeginTable('##dist_table', 4, tflags, { 0, math_min(max_k * 24 + 28, 200) }) then
+        imgui.TableSetupColumn('Items', 0, 50);
+        imgui.TableSetupColumn('Observed', 0, 70);
+        imgui.TableSetupColumn('Expected', 0, 70);
+        imgui.TableSetupColumn('Diff', 0, 60);
+        imgui.TableHeadersRow();
+
+        for _, b in ipairs(bins) do
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.Text(tostring(b.items));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Number of items (excluding gil) dropped in a single ' .. kill_word .. '.');
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', b.obs_rate * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'Observed: %.1f%%%% of %ss dropped exactly %d item(s).',
+                    b.obs_rate * 100, kill_word, b.items));
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f%%', b.exp_rate * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'Expected: %.1f%%%% from the Poisson Binomial model\n'
+                    .. '(independent slots with observed per-item rates).',
+                    b.exp_rate * 100));
+            end
+
+            imgui.TableNextColumn();
+            local diff_abs = math.abs(b.diff) * 100;
+            local diff_color = COLOR_GREEN;
+            if (diff_abs > 10) then diff_color = COLOR_RED;
+            elseif (diff_abs > 3) then diff_color = COLOR_WARN; end
+            local sign = (b.diff >= 0) and '+' or '';
+            imgui.TextColored(diff_color, string_format('%s%.1f%%', sign, b.diff * 100));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    '%d-item %ss: observed %.1f%%%% vs expected %.1f%%%%\n%s',
+                    b.items, kill_word, b.obs_rate * 100, b.exp_rate * 100,
+                    diff_abs > 10 and 'Large deviation — model may not fit well.' or
+                    diff_abs > 3 and 'Moderate deviation — more data may help.' or
+                    'Good fit — model matches observation.'));
+            end
+        end
+        imgui.EndTable();
+    end
+end
+
+--- Render Section 4: Co-occurrence Analysis.
+local function render_cooccurrence_section(result, kills)
+    local kw = result.is_battlefield and 'runs' or 'kills';
+    if (kills < analysis.MIN_KILLS_COOCCURRENCE) then
+        imgui.TextColored(COLOR_WARN, string_format(
+            'Low sample size (%d %s). Co-occurrence results below %d %s may be unreliable.',
+            kills, kw, analysis.MIN_KILLS_COOCCURRENCE, kw));
+    end
+
+    local co = result.cooccurrence;
+    if (#co == 0) then
+        imgui.TextDisabled('No co-occurring item pairs found (need items with 5+ drops each).');
+        return;
+    end
+
+    local flags = bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg, ImGuiTableFlags_Sortable,
+        ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY,
+        ImGuiTableFlags_Resizable, ImGuiTableFlags_Reorderable);
+    if imgui.BeginTable('##co_table', 6, flags, { 0, math_min(#co * 24 + 28, 300) }) then
+        imgui.TableSetupColumn('Item A', ImGuiTableColumnFlags_DefaultSort, 130);
+        imgui.TableSetupColumn('Item B', 0, 130);
+        imgui.TableSetupColumn('Observed', ImGuiTableColumnFlags_PreferSortDescending, 60);
+        imgui.TableSetupColumn('Expected', ImGuiTableColumnFlags_PreferSortDescending, 60);
+        imgui.TableSetupColumn('Deviation', ImGuiTableColumnFlags_PreferSortDescending, 65);
+        imgui.TableSetupColumn('Order', ImGuiTableColumnFlags_PreferSortDescending, 80);
+        imgui.TableHeadersRow();
+
+        -- Read sort specs and sort only when spec changes (no per-frame sort)
+        local sort_specs = imgui.TableGetSortSpecs();
+        if (sort_specs ~= nil and sort_specs.Specs ~= nil) then
+            local new_col = sort_specs.Specs.ColumnIndex + 1;
+            local new_asc = (sort_specs.Specs.SortDirection == 1);
+            if (new_col ~= an.co_sort_col or new_asc ~= an.co_sort_asc) then
+                an.co_sort_col = new_col;
+                an.co_sort_asc = new_asc;
+                local key = co_sort_keys[new_col];
+                if (key ~= nil) then
+                    if (new_asc) then
+                        table.sort(co, function(a, b) return (a[key] or 0) < (b[key] or 0); end);
+                    else
+                        table.sort(co, function(a, b) return (a[key] or 0) > (b[key] or 0); end);
+                    end
+                end
+            end
+        end
+
+        for _, row in ipairs(co) do
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.Text(row.name_a);
+            imgui.TableNextColumn(); imgui.Text(row.name_b);
+            imgui.TableNextColumn(); imgui.Text(tostring(row.observed));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format('These items dropped together %d times.', row.observed));
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f', row.expected));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'Expected co-occurrences if independent:\nP(A) * P(B) * %s = %.1f',
+                    kw, row.expected));
+            end
+
+            -- Deviation color
+            imgui.TableNextColumn();
+            local dev = row.deviation;
+            local dev_color = COLOR_GREEN;
+            if (dev < 0.5 or dev > 2.0) then dev_color = COLOR_RED;
+            elseif (dev < 0.8 or dev > 1.2) then dev_color = COLOR_WARN; end
+            imgui.TextColored(dev_color, string_format('%.2fx', dev));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Observed / Expected co-occurrence.\n1.0 = perfect independence.\n> 1.0 = co-occur more than expected.\n< 1.0 = co-occur less (possible shared slot).');
+            end
+
+            -- Order column
+            imgui.TableNextColumn();
+            if (row.order_text ~= nil) then
+                local oc = row.order_consistency;
+                local oc_color = COLOR_GREEN;
+                if (oc < 0.7) then oc_color = COLOR_GRAY;
+                elseif (oc < 0.9) then oc_color = COLOR_WARN; end
+                imgui.TextColored(oc_color, row.order_text);
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip('When both items drop, which arrives first?\nHigh consistency (>90%%) = separate drop table slots\nwith predictable ordering.');
+                end
+            else
+                imgui.TextDisabled('--');
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip('No drop order data available.\nOrder tracking starts after v1.1.1 migration.');
+                end
+            end
+        end
+        imgui.EndTable();
+    end
+end
+
+--- Render Section 5: Shared Slot Candidates.
+local function render_shared_slots_section(result, kills)
+    local kw = result.is_battlefield and 'runs' or 'kills';
+    if (kills < analysis.MIN_KILLS_COOCCURRENCE) then
+        imgui.TextColored(COLOR_WARN, string_format(
+            'Low sample size (%d %s). Shared slot detection below %d %s may produce false positives.',
+            kills, kw, analysis.MIN_KILLS_COOCCURRENCE, kw));
+    end
+
+    local ss = result.shared_slot_candidates;
+    if (#ss == 0) then
+        imgui.TextColored(COLOR_GREEN, 'No shared slot candidates detected.');
+        imgui.TextDisabled('All item pairs with sufficient data have been observed co-occurring.');
+        return;
+    end
+
+    imgui.TextColored(COLOR_WARN, 'Items that NEVER co-occur despite sufficient sample sizes:');
+    imgui.Spacing();
+
+    local flags = bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg, ImGuiTableFlags_SizingStretchProp,
+        ImGuiTableFlags_Resizable, ImGuiTableFlags_Reorderable);
+    if imgui.BeginTable('##ss_table', 6, flags, { 0, math_min(#ss * 24 + 28, 250) }) then
+        imgui.TableSetupColumn('Item A', 0, 130);
+        imgui.TableSetupColumn('Item B', 0, 130);
+        imgui.TableSetupColumn('A Drops', 0, 55);
+        imgui.TableSetupColumn('B Drops', 0, 55);
+        imgui.TableSetupColumn('Expected Co-occur', 0, 95);
+        imgui.TableSetupColumn('Confidence', 0, 70);
+        imgui.TableHeadersRow();
+
+        for _, row in ipairs(ss) do
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.Text(row.name_a);
+            imgui.TableNextColumn(); imgui.Text(row.name_b);
+            imgui.TableNextColumn(); imgui.Text(tostring(row.drops_a));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format('%s dropped %d times total.', row.name_a, row.drops_a));
+            end
+            imgui.TableNextColumn(); imgui.Text(tostring(row.drops_b));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format('%s dropped %d times total.', row.name_b, row.drops_b));
+            end
+            imgui.TableNextColumn(); imgui.Text(string_format('%.1f', row.expected_co));
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'If independent: P(A)*P(B)*%s = %.1f\n'
+                    .. 'But observed 0 co-occurrences.\n'
+                    .. 'Higher expected = stronger shared slot evidence.',
+                    kw, row.expected_co));
+            end
+
+            imgui.TableNextColumn();
+            local conf_color = COLOR_GREEN;
+            if (row.confidence == 'High') then conf_color = COLOR_YELLOW;
+            elseif (row.confidence == 'Possible') then conf_color = COLOR_GRAY; end
+            imgui.TextColored(conf_color, row.confidence);
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    'Expected %.1f co-occurrences but observed 0.\n'
+                    .. 'These items likely share a drop table slot\n'
+                    .. '(the server picks one OR the other, never both).',
+                    row.expected_co));
+            end
+        end
+        imgui.EndTable();
+    end
+
+    -- Drop position analysis for shared slot candidates
+    local dp = result.drop_positions or T{};
+    if (#dp > 0 and #ss > 0) then
+        imgui.Spacing();
+        imgui.TextDisabled('Drop Position Analysis (post-v1.1.1 data only):');
+
+        -- Build quick lookup of shared slot item IDs (cached on result)
+        if (result._ss_relevant == nil) then
+            local ss_items = {};
+            for _, ss_row in ipairs(ss) do
+                ss_items[ss_row.item_a] = true;
+                ss_items[ss_row.item_b] = true;
+            end
+            local rel = {};
+            for _, p in ipairs(dp) do
+                if (ss_items[p.item_id]) then
+                    rel[#rel + 1] = p;
+                end
+            end
+            result._ss_relevant = rel;
+        end
+        local relevant = result._ss_relevant;
+
+        if (#relevant > 0) then
+            for _, p in ipairs(relevant) do
+                local pos_parts = {};
+                for pos, cnt in pairs(p.positions) do
+                    pos_parts[#pos_parts + 1] = string_format('pos %d: %dx', pos, cnt);
+                end
+                table.sort(pos_parts);
+                imgui.BulletText(string_format('%s: %s', p.item_name, table.concat(pos_parts, ', ')));
+            end
+        else
+            imgui.TextDisabled('No drop order data yet for shared slot candidates.');
+        end
+    end
+end
+
+--- Render Battlefield Drop Structure (replaces Slot Count Estimation for battlefields).
+local function render_battlefield_drop_structure(result)
+    local se = result.slot_estimate;
+    if (se == nil) then return; end
+
+    local guaranteed = se.guaranteed_items or T{};
+    local variable = se.variable_items or T{};
+    local std_dev = se.items_std_dev or 0;
+
+    -- Summary metrics table
+    local tflags = bit.bor(ImGuiTableFlags_SizingFixedFit, ImGuiTableFlags_NoHostExtendX);
+    if imgui.BeginTable('##bf_struct_tbl', 2, tflags) then
+        imgui.TableSetupColumn('Label', 0, 220);
+        imgui.TableSetupColumn('Value', 0, 250);
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Items per encounter:');
+        imgui.TableNextColumn();
+        local consistency_color = (std_dev < 0.5) and COLOR_GREEN or (std_dev < 1.0) and COLOR_WARN or COLOR_LIGHT_GRAY;
+        imgui.TextColored(consistency_color, string_format('%.1f avg (std dev: %.1f)', se.avg_items_per_kill, std_dev));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(
+                'Average items dropped per battlefield encounter.\n'
+                .. 'Low std dev = consistent slot count (fixed drop table).\n'
+                .. 'High std dev = variable drops (conditional slots?).');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Guaranteed drops:');
+        imgui.TableNextColumn(); imgui.TextColored(COLOR_GREEN, tostring(#guaranteed));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Items with 95%%%% or higher drop rate.\nThese drop on virtually every run.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Variable drops:');
+        imgui.TableNextColumn(); imgui.Text(tostring(#variable));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Items with less than 95%%%% drop rate.\nThese are contested or low-chance slots.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Max items in one encounter:');
+        imgui.TableNextColumn(); imgui.Text(tostring(se.max_observed));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('The most items seen in a single run.\nHard lower bound on total drop slots.');
+        end
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.Text('Unique items seen:');
+        imgui.TableNextColumn(); imgui.Text(tostring(se.unique_items));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Total distinct items (excluding gil) from this battlefield.\nItems sharing a slot inflate this count above actual slot count.');
+        end
+
+        imgui.EndTable();
+    end
+
+    imgui.Spacing();
+
+    -- Guaranteed items list
+    if (#guaranteed > 0) then
+        imgui.TextColored(COLOR_GREEN, 'Guaranteed:');
+        for _, item in ipairs(guaranteed) do
+            imgui.BulletText(string_format('%s  %.1f%%%%  [%d/%d]',
+                item.item_name, item.rate * 100, item.drops, item.kills));
+        end
+        imgui.Spacing();
+    end
+
+    -- Variable items list
+    if (#variable > 0) then
+        imgui.TextColored(COLOR_WARN, 'Variable:');
+        for _, item in ipairs(variable) do
+            imgui.BulletText(string_format('%s  %.1f%%%%  [%d/%d]',
+                item.item_name, item.rate * 100, item.drops, item.kills));
+        end
+    end
+
+    if (#guaranteed == 0 and #variable == 0) then
+        imgui.TextDisabled('No item drops recorded.');
+    end
+end
+
+--- Render Inferred Battlefield Drop Table (union-find slot grouping).
+local function render_inferred_drop_table(result, kills)
+    local slots = result.inferred_slots;
+
+    if (kills < analysis.MIN_KILLS_COOCCURRENCE) then
+        imgui.TextColored(COLOR_WARN, string_format(
+            'Low sample size (%d runs). Inferred slots below %d runs may be inaccurate.',
+            kills, analysis.MIN_KILLS_COOCCURRENCE));
+    end
+
+    if (slots == nil or #slots == 0) then
+        imgui.TextDisabled('No items with sufficient data for slot inference.');
+        return;
+    end
+
+    imgui.TextDisabled('Items that never drop together are inferred to share a slot.');
+    imgui.Spacing();
+
+    for slot_idx, slot in ipairs(slots) do
+        local items = slot.items;
+        local label_color = slot.is_guaranteed and COLOR_GREEN or (slot.total_rate >= 0.5) and COLOR_WARN or COLOR_GRAY;
+
+        if (#items == 1) then
+            -- Single-item slot
+            local item = items[1];
+            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%%%):',
+                slot_idx, slot.total_rate * 100));
+            imgui.SameLine();
+            imgui.Text(item.item_name);
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(string_format(
+                    '%s\nDrop rate: %.1f%%%% (%d drops / %d runs)\n\n%s',
+                    item.item_name, item.rate * 100, item.drops, kills,
+                    slot.is_guaranteed and 'Guaranteed drop — appears on virtually every run.'
+                    or 'Independent slot — no shared items detected.'));
+            end
+        else
+            -- Multi-item (shared) slot
+            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%%%):',
+                slot_idx, slot.total_rate * 100));
+            imgui.SameLine();
+
+            -- Build inline item list: "ItemA (12.0%) | ItemB (8.0%)"
+            -- %%%% → string_format produces %% → ImGui printf displays %
+            local parts = {};
+            for _, item in ipairs(items) do
+                parts[#parts + 1] = string_format('%s (%.1f%%%%)', item.item_name, item.rate * 100);
+            end
+            imgui.Text(table.concat(parts, ' | '));
+            if imgui.IsItemHovered() then
+                local tip_lines = { string_format('Shared slot — %d mutually exclusive items:', #items) };
+                for _, item in ipairs(items) do
+                    tip_lines[#tip_lines + 1] = string_format('  %s: %.1f%%%% (%d drops)', item.item_name, item.rate * 100, item.drops);
+                end
+                tip_lines[#tip_lines + 1] = '';
+                tip_lines[#tip_lines + 1] = 'These items were never observed dropping together.';
+                tip_lines[#tip_lines + 1] = 'The server picks one from this group per run.';
+                imgui.SetTooltip(table.concat(tip_lines, '\n'));
+            end
+        end
+    end
+
+    -- Summary
+    imgui.Spacing();
+    local shared_count = 0;
+    for _, slot in ipairs(slots) do
+        if (#slot.items > 1) then shared_count = shared_count + 1; end
+    end
+    if (shared_count == 0) then
+        imgui.TextDisabled('All items appear to be on independent slots.');
+    else
+        imgui.TextDisabled(string_format('%d slot(s), %d shared — based on %d runs.',
+            #slots, shared_count, kills));
+    end
+end
+
+--- Main Slot Analysis tab renderer.
+local function render_slot_analysis()
+    if (analysis == nil) then
+        imgui.TextColored(COLOR_ERR, 'Analysis module failed to load. Slot Analysis unavailable.');
+        return;
+    end
+
+    -- Lazy init: pass db.conn to analysis once it's available
+    if (not an.analysis_inited and db.conn ~= nil) then
+        analysis.init(db.conn);
+        an.analysis_inited = true;
+    end
+
+    -- Row 1: Category radio buttons (same as Statistics for visual consistency)
+    if imgui.RadioButton('Field##an', an.category == 0) then
+        an.category = 0;
+        reset_an_filter(0);
+    end
+    imgui.SameLine();
+    if imgui.RadioButton('Battlefields##an', an.category == 1) then
+        an.category = 1;
+        reset_an_filter(8);
+    end
+    imgui.SameLine();
+    if imgui.RadioButton('Instances##an', an.category == 2) then
+        an.category = 2;
+        reset_an_filter(7);  -- default to Dynamis (only supported instance)
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Slot Analysis Categories\n'
+            .. '------------------------------\n'
+            .. 'Select a category, then a zone and mob to analyze.\n'
+            .. 'All analysis uses nearby kills only — distant kills\n'
+            .. 'are excluded because you only see drops that entered\n'
+            .. 'your treasure pool (empty distant kills are invisible).\n\n'
+            .. '  Field — Open-world mobs (excludes instance content)\n'
+            .. '  Battlefields — BCNM (chest drops) and HTBF (direct drops)\n'
+            .. '  Instances — Dynamis (Omen/Ambuscade/Sortie WIP)\n\n'
+            .. 'Chest/Coffer is not shown here — chests give one\n'
+            .. 'outcome per open, so slot analysis does not apply.\n'
+            .. 'See the Statistics tab for chest/coffer drop rates.');
+    end
+
+    -- Row 2: Sub-filter radio buttons (Battlefields / Instances)
+    if (an.category == 1) then
+        imgui.Spacing();
+        if imgui.RadioButton('All BF##an', an.source_filter == 8) then reset_an_filter(8); end
+        imgui.SameLine();
+        if imgui.RadioButton('BCNM##an', an.source_filter == 2) then reset_an_filter(2); end
+        imgui.SameLine();
+        if imgui.RadioButton('HTBF##an', an.source_filter == 3) then reset_an_filter(3); end
+    elseif (an.category == 2) then
+        imgui.Spacing();
+        if imgui.RadioButton('Dynamis##an', an.source_filter == 7) then reset_an_filter(7); end
+        imgui.SameLine();
+        imgui.TextDisabled('Ambuscade / Omen / Sortie (WIP)');
+    end
+
+    imgui.Spacing();
+
+    -- Zone/Battlefield combo
+    local combo_str, combo_entries = build_an_filter(an.source_filter);
+    imgui.SetNextItemWidth(300);
+    if imgui.Combo('##an_zone', an.mob_idx, combo_str) then
+        local idx = an.mob_idx[1];
+        if (idx == 0) then
+            an.zone_filter = -1;
+            an.name_filter = nil;
+            an.mob_filter = nil;
+            an.mob_level_cap = nil;
+            an.effective_sf = nil;
+            an.result = nil;
+            an.mob_stats = nil;
+        elseif (combo_entries ~= nil and combo_entries[idx] ~= nil) then
+            local e = combo_entries[idx];
+            an.zone_filter = e.zone_id;
+            an.name_filter = e.name;
+            an.mob_filter = nil;
+            an.mob_level_cap = e.level_cap;  -- bf_difficulty for HTBF, level_cap for BCNM
+            an.effective_sf = e.effective_sf;  -- remapped sf (2 or 3) for All BF entries
+            an.result = nil;
+            an.mob_stats = nil;
+        end
+        an.cache_dirty = true;
+    end
+
+    -- BCNM/HTBF/All BF zone combo = battlefield; others need mob combo
+    if (an.zone_filter >= 0) then
+        local needs_mob_combo = (an.source_filter ~= 2 and an.source_filter ~= 3 and an.source_filter ~= 8);
+
+        if (needs_mob_combo) then
+            local mob_str, mob_list = build_mob_combo(an.source_filter, an.zone_filter, an.name_filter);
+            an_mob_sel[1] = 0;
+            -- Find current selection
+            if (an.mob_filter ~= nil and mob_list ~= nil) then
+                for i, m in ipairs(mob_list) do
+                    if (m.mob_name == an.mob_filter) then
+                        an_mob_sel[1] = i;
+                        break;
+                    end
+                end
+            end
+
+            imgui.SameLine();
+            imgui.SetNextItemWidth(300);
+            if imgui.Combo('##an_mob', an_mob_sel, mob_str) then
+                local idx = an_mob_sel[1];
+                if (idx == 0) then
+                    an.mob_filter = nil;
+                    an.mob_level_cap = nil;
+                    an.effective_sf = nil;
+                    an.result = nil;
+                    an.mob_stats = nil;
+                elseif (mob_list ~= nil and mob_list[idx] ~= nil) then
+                    an.mob_filter = mob_list[idx].mob_name;
+                    an.mob_level_cap = mob_list[idx].level_cap;
+                    an.result = nil;
+                    an.mob_stats = nil;
+                end
+                an.cache_dirty = true;
+            end
+        else
+            -- BCNM/HTBF: mob_filter is the battlefield name from zone combo
+            if (an.mob_filter == nil and an.name_filter ~= nil) then
+                an.mob_filter = an.name_filter;
+            end
+        end
+    end
+
+    imgui.Separator();
+
+    -- Determine what to analyze
+    local mob_name = an.mob_filter;
+    local zone_id = an.zone_filter;
+    local level_cap = an.mob_level_cap;
+    -- For All BF (sf=8), route through BCNM (2) or HTBF (3) path
+    local query_sf = an.effective_sf or an.source_filter;
+
+    if (mob_name == nil or zone_id < 0) then
+        imgui.Spacing();
+        imgui.TextDisabled('Select a zone and mob to analyze drop slot probabilities.');
+        an.cache_dirty = false;
+        return;
+    end
+
+    -- Get mob stats (from db cache)
+    if (an.mob_stats == nil or an.cache_dirty) then
+        an.mob_stats = db.get_mob_stats(mob_name, zone_id, query_sf, level_cap);
+    end
+
+    if (an.mob_stats == nil or an.mob_stats.kills == 0) then
+        imgui.TextDisabled('No kill data for this mob.');
+        an.cache_dirty = false;
+        return;
+    end
+
+    -- Compute analysis (cached)
+    if (an.result == nil or an.cache_dirty) then
+        an.result = analysis.compute(mob_name, zone_id, query_sf, level_cap, an.mob_stats);
+        an.cache_dirty = false;
+    end
+
+    -- Nearby kills only — distant kills have partial drop visibility
+    local kills = an.mob_stats.kills - (an.mob_stats.distant_kills or 0);
+
+    if (an.result == nil) then
+        if (kills == 0 and an.mob_stats.kills > 0) then
+            local sf = an.source_filter;
+            local dkw = (sf == 2 or sf == 3 or sf == 8) and 'runs' or 'kills';
+            imgui.TextDisabled('All ' .. dkw .. ' are distant — slot analysis requires nearby ' .. dkw .. '.');
+        else
+            imgui.TextDisabled('Insufficient data for analysis.');
+        end
+        return;
+    end
+
+    -- Scrollable content area for analysis results
+    imgui.BeginChild('##an_scroll', { 0, 0 });
+
+    local is_bf = an.result.is_battlefield;
+    local kw = is_bf and 'runs' or 'kills';
+
+    -- Header
+    imgui.TextColored(COLOR_CYAN, mob_name);
+    imgui.SameLine();
+    imgui.TextDisabled(string_format('(%s nearby %s)', format_count(kills), kw));
+    if imgui.IsItemHovered() then
+        local distant = an.mob_stats.distant_kills or 0;
+        if (distant > 0) then
+            imgui.SetTooltip(string_format(
+                'Slot analysis uses nearby %s only (%s nearby, %s distant).\n'
+                .. 'Distant %s are excluded because you only see drops\n'
+                .. 'that entered your treasure pool — empty distant %s\n'
+                .. 'are invisible, which would bias all analysis.',
+                kw, format_count(kills), format_count(distant), kw, kw));
+        else
+            imgui.SetTooltip('All ' .. kw .. ' are nearby (witnessed defeat message).\nNo distant ' .. kw .. ' to exclude.');
+        end
+    end
+    imgui.Spacing();
+
+    -- Section 1: Confidence Intervals (open by default, same for all modes)
+    local ci_label = is_bf and 'Drop Rate Confidence Intervals (95% Wilson Score)' or 'Confidence Intervals (95% Wilson Score)';
+    local ci_open = imgui.CollapsingHeader(ci_label, ImGuiTreeNodeFlags_DefaultOpen);
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'How precise are the observed drop rates?\n\n'
+            .. 'Wilson Score CI gives a range where the TRUE drop rate\n'
+            .. 'likely falls (95%% confidence). Narrower = more reliable.\n'
+            .. (is_bf and 'More reliable with 30+ runs.' or 'More reliable with 30+ kills.'));
+    end
+    if (ci_open) then
+        render_ci_section(an.result, kills);
+    end
+
+    -- Section 2: Slot structure (mode-aware)
+    if (is_bf) then
+        -- Battlefield: Drop Structure replaces Slot Count Estimation
+        local cs_open = imgui.CollapsingHeader('Battlefield Drop Structure', ImGuiTreeNodeFlags_DefaultOpen);
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(
+                'Battlefield drop table structure.\n\n'
+                .. 'Battlefields have fixed drop slots — some always drop\n'
+                .. '(guaranteed), others have a chance (variable).\n'
+                .. 'Items per encounter shows how consistent the slot count is.');
+        end
+        if (cs_open) then
+            render_battlefield_drop_structure(an.result);
+        end
+    else
+        -- Field/Instance: standard Slot Count Estimation
+        local se_open = imgui.CollapsingHeader('Slot Count Estimation', ImGuiTreeNodeFlags_DefaultOpen);
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(
+                'How many independent drop slots does this mob have?\n\n'
+                .. 'FFXI mobs have a drop table of independent slots,\n'
+                .. 'each with one item and a fixed probability. The server\n'
+                .. 'rolls each slot independently on kill.\n\n'
+                .. 'Key indicators:\n'
+                .. '  Rate sum > 1.0 = multiple independent slots confirmed\n'
+                .. '  Empty kill rate matches model = slots are independent');
+        end
+        if (se_open) then
+            render_slot_section(an.result);
+        end
+    end
+
+    -- Section 3: Items-Per-Kill/Encounter Distribution
+    local dist_label = is_bf and 'Items-Per-Encounter Distribution' or 'Items-Per-Kill Distribution';
+    local dist_open = imgui.CollapsingHeader(dist_label);
+    if imgui.IsItemHovered() then
+        if (is_bf) then
+            imgui.SetTooltip(
+                'How many items drop per encounter?\n\n'
+                .. 'Compares the observed distribution against what the\n'
+                .. 'independent slot model predicts (Poisson Binomial).\n'
+                .. 'Large deviations suggest slots may not be independent.');
+        else
+            imgui.SetTooltip(
+                'How many items drop per kill?\n\n'
+                .. 'Compares the observed distribution against what the\n'
+                .. 'independent slot model predicts (Poisson Binomial).\n'
+                .. 'Large deviations suggest slots may not be independent.');
+        end
+    end
+    if (dist_open) then
+        render_distribution_section(an.result);
+    end
+
+    -- Section 4: Co-occurrence Analysis (collapsed by default)
+    local co_open = imgui.CollapsingHeader('Co-occurrence Analysis');
+    if imgui.IsItemHovered() then
+        if (is_bf) then
+            imgui.SetTooltip(
+                'Do item pairs drop together as often as expected?\n\n'
+                .. 'If two items are on independent slots, their co-occurrence\n'
+                .. 'rate should equal P(A) * P(B). Deviation from 1.0x means\n'
+                .. 'the items may share a slot or be correlated.\n\n'
+                .. 'For battlefield drops, items on different slots always\n'
+                .. 'co-occur. Items on the same slot never co-occur.\n'
+                .. 'More reliable with 50+ runs.');
+        else
+            imgui.SetTooltip(
+                'Do item pairs drop together as often as expected?\n\n'
+                .. 'If two items are on independent slots, their co-occurrence\n'
+                .. 'rate should equal P(A) * P(B). Deviation from 1.0x means\n'
+                .. 'the items may share a slot or be correlated.\n'
+                .. 'More reliable with 50+ kills.');
+        end
+    end
+    if (co_open) then
+        render_cooccurrence_section(an.result, kills);
+    end
+
+    -- Section 5: Shared Slot Candidates (collapsed by default)
+    local ss_open = imgui.CollapsingHeader('Shared Slot Candidates');
+    if imgui.IsItemHovered() then
+        if (is_bf) then
+            imgui.SetTooltip(
+                'Items that NEVER drop together despite high individual rates.\n\n'
+                .. 'For battlefield drops, shared slots mean items that are\n'
+                .. 'mutually exclusive outcomes from the same drop table position.\n'
+                .. 'The server picks one OR the other per run — never both.');
+        else
+            imgui.SetTooltip(
+                'Items that NEVER drop together despite high individual rates.\n\n'
+                .. 'If two items share a drop table slot, the server picks one\n'
+                .. 'OR the other — never both. Zero co-occurrences with high\n'
+                .. 'expected count is strong evidence for a shared slot.');
+        end
+    end
+    if (ss_open) then
+        render_shared_slots_section(an.result, kills);
+    end
+
+    -- Section 6 (battlefields only): Inferred Drop Table
+    if (is_bf) then
+        local inf_open = imgui.CollapsingHeader('Inferred Battlefield Drop Table');
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(
+                'Reverse-engineered battlefield drop table.\n\n'
+                .. 'Groups items into slots based on co-occurrence data:\n'
+                .. 'items that NEVER drop together share a slot.\n'
+                .. 'More reliable with 50+ runs.');
+        end
+        if (inf_open) then
+            render_inferred_drop_table(an.result, kills);
+        end
+    end
+
+    imgui.EndChild();
+end
+
+-------------------------------------------------------------------------------
+-- Export Tab
+-------------------------------------------------------------------------------
 
 local function render_export_tab()
     imgui.Spacing();
@@ -2292,13 +3838,12 @@ local function render_settings_tab()
     imgui.TextColored(settings_header_color, 'Live Feed');
     imgui.Separator();
 
-    local v;
     local slider_w = math_min((imgui.GetContentRegionAvail()), 250);
 
-    v = { s.feed_max_entries };
+    set_int_buf[1] = s.feed_max_entries;
     imgui.PushItemWidth(slider_w);
-    if imgui.SliderInt('Live Feed Max Entries', v, 10, 500) then
-        s.feed_max_entries = v[1];
+    if imgui.SliderInt('Live Feed Max Entries', set_int_buf, 10, 500) then
+        s.feed_max_entries = set_int_buf[1];
         ui.settings_dirty = true;
     end
     imgui.PopItemWidth();
@@ -2306,18 +3851,18 @@ local function render_settings_tab()
         imgui.SetTooltip('Maximum number of entries shown in the Live Feed tab.');
     end
 
-    v = { s.show_empty_kills };
-    if imgui.Checkbox('Show Kills Without Drops', v) then
-        s.show_empty_kills = v[1];
+    set_bool_buf[1] = s.show_empty_kills;
+    if imgui.Checkbox('Show Kills Without Drops', set_bool_buf) then
+        s.show_empty_kills = set_bool_buf[1];
         ui.settings_dirty = true;
     end
     if imgui.IsItemHovered() then
         imgui.SetTooltip('Show mobs that died without dropping anything in the Live Feed.\nUseful for tracking TH levels on empty kills.');
     end
 
-    v = { s.show_gil_drops ~= false };
-    if imgui.Checkbox('Show Kills With Gil Drops', v) then
-        s.show_gil_drops = v[1];
+    set_bool_buf[1] = s.show_gil_drops ~= false;
+    if imgui.Checkbox('Show Kills With Gil Drops', set_bool_buf) then
+        s.show_gil_drops = set_bool_buf[1];
         ui.settings_dirty = true;
     end
     if imgui.IsItemHovered() then
@@ -2328,10 +3873,10 @@ local function render_settings_tab()
     imgui.TextColored(settings_header_color, 'Compact Mode');
     imgui.Separator();
 
-    v = { s.compact_bg_alpha or 0.8 };
+    set_float_buf[1] = s.compact_bg_alpha or 0.8;
     imgui.PushItemWidth(slider_w);
-    if imgui.SliderFloat('Background Opacity', v, 0.0, 1.0, '%.2f') then
-        s.compact_bg_alpha = v[1];
+    if imgui.SliderFloat('Background Opacity', set_float_buf, 0.0, 1.0, '%.2f') then
+        s.compact_bg_alpha = set_float_buf[1];
         ui.settings_dirty = true;
     end
     imgui.PopItemWidth();
@@ -2339,9 +3884,9 @@ local function render_settings_tab()
         imgui.SetTooltip('Background transparency for compact mode.\n0 = fully transparent, 1 = fully opaque.');
     end
 
-    v = { s.compact_titlebar ~= false };
-    if imgui.Checkbox('Show Title Bar', v) then
-        s.compact_titlebar = v[1];
+    set_bool_buf[1] = s.compact_titlebar ~= false;
+    if imgui.Checkbox('Show Title Bar', set_bool_buf) then
+        s.compact_titlebar = set_bool_buf[1];
         ui.settings_dirty = true;
     end
     if imgui.IsItemHovered() then
@@ -2352,9 +3897,9 @@ local function render_settings_tab()
     imgui.TextColored(settings_header_color, 'Startup');
     imgui.Separator();
 
-    v = { s.show_on_load };
-    if imgui.Checkbox('Open window when addon loads', v) then
-        s.show_on_load = v[1];
+    set_bool_buf[1] = s.show_on_load;
+    if imgui.Checkbox('Open window when addon loads', set_bool_buf) then
+        s.show_on_load = set_bool_buf[1];
         ui.settings_dirty = true;
     end
 
@@ -2375,12 +3920,6 @@ end
 -------------------------------------------------------------------------------
 -- Compact Mode
 -------------------------------------------------------------------------------
--- Helper: read a theme color and return it with alpha scaled
-local function scaled_color(idx, a)
-    local r, g, b, ca = imgui.GetStyleColorVec4(idx);
-    return { r, g, b, ca * a };
-end
-
 -- Compact mode style color indices (hoisted to avoid per-frame allocation)
 local compact_style_color_ids = {
     ImGuiCol_Border, ImGuiCol_BorderShadow,
@@ -2390,6 +3929,20 @@ local compact_style_color_ids = {
     ImGuiCol_TableRowBg, ImGuiCol_TableRowBgAlt,
     ImGuiCol_ResizeGrip, ImGuiCol_ResizeGripHovered, ImGuiCol_ResizeGripActive,
 };
+
+-- Pre-allocated color tables for scaled_color (avoids 14 table allocs per frame)
+local compact_scaled_colors = {};
+for i = 1, #compact_style_color_ids do
+    compact_scaled_colors[i] = { 0, 0, 0, 0 };
+end
+
+-- Helper: read a theme color, scale alpha, write into pre-allocated table
+local function scaled_color(pool_idx, color_idx, a)
+    local r, g, b, ca = imgui.GetStyleColorVec4(color_idx);
+    local c = compact_scaled_colors[pool_idx];
+    c[1] = r; c[2] = g; c[3] = b; c[4] = ca * a;
+    return c;
+end
 
 local function render_compact()
     if (restore_compact_size and saved_compact_size) then
@@ -2408,8 +3961,8 @@ local function render_compact()
 
     -- Scale all UI element colors by the opacity setting
     local a = bg_alpha;
-    for _, col_idx in ipairs(compact_style_color_ids) do
-        imgui.PushStyleColor(col_idx, scaled_color(col_idx, a));
+    for i, col_idx in ipairs(compact_style_color_ids) do
+        imgui.PushStyleColor(col_idx, scaled_color(i, col_idx, a));
     end
 
     -- Window flags: optional title bar
@@ -2419,6 +3972,7 @@ local function render_compact()
         win_flags = win_flags + ImGuiWindowFlags_NoTitleBar;
     end
 
+    local compact_ok, compact_err = pcall(function()
     if imgui.Begin('LootScope', is_open, win_flags) then
         local limit = (s ~= nil) and math_min(s.feed_max_entries, 20) or 20;
         local raw_drops = db.get_recent_drops(limit);
@@ -2501,17 +4055,57 @@ local function render_compact()
                     end
 
                     imgui.TableNextColumn();
+                    -- Battlefield prefix for mob kills inside BCNM/HTBF
+                    local c_bf_diff = tonumber(drop.bf_difficulty);
+                    local c_has_bf = (drop.battlefield ~= nil and drop.battlefield ~= '');
+                    if (drop.source_type == 0 and c_has_bf) then
+                        local c_bf_label = (c_bf_diff ~= nil and c_bf_diff > 0) and 'HTBF' or 'BCNM';
+                        imgui.TextColored(source_colors[3], '[' .. c_bf_label .. '] ');
+                        imgui.SameLine(0, 0);
+                    end
                     imgui.TextDisabled(drop.mob_name or '');
-                    if imgui.IsItemHovered() and drop.mob_server_id ~= nil and drop.mob_server_id > 0 then
-                        imgui.SetTooltip(string_format('Mob ID: %.0f', tonumber(drop.mob_server_id)));
+                    -- HTBF difficulty badge (inline)
+                    if (c_bf_diff ~= nil and c_bf_diff > 0) then
+                        imgui.SameLine(0, 4);
+                        local c_dc = difficulty_colors[c_bf_diff] or COLOR_GRAY;
+                        imgui.TextColored(c_dc, '[' .. tracker.get_difficulty_label(c_bf_diff) .. ']');
+                    end
+                    if imgui.IsItemHovered() then
+                        local tip = '';
+                        if (drop.mob_server_id ~= nil and drop.mob_server_id > 0) then
+                            tip = string_format('Mob ID: %.0f', tonumber(drop.mob_server_id));
+                        end
+                        if (c_has_bf) then
+                            if (tip ~= '') then tip = tip .. '\n'; end
+                            tip = tip .. 'Battlefield: ' .. drop.battlefield;
+                        end
+                        if (c_bf_diff ~= nil and c_bf_diff > 0) then
+                            if (tip ~= '') then tip = tip .. '\n'; end
+                            tip = tip .. 'Difficulty: ' .. tracker.get_difficulty_full_label(c_bf_diff);
+                            local c_bf_name = drop.bf_name;
+                            if (c_bf_name ~= nil and c_bf_name ~= '') then
+                                tip = tip .. '\nHTBF: ' .. c_bf_name;
+                            end
+                        end
+                        if (tip ~= '') then
+                            imgui.SetTooltip(tip);
+                        end
                     end
 
                     imgui.TableNextColumn();
                     imgui.TextDisabled(drop.zone_name or '');
 
                     imgui.TableNextColumn();
-                    local src_color = source_colors[drop.source_type] or source_colors[0];
-                    imgui.TextColored(src_color, tracker.get_source_label(drop.source_type));
+                    local c_src_c;
+                    local c_src_l;
+                    if (drop.source_type == 0 and c_has_bf) then
+                        c_src_c = source_colors[3];
+                        c_src_l = (c_bf_diff ~= nil and c_bf_diff > 0) and 'HTBF' or 'BCNM';
+                    else
+                        c_src_c = source_colors[drop.source_type] or source_colors[0];
+                        c_src_l = tracker.get_source_label(drop.source_type, c_bf_diff);
+                    end
+                    imgui.TextColored(c_src_c, c_src_l);
 
                     imgui.TableNextColumn();
                     if ((drop.quantity or 1) > 1) then
@@ -2627,6 +4221,7 @@ local function render_compact()
         end
     end
     imgui.End();
+    end); -- pcall: ensures PopStyleColor runs even on error
     imgui.PopStyleColor(#compact_style_color_ids);
 end
 
@@ -2683,6 +4278,17 @@ local function render_full()
 
         imgui.Separator();
 
+        -- Propagate DB dirty flags BEFORE tab rendering.
+        -- Tabs are lazy-evaluated (only the active tab runs), so propagation
+        -- inside each tab's render function would miss inactive tabs.
+        if (db.stats_dirty) then
+            stats_cache_dirty = true;
+            if (analysis ~= nil and an.analysis_inited) then
+                an.cache_dirty = true;
+                analysis.invalidate();
+            end
+        end
+
         -- Tabs
         if imgui.BeginTabBar('lootscope_tabs') then
             if imgui.BeginTabItem('Live Feed') then
@@ -2692,6 +4298,11 @@ local function render_full()
 
             if imgui.BeginTabItem('Statistics') then
                 render_statistics();
+                imgui.EndTabItem();
+            end
+
+            if imgui.BeginTabItem('Slot Analysis') then
+                render_slot_analysis();
                 imgui.EndTabItem();
             end
 
@@ -2714,9 +4325,7 @@ local function render_full()
             imgui.EndTabBar();
         end
 
-        -- Reset confirmation popups (shared by toolbar Reset button and Settings Clear All Data)
-        -- OpenPopup must be at the same ID scope as BeginPopupModal, so we trigger here
-        -- rather than inside render_settings_tab() which is nested inside a tab item.
+        -- Reset popups (must be at same ID scope as BeginPopupModal, not inside tab)
         if (ui.reset_step == 1) then
             imgui.OpenPopup('Clear Data Warning##ls');
         end
@@ -2804,6 +4413,12 @@ function ui.render()
 
     -- Advanced Export is a standalone window (no dimming)
     render_advanced_export_window();
+
+    -- Clear per-frame notification flags (per-cache dirty flags handle invalidation)
+    db.stats_dirty = false;
+    db.kills_dirty = false;
+    db.drops_dirty = false;
+    db.chest_events_dirty = false;
 end
 
 -------------------------------------------------------------------------------

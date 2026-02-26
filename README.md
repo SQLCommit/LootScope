@@ -1,13 +1,14 @@
-# LootScope v1.0.0 - Loot Drop Tracker for Ashita v4.3
+# LootScope v1.1.1 - Loot Drop Tracker for Ashita v4.30
 
-Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
+Loot drop tracker for Ashita v4.30 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
 
 ---
 
 ## Features
 
 - **Live Feed**: Real-time scrolling table of all loot drops with configurable columns. Tooltips show Mob ID, Vana'diel time, moon phase, and weather. Filterable: hide empty kills or mob gil drops.
-- **Statistics**: Per-mob kill counts (nearby + distant), drop rates (nearby rate + combined rate with distant bias), unique items, per-item breakdowns, and per-spawn (Mob ID) breakdown with sortable columns. Source-type radio buttons (Mob, BCNM, Chest/Coffer) filter by kill source, each with a `(?)` tooltip explaining edge cases. Context-sensitive dropdown: zones for Mobs, battlefield names for BCNMs, entity names for Chests/Coffers.
+- **Statistics**: Per-mob kill counts (nearby + distant), drop rates (nearby rate + combined rate with distant bias), unique items, per-item breakdowns, and per-spawn (Mob ID) breakdown with sortable columns. Two-row grouped filter: Row 1 selects a category (Field, Battlefields, Instances, Chest/Coffer), Row 2 shows context-sensitive sub-filters (Battlefields: All/BCNM/HTBF; Instances: Dynamis — Ambuscade/Omen/Sortie WIP). Each category has a `(?)` tooltip explaining detection methods and edge cases. Filter combo dropdown below for zone/battlefield selection. The "All" Battlefields view shows battlefield names with both Lv Cap and Difficulty columns, grouping by battlefield + zone + level cap + difficulty.
+- **Slot Analysis**: Per-mob drop slot probability analysis. Wilson score 95% confidence intervals, slot count estimation (rate sum, empty kill model fit), items-per-kill distribution with Poisson Binomial expected values, co-occurrence analysis (deviation from independence), shared slot candidate detection (items that never co-occur), and drop arrival order tracking for drop table position inference. Battlefield mode (BCNM/HTBF/All Battlefields) automatically switches to specialized sections: Drop Structure (guaranteed vs variable items, items-per-encounter stats) and Inferred Drop Table (union-find grouping of co-occurrence data into probable slots). All data visible from the first kill — low-sample warnings shown when appropriate, but nothing gated behind minimum kill counts. Tooltips adapt to context (kills/runs, per-kill/per-encounter). Chest/Coffer excluded (independent slot model doesn't apply). Uses same category/zone/mob filter system as Statistics.
 - **Two-Tier Distant Kill Tracking**: Per-mob distant kills with drops (flagged `is_distant=1` via 0x00D2) shown as blue `(+N)` with separate combined rate. Zone-level missed kills (msg_id=37, no mob identity) informational count only in DB — not applied to per-mob rates.
 - **Treasure Hunter Tracking**: Detects TH procs from action packets and records TH level at time of kill
 - **Mob Gil Tracking**: Detects gil dropped by mobs via 0x0029 msg_id=565 (FIFO queue for AoE). Displayed in green with min/max/avg in Statistics. Gil is excluded from item drop rate calculations.
@@ -17,10 +18,13 @@ Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, a
 - **Mob Name Resolution**: Three-tier system: entity memory, DAT file lookup, chat text fallback. Resolves mob names even when out of render range.
 - **Mob Spawn ID Tracking**: Each kill records the mob's permanent server ID, enabling per-spawn point drop rate analysis. Gil-only spawns are hidden from the per-spawn breakdown.
 - **Source Classification**: Distinguishes drops from mobs, chests, coffers, and BCNM crates using SpawnFlags
-- **BCNM Detection**: Captures battlefield name from chat ("Entering the battlefield for X!"), detects level cap, tracks battlefield sessions in SQLite, and reconnects on addon reload via buff icon 254. Stale sessions auto-cleaned after 4 hours.
+- **BCNM Detection**: Captures battlefield name from chat ("Entering the battlefield for X!"), detects level cap via two methods (chat text parsing of "{Name}'s level is currently restricted to {N}" + `GetJobLevel()` vs `GetMainJobLevel()` memory comparison fallback), tracks battlefield sessions in SQLite, and reconnects on addon reload via buff icon 254. Stale sessions auto-cleaned after 4 hours.
+- **Content Type Detection**: Classifies endgame content (BCNM, HTBF, Dynamis). BCNM/HTBF detected via S2C 0x0075 battlefield packet (mode 0x0001 = countdown timer). Dynamis (original + Divergence) detected by zone name prefix — covers all 14 zones without packet dependency. Crash-resilient. Ambuscade, Omen, and Sortie are WIP — more packet research needed.
+- **HTBF Difficulty Tracking**: Detects High-Tier Battlefield entry via S2C 0x005C packet (`num[0]==2`). Records difficulty level (VD/D/N/E/VE) and resolves battlefield name from zone dialog DAT files. Separate HTBF tab in Statistics with per-difficulty grouping. Color-coded `[VD]`/`[D]`/`[N]`/`[E]`/`[VE]` badges in Live Feed and Compact mode. Mob kills inside battlefields show `[BCNM]`/`[HTBF]` prefix. Difficulty range guard (1-5) prevents BCNMs from setting false HTBF info.
+- **Chest Interaction Pre-identification**: Tracks outgoing C2S 0x1A (Talk/Interact) packets to pre-identify chest/coffer targets before 0x00D2 drops arrive. Improves container name resolution when the entity despawns before drops are processed.
 - **Compact Mode**: Minimal overlay with configurable opacity and columns
 - **CSV Export**: Export all data or filtered subsets for external analysis
-- **Advanced Export**: Filter by zone, mob, TH level, date range, Vana'diel day/hour/moon/weather, item, status, and more. Preview updates automatically as filters change.
+- **Advanced Export**: Filter by source (Field/Chest-Coffer/All BF/BCNM/HTBF/Dynamis), zone, mob, TH level, date range, Vana'diel day/hour/moon/weather, item, status, and more. Source filter uses content_type so mob kills inside BCNMs are correctly grouped with their content. Preview updates automatically as filters change.
 - **SQLite Storage**: All data persisted locally for cross-session analysis
 - **Configurable Columns**: Choose which columns are visible in Live Feed and Compact mode independently
 
@@ -50,15 +54,21 @@ Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, a
 
 ### Packet Capture
 
-LootScope passively monitors these incoming packets:
+LootScope passively monitors these packets:
 
+**Incoming (S2C):**
 - **0x0028 (Action)**: Parsed via bitreader for Treasure Hunter proc messages (message ID 603) which contain the mob's new TH level.
 - **0x0029 (Battle Message)**: Message ID 6 = "X defeats Y" creates kill records (nearby, `is_distant=0`). Message ID 37 = "too far from battle" records zone-level missed kills (informational, no mob identity). Message ID 565 = "obtains X gil" detects mob gil drops (exact amount from Data field at offset 0x0C).
 - **0x002A (Message Special)**: Zone-specific message IDs for chest/coffer unlock, lockpick fail, trap, mimic, and illusion. Uses `CHEST_UNLOCKED` base offsets from LSB IDs.lua files.
 - **0x001E (Item Quantity Update)**: Primary chest gil detection. Fires when `addGil()` updates the gil inventory slot. Compares snapshot from 0x002A time to new quantity.
 - **0x0053 (System Message)**: MsgStd 19 = "Obtains X gil". Secondary chest gil detection (LSB uses `messageSystem(OBTAINS_GIL)` for chest gil distribution).
+- **0x005C (GP_SERV_COMMAND_PENDINGNUM)**: HTBF entry detection. 8 x int32 params: `num[0]==2` = HTBF entry, `num[1]` = bit position (battlefield name index), `num[2]` = difficulty (1=VD, 2=D, 3=N, 4=E, 5=VE). Difficulty range guard rejects values outside 1-5 (BCNMs send 0). Battlefield name resolved from zone dialog DAT files.
+- **0x0075 (GP_SERV_COMMAND_BATTLEFIELD)**: Content type detection. Mode field at offset 0x04 (uint16 LE): 0x0001=countdown timer (all battlefields), 0xFFFF=progress bars, 0x1000=scoreboard. Currently maps 0x0001 to BCNM (HTBF distinguished by bf_difficulty). NOT sent for original Dynamis. Dynamis detected by zone name prefix. Ambuscade/Omen/Sortie detection via this packet is WIP — more packet research needed.
 - **0x00D2 (Treasure Pool Item)**: Fired when a drop appears in the treasure pool. Contains item ID, quantity, mob server ID, and pool slot. Sent to ALL party members regardless of distance.
 - **0x00D3 (Lot Result)**: Fired when a lot is resolved. Contains pool slot, winner name, lot value, and win/loss/error flag.
+
+**Outgoing (C2S):**
+- **0x1A (GP_CLI_COMMAND_ACTION)**: Tracks NPC interactions (ActionID=0x00 = Talk/Interact). Pre-identifies chest/coffer targets before 0x00D2 drops arrive.
 
 ### Ashita SDK API
 
@@ -69,7 +79,7 @@ Beyond packet capture, LootScope uses these Ashita SDK interfaces for client-sid
 | **IEntity** | `GetName(idx)`, `GetSpawnFlags(idx)`, `GetLocalPositionX/Y(idx)` | Mob name resolution (primary), source classification (Monster vs Object flags), entity scanning for nearby containers |
 | **IInventory** | `GetTreasurePoolItem(slot)`, `GetTreasurePoolStatus()`, `GetContainerItem(bag, slot)` | Pool scanning on addon reload/late join, pool active check, gil snapshot before/after chest opens |
 | **IParty** | `GetMemberZone(0)` | Zone detection, character login gate (`zone > 0` = in-game) |
-| **IPlayer** | `GetMainJobLevel()`, `GetBuffs()` | BCNM level cap detection, battlefield reconnect (buff ID 71/73) |
+| **IPlayer** | `GetMainJob()`, `GetMainJobLevel()`, `GetJobLevel(id)`, `GetBuffs()` | BCNM level cap detection (`GetMainJobLevel()` capped vs `GetJobLevel()` uncapped), battlefield reconnect (buff ID 71/73) |
 | **ITarget** | `GetTargetIndex(0)` | Container detection — checks if player is targeting a chest/coffer |
 | **IResourceManager** | `GetItemById(id)`, `GetString('zones.names', id)` | Item name resolution from pool data, zone name lookup |
 | **GetPlayerEntity()** | `.ServerId` | Character identity for per-character database selection |
@@ -108,7 +118,7 @@ Source type is determined using entity SpawnFlags from client memory:
 | Mob | 0 | SpawnFlags `0x0010` (Monster), or default when is_container=0 |
 | Chest | 1 | SpawnFlags `0x0020` (Object) + generic name |
 | Coffer | 2 | SpawnFlags `0x0020` (Object) + name contains "Coffer" |
-| BCNM | 3 | SpawnFlags `0x0020` (Object) + name contains "Armoury Crate" or "Sturdy Pyxis" |
+| BCNM | 3 | SpawnFlags `0x0020` (Object) + name contains chest entity name or "Sturdy Pyxis" |
 
 Falls back to name-based classification if SpawnFlags are unavailable.
 
@@ -201,7 +211,7 @@ CSV export path: `config/addons/lootscope/exports/lootscope_<CharName>_YYYYMMDD_
 
 Export options:
 - **Export All**: Exports every kill and drop to CSV (available from the Export tab)
-- **Advanced Export**: Filter window with auto-updating preview. Narrow down by zone, mob name, TH level, date range, Vana'diel time, moon phase, weather, item, status, winner, and more. Discrete filter changes (dropdowns, sliders) update instantly; text inputs debounce for 0.5 seconds.
+- **Advanced Export**: Filter window with auto-updating preview. Source filter: All, Field, Chest/Coffer, All BF, BCNM, HTBF, Dynamis (uses content_type so mob kills inside instances are grouped correctly). Additional filters: zone, mob name, TH level, date range, Vana'diel time, moon phase, weather, item, status, winner, and more. Discrete filter changes (dropdowns, sliders) update instantly; text inputs debounce for 0.5 seconds.
 
 ## File Structure
 
@@ -209,8 +219,10 @@ Export options:
 lootscope/
   lootscope.lua   -- Main addon: metadata, events, commands, CSV export
   db.lua          -- SQLite schema, migrations, queries, dirty-flag caching, transaction batching
-  tracker.lua     -- Packet parsing (0x0028/0x0029/0x002A/0x001E/0x0053/0x00D2/0x00D3), weather scan, DAT lookup, credit system
-  ui.lua          -- ImGui dashboard with tabs, compact mode, advanced export, nearby/combined rates
+  tracker.lua     -- Packet parsing (0x0028/0x0029/0x002A/0x001E/0x0053/0x005C/0x0075/0x00D2/0x00D3), content detection, weather scan, DAT lookup, credit system, drop order tracking
+  analysis.lua    -- Statistical engine: Wilson CI, Poisson Binomial, co-occurrence, shared slot detection, battlefield drop structure, union-find inferred slots
+  datreader.lua   -- Zone dialog DAT reader: d_msg/event_msg parsing for HTBF battlefield name resolution
+  ui.lua          -- ImGui dashboard with tabs, compact mode, advanced export, nearby/combined rates, slot analysis (field + battlefield modes)
 ```
 
 ## Data Storage
@@ -225,7 +237,7 @@ Database initialization is deferred until the character is fully logged in.
 - `mob_name`, `mob_server_id`, `zone_id`, `zone_name`, `th_level`, `source_type`, `killer_id`, `killer_name`, `th_action_type`, `th_action_id`, `vana_weekday`, `vana_hour`, `moon_phase`, `moon_percent`, `weather`, `battlefield`, `level_cap`, `is_distant` (0=nearby, 1=distant kill with drops), `timestamp`
 
 **drops**: One row per item that appeared in the treasure pool (or mob gil drop)
-- `kill_id` (FK to kills), `pool_slot` (internal slot index used for lot matching; -1 for mob gil), `item_id` (65535 for gil), `item_name`, `quantity`, `won`, `lot_value`, `winner_id`, `winner_name`, `player_lot`, `player_action`, `timestamp`
+- `kill_id` (FK to kills), `pool_slot` (internal slot index used for lot matching; -1 for mob gil), `item_id` (65535 for gil), `item_name`, `quantity`, `won`, `lot_value`, `winner_id`, `winner_name`, `player_lot`, `player_action`, `drop_order` (arrival sequence per kill, -1 for pre-v1.1.1 data), `timestamp`
 
 **missed_kills**: One row per distant party kill with no mob identity and no drops (msg_id=37 with no matching credit). Informational only — not used in per-mob rate calculations.
 - `zone_id`, `zone_name`, `timestamp`
@@ -250,7 +262,9 @@ The database schema evolves automatically. Each migration checks for missing col
 7. **Battlefield**: Added `battlefield` (TEXT) and `level_cap` (INTEGER) to kills
 7. **Battlefield sessions**: Created `battlefield_sessions` table for BCNM reconnect tracking
 8. **Chest events**: Created `chest_events` table for chest/coffer gil and failure tracking
-Old databases are upgraded transparently. Missing values default to -1 (time/weather) or 0 (IDs).
+9. **Drop order**: Added `drop_order` (INTEGER, default -1) to drops — tracks arrival sequence per kill for slot analysis ordering queries. Legacy rows excluded via `drop_order >= 0` filter.
+
+Old databases are upgraded transparently. Missing values default to -1 (time/weather/drop_order) or 0 (IDs).
 
 ## Settings
 
@@ -283,43 +297,28 @@ Settings are saved per-character via Ashita's settings library.
 - **Transaction batching**: Writes are batched into transactions (flush every 1s or 20 operations) to amortize fsync overhead during burst kills.
 - **Running counters**: Kill/drop/missed counts use O(1) in-memory counters instead of COUNT(*) scans.
 - **Streamed export**: CSV export processes one kill at a time (constant memory) instead of loading the entire database.
-- **Zone-cached missed kills**: `get_missed_kills_for_zone()` caches per zone ID, only requeried on mutation. Used for informational display only (not in rate calculations).
 - **DAT loading**: Zone entity names loaded once per zone change, not per-frame.
+- **HTBF DAT cache**: Zone dialog DATs are read once per zone and cached for battlefield name resolution.
+
+## Database Schema
+
+### kills table (new columns in v1.1.0)
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| bf_name | TEXT | '' | HTBF battlefield name (resolved from zone dialog DAT) |
+| bf_difficulty | INTEGER | 0 | HTBF difficulty: 0=none, 1=VD, 2=D, 3=N, 4=E, 5=VE |
+
+These columns are added via automatic schema migration when loading the addon with an existing database.
 
 ## Version History
 
-### v1.0.0
-- Initial release
-- **Live Feed** with configurable columns, row tooltips (mob ID, Vana'diel time, moon, weather), and color-coded rows by source type
-- **Statistics** tab with nested mob/item/per-spawn tree, sortable columns, per-spawn item breakdowns, and source-type radio buttons (Mob, BCNM, Chest/Coffer) with `(?)` tooltips
-- **Treasure Hunter** tracking via 0x0028 action packet parsing with TH action type/ID recording
-- **Mob gil tracking** via 0x0029 msg_id=565 with FIFO queue for AoE kills. Gil displayed in green with min/max/avg amounts. Excluded from item drop rate calculations. Gil-only spawns hidden from per-spawn breakdown.
-- **Chest/Coffer tracking**: Full event tracking via 0x002A (unlock/fail), 0x001E (gil inventory diff), and 0x0053 (system message). Four-layer gil detection with dedup. Records gil amount, container type, and failure reason (lockpick fail, trap, mimic, illusion).
-- **BCNM battlefield detection**: Captures name from chat, detects level cap, persists sessions to SQLite, reconnects on reload via buff icon 254. Stale sessions auto-cleaned after 4 hours.
-- **Vana'diel time** recording: weekday, hour, moon phase, and moon percentage per kill
-- **Weather tracking** via client memory pattern scan (20 weather types)
-- **Three-tier mob name resolution**: entity memory -> DAT file lookup -> chat text fallback
-- **Two-tier distant kill tracking**: per-mob `is_distant` flag for kills with drops + zone-level missed kills (informational) via credit/debit system
-- **SpawnFlags-based source classification** (Mob, Chest, Coffer, BCNM)
-- **TreasurePoolStatus guard** for safe pool scanning on addon reload
-- **Mob server ID tracking** for per-spawn analysis with unique spawn count
-- **Lot result tracking**: winner name/ID, player lot value, player action (lot/pass), color-coded status (Got/Full/Lost/Zoned/Pending)
-- **Compact mode** with independent column settings, optional title bar, and background opacity slider
-- **Full CSV export** with streamed writes for large datasets
-- **Advanced Export** with 14+ filter dimensions: zone, source type, TH level, mob spawn ID, date range, Vana'diel weekday, hour range (wrap-around), moon phase range, weather, item name/ID, winner name/ID, player action, status, empty kills toggle
-- **Live export preview** with auto-update on discrete changes and debounced text input (0.5s)
-- **Settings**: Live Feed max entries, show/hide empty kills, show/hide mob gil drops, compact background opacity, compact title bar toggle, column visibility popups
-- **Commands**: `/loot` toggle, `/loot compact`, `/loot resetui`, `/loot stats [mob]`, `/loot help`
-- **Reset confirmation** dialog requiring "CONFIRM" text input (3-step process)
-- **SQLite storage** with WAL mode, dirty-flag caching, and 8-step migration chain
-- **Per-character database** isolation (multi-box safe)
-- **Transaction batching** for write performance
-- **pcall safety** around all packet parsing, memory reads, and database operations
-- **Pool reconnection** on addon reload
-- **Thousand separators** in count displays, database file size display in export tab
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 ## Thanks
 
+- **Thorny** - Slot Analysis concept, drop order tracking idea, outgoing 0x1A chest pre-identification approach, and ongoing feedback
+- **Chihiro** - HTBF difficulty tracking suggestion
 - **Ashita Team** - atom0s, thorny, and the [Ashita Discord](https://discord.gg/Ashita) community
 
 ## License

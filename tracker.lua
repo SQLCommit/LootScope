@@ -1,11 +1,13 @@
 --[[
-    LootScope v1.0.0 - Packet Tracker
-    Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool), and
-    0x00D3 (lot result) packets to track kills, loot drops, lot outcomes,
-    and Treasure Hunter procs.
+    LootScope v1.1.1 - Packet Tracker
+    Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
+    0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
+    and outgoing 0x1A (chest interaction) packets to track kills, loot
+    drops, lot outcomes, Treasure Hunter procs, content type, and HTBF
+    difficulty.
 
     Author: SQLCommit
-    Version: 1.0.0
+    Version: 1.1.1
 ]]--
 
 require 'common';
@@ -14,6 +16,8 @@ local sunpack = struct.unpack;
 local breader = require 'bitreader';
 local vana_time = require 'ffxi.time';
 local dats = require 'ffxi.dats';
+local ok_dat, datreader = pcall(require, 'datreader');
+if (not ok_dat) then datreader = nil; end
 local tracker = {};
 
 -------------------------------------------------------------------------------
@@ -23,7 +27,9 @@ tracker.th_levels = {};         -- mob_server_id -> TH level (from 0x0028 procs)
 tracker.th_actions = {};        -- mob_server_id -> {cmd_no, cmd_arg} (action that triggered last TH proc)
 tracker.active_pool = {};       -- pool_slot(0-9) -> {kill_id, item_id, mob_sid, player_lot, player_action}
 tracker.mob_kills = {};         -- mob_server_id -> kill_id (link drops to kills)
+tracker.mob_kill_times = {};    -- mob_server_id -> os.clock() when kill record was created
 tracker.mob_names = {};         -- mob_server_id -> name (cached from 0x0029/0x00D2)
+tracker.pet_to_master = {};    -- pet_server_id -> {master_sid, master_tidx} (AOE pet redirect)
 tracker.current_zone_id = 0;
 tracker.current_zone_name = '';
 tracker.char_name = nil;        -- character name (nil until logged in)
@@ -39,16 +45,11 @@ tracker.dat_names = {};          -- target_index -> entity name (rebuilt on zone
 -- Each entry: {mob_sid, kill_id, time, expected_msgs, received_msgs}
 tracker.pending_mob_resolves = {};
 
--- Credit system for deduplicating distant kills:
--- When 0x00D2 creates a kill record without a prior defeat message, we know it's
--- a distant kill WITH drops. msg_id=37 also fires for these kills. To avoid
--- double-counting, each 0x00D2-created distant kill grants a credit that absorbs
--- one msg_id=37. Unmatched msg_id=37 events = genuinely missed empty kills.
+-- Distant kill dedup credits: each 0x00D2-created distant kill absorbs one msg_id=37
+-- Unmatched msg_id=37 events = genuinely missed empty kills
 tracker.distant_kill_credits = 0;
 
--- Deferred pool scan: if scan_pool() skips because pool wasn't loaded yet
--- on initial login, retry on subsequent d3d_present frames until it succeeds.
--- Retries are throttled to once per second and capped at 10 attempts.
+-- Deferred pool scan: retries once/sec (up to 10) until pool is loaded
 tracker.pool_scan_pending = false;
 tracker.pool_scan_retries = 0;
 tracker.pool_scan_last_try = 0;
@@ -57,10 +58,7 @@ tracker.pool_scan_last_try = 0;
 -- Set when "You unlock the chest/coffer!" detected, cleared on 0x00D2 or timeout.
 tracker.chest_unlock_pending = nil;  -- { time, container_type, zone_id, zone_name }
 
--- Recent 0x001E memory: remembers the last inventory gil update (category=0, index=0)
--- even when chest_unlock_pending is nil. This allows the text_in fallback to
--- retroactively use the packet data if 0x002A didn't set pending in time.
--- {prev_gil, new_qty, time}
+-- Recent 0x001E memory: last gil update for text_in fallback when 0x002A races
 tracker.last_gil_update = nil;
 
 -- Battlefield (BCNM) state
@@ -69,12 +67,24 @@ tracker.battlefield = {
     zone_id = nil,           -- Zone when entered
     level_cap = nil,         -- Detected level cap (nil if uncapped/KSNM)
     active = false,          -- Currently in a BCNM?
-    real_level = nil,        -- Level before cap applied
     cap_check_pending = false,
     last_kill_id = nil,      -- Most recent kill_id from BCNM crate (for gil recording)
     gil_handled = false,     -- Dedup: true when 0x001E/0x0053 already recorded BCNM gil
     pending_gil = nil,       -- Buffered gil amount: when 0x001E/0x0053 fires before 0x00D2
 };
+
+-- HTBF state — set from 0x005C, persists until zone change
+tracker.htbf_info = nil;  -- { zone_id, bit_pos, difficulty, bf_name }
+
+-- Outgoing 0x1A interaction — pre-identifies chest/coffer before 0x00D2
+tracker.last_interact = nil;  -- { server_id, target_index, name, timestamp }
+
+-- Content type — set by 0x0075, persists until zone change
+tracker.content_info = nil;  -- { type='BCNM'|'Dynamis'|..., mode=0x0001, ... }
+
+-- Drop arrival order per mob (for slot analysis ordering queries)
+-- mob_server_id -> next sequence number, reset to 0 on kill, incremented per 0x00D2
+tracker.drop_sequence = {};
 
 -- Mob gil pending queue (FIFO).
 -- After handle_defeat records a SOURCE_MOB kill, the kill_id is pushed here.
@@ -99,6 +109,55 @@ tracker.SOURCE_BCNM   = 3;
 tracker.POOL_MAX_SLOT = 9;   -- FFXI treasure pool has slots 0-9
 
 -------------------------------------------------------------------------------
+-- Instance Zone Lookup (WIP: Ambuscade/Omen/Sortie need more packet research)
+-- Dynamis is detected by zone name prefix instead.
+-------------------------------------------------------------------------------
+tracker.INSTANCE_ZONES = {
+    -- WIP: Uncomment when instance detection is tested
+    -- [183] = 'Ambuscade',   -- Maquette Abdhaljs-Legion A
+    -- [287] = 'Ambuscade',   -- Maquette Abdhaljs-Legion B
+    -- [292] = 'Omen',        -- Reisenjima Henge
+    -- [274] = 'Sortie',      -- Outer Ra'Kaznar
+    -- [275] = 'Sortie',      -- Outer Ra'Kaznar [U1]
+};
+
+function tracker.get_content_type()
+    if (tracker.content_info ~= nil) then
+        return tracker.content_info.type;
+    end
+    return '';
+end
+
+-------------------------------------------------------------------------------
+-- Packet: 0x0075 (S2C) - Battlefield entry (content type detection)
+-- Sent on entry + reconnect. Mode 0x0001 = BCNM/HTBF.
+-- WIP: Ambuscade/Omen/Sortie disabled — needs more packet research.
+-------------------------------------------------------------------------------
+local BATTLEFIELD_MODE_MAP = {
+    [0x0001] = 'BCNM',
+};
+
+function tracker.handle_battlefield_packet(data)
+    if (#data < 6) then return; end
+
+    local mode = sunpack('H', data, 0x04 + 1);
+
+    local content_type = BATTLEFIELD_MODE_MAP[mode];
+    if (content_type == nil) then
+        -- WIP: 0xFFFF = progress bars (used by Omen, etc.)
+        -- Instance zone disambiguation disabled until tested.
+        content_type = 'Unknown Battlefield';
+    end
+
+    -- Skip if already classified with the same type (avoid re-processing duplicates)
+    if (tracker.content_info ~= nil and tracker.content_info.type == content_type) then
+        return;
+    end
+
+    tracker.content_info = { type = content_type };
+end
+
+-------------------------------------------------------------------------------
 -- Chest Event Constants
 -------------------------------------------------------------------------------
 tracker.CHEST_RESULT_GIL           = 0;
@@ -113,7 +172,6 @@ tracker.CONTAINER_COFFER = 2;
 -------------------------------------------------------------------------------
 -- Lot Result Status Constants
 -------------------------------------------------------------------------------
-tracker.STATUS_PENDING  = 0;   -- still in pool
 tracker.STATUS_OBTAINED = 1;   -- won and in inventory
 tracker.STATUS_DROPPED  = 2;   -- won but inventory full, item dropped
 tracker.STATUS_LOST     = -1;  -- lost lot or expired
@@ -126,7 +184,10 @@ local source_labels = {
     [3] = 'BCNM',
 };
 
-function tracker.get_source_label(source_type)
+function tracker.get_source_label(source_type, bf_difficulty)
+    if (source_type == 3 and bf_difficulty ~= nil and bf_difficulty > 0) then
+        return 'HTBF';
+    end
     return source_labels[source_type] or 'Mob';
 end
 
@@ -144,8 +205,7 @@ local weekday_labels = {
     [7] = 'Darksday',
 };
 
--- Client's ntGameMoonGet returns 0-11 (12 segments of the 84-day cycle),
--- NOT the server's 0-7 enum. Each named phase spans 1-2 raw values.
+-- Client moon phase: 0-11 (12 segments), each named phase spans 1-2 values
 local moon_phase_labels = {
     [0]  = 'New Moon',
     [1]  = 'Waxing Crescent',
@@ -199,6 +259,33 @@ function tracker.get_weather_label(id)
     local n = tonumber(id);
     if (n == nil or n < 0) then return '-'; end
     return weather_labels[n] or '?';
+end
+
+-------------------------------------------------------------------------------
+-- HTBF Difficulty Labels (from 0x005C num[2])
+-------------------------------------------------------------------------------
+local difficulty_labels = {
+    [1] = 'VD',
+    [2] = 'D',
+    [3] = 'N',
+    [4] = 'E',
+    [5] = 'VE',
+};
+
+local difficulty_full_labels = {
+    [1] = 'Very Difficult',
+    [2] = 'Difficult',
+    [3] = 'Normal',
+    [4] = 'Easy',
+    [5] = 'Very Easy',
+};
+
+function tracker.get_difficulty_label(difficulty)
+    return difficulty_labels[tonumber(difficulty)] or '';
+end
+
+function tracker.get_difficulty_full_label(difficulty)
+    return difficulty_full_labels[tonumber(difficulty)] or '';
 end
 
 -------------------------------------------------------------------------------
@@ -296,33 +383,72 @@ end
 function tracker.handle_battlefield_text(msg)
     if (msg == nil or msg == '') then return; end
 
-    -- Match: "Entering the battlefield for X!"
+    -- 1. BCNM/HTBF: "Entering the battlefield for X!"
     local bf_name = msg:match('Entering the battlefield for (.+)!');
-    if (bf_name == nil) then return; end
+    if (bf_name ~= nil) then
+        -- Strip non-ASCII bytes (FFXI control bytes, Shift-JIS fragments, auto-translate markers)
+        bf_name = bf_name:gsub('[^ -~]', '');
+        bf_name = bf_name:trim();
+        if (bf_name == '') then return; end
 
-    -- Strip non-ASCII bytes (FFXI control bytes, Shift-JIS fragments, auto-translate markers)
-    bf_name = bf_name:gsub('[^ -~]', '');
-    bf_name = bf_name:trim();
-    if (bf_name == '') then return; end
+        local mem = AshitaCore:GetMemoryManager();
+        if (mem == nil) then return; end
 
-    local mem = AshitaCore:GetMemoryManager();
-    if (mem == nil) then return; end
+        local player = mem:GetPlayer();
+        if (player == nil) then return; end
 
-    local player = mem:GetPlayer();
-    if (player == nil) then return; end
+        tracker.battlefield.name = bf_name;
+        tracker.battlefield.zone_id = tracker.current_zone_id;
+        tracker.battlefield.active = true;
+        tracker.battlefield.cap_check_pending = true;
+        tracker.battlefield.level_cap = nil;
+        tracker.battlefield.last_kill_id = nil;
+        tracker.battlefield.gil_handled = false;
+        tracker.battlefield.pending_gil = nil;
 
-    tracker.battlefield.name = bf_name;
-    tracker.battlefield.zone_id = tracker.current_zone_id;
-    tracker.battlefield.real_level = player:GetMainJobLevel();
-    tracker.battlefield.active = true;
-    tracker.battlefield.cap_check_pending = true;
-    tracker.battlefield.level_cap = nil;
-    tracker.battlefield.last_kill_id = nil;
-    tracker.battlefield.gil_handled = false;
-    tracker.battlefield.pending_gil = nil;
+        if (db ~= nil) then
+            db.record_battlefield_entry(bf_name, tracker.current_zone_id, tracker.current_zone_name, os.time());
+        end
 
-    if (db ~= nil) then
-        db.record_battlefield_entry(bf_name, tracker.current_zone_id, tracker.current_zone_name, os.time());
+        -- Set content_info if not already set by 0x0075
+        if (tracker.content_info == nil) then
+            tracker.content_info = { type = 'BCNM' };
+        end
+        -- bf_name is stored on htbf_info, not content_info
+        return;
+    end
+
+    -- 2. Level restriction: "<name>'s level is currently restricted to <N>."
+    local cap = msg:match("level is currently restricted to (%d+)");
+    if (cap ~= nil) then
+        cap = tonumber(cap);
+        if (cap ~= nil and cap > 0 and tracker.battlefield.active) then
+            tracker.battlefield.level_cap = cap;
+            tracker.battlefield.cap_check_pending = false;
+            if (db ~= nil) then
+                db.update_battlefield_level_cap(cap);
+            end
+        end
+        return;
+    end
+
+    -- WIP: Ambuscade/Omen/Sortie chat detection disabled.
+    -- "Entering..." messages not confirmed for these content types.
+    -- Will be re-enabled when instance detection is tested.
+
+    -- 3. Dynamis (original + Divergence):
+    --    Original: "You will now be warped to Dynamis - Windurst."
+    --    Divergence: "Entering Dynamis - Windurst [D]."
+    --    Primary detection is zone-name based (check_zone / on_login),
+    --    but entry text serves as a secondary signal.
+    local dyna_name = msg:match('Entering (Dynamis %- .+)%.') or msg:match('warped to (Dynamis %- .+)%.');
+    if (dyna_name ~= nil) then
+        dyna_name = dyna_name:gsub('[^ -~]', ''):trim();
+        if (tracker.content_info == nil) then
+            tracker.content_info = { type = 'Dynamis' };
+        end
+        -- dyna_city is informational only (not consumed by UI)
+        return;
     end
 end
 
@@ -335,14 +461,24 @@ function tracker.check_battlefield_level_cap()
     local player = mem:GetPlayer();
     if (player == nil) then return; end
 
+    -- GetMainJobLevel() returns the CAPPED level inside a battlefield.
+    -- GetJobLevel(job_id) returns the REAL (uncapped) level from the job table.
+    -- Compare both to reliably detect level caps regardless of timing.
+    local main_job = player:GetMainJob();
     local current_level = player:GetMainJobLevel();
-    if (current_level < (tracker.battlefield.real_level or 99)) then
+    local real_level = player:GetJobLevel(main_job);
+
+    if (real_level > 0 and current_level > 0 and current_level < real_level) then
         tracker.battlefield.level_cap = current_level;
         if (db ~= nil) then
             db.update_battlefield_level_cap(current_level);
         end
+        tracker.battlefield.cap_check_pending = false;
+    elseif (current_level > 0 and real_level > 0) then
+        -- Both levels loaded but no cap detected — uncapped BCNM (KSNM, etc.)
+        tracker.battlefield.cap_check_pending = false;
     end
-    tracker.battlefield.cap_check_pending = false;
+    -- If levels are 0, client data hasn't loaded yet — keep pending for next frame
 end
 
 function tracker.check_battlefield_reconnect()
@@ -411,10 +547,17 @@ local function increment_pending_resolve(kill_id)
 end
 
 function tracker.resolve_mob_name_from_chat(mob_name, is_defeat_msg)
-    -- Expire stale entries (30 second window)
+    -- Expire stale entries: 10s for entries that received zero of their expected
+    -- messages (likely missed), 30s for entries actively receiving messages.
     local now = os.clock();
-    while (#tracker.pending_mob_resolves > 0 and now - tracker.pending_mob_resolves[1].time > 30) do
-        table.remove(tracker.pending_mob_resolves, 1);
+    while (#tracker.pending_mob_resolves > 0) do
+        local front = tracker.pending_mob_resolves[1];
+        local timeout = (front.expected_msgs > 0 and front.received_msgs == 0) and 10 or 30;
+        if (now - front.time > timeout) then
+            table.remove(tracker.pending_mob_resolves, 1);
+        else
+            break;
+        end
     end
 
     if (#tracker.pending_mob_resolves == 0) then return; end
@@ -423,6 +566,18 @@ function tracker.resolve_mob_name_from_chat(mob_name, is_defeat_msg)
 
     -- For "You find" messages, don't process until at least one drop has been recorded
     if (not is_defeat_msg and entry.expected_msgs == 0) then return; end
+
+    -- If this is a defeat message for a different mob than the front entry is
+    -- waiting on, and the front entry is stuck waiting for drop messages, skip
+    -- past it to avoid head-of-line blocking in rapid kill scenarios.
+    if (is_defeat_msg and entry.expected_msgs > 0 and entry.received_msgs == 0) then
+        -- Check if any queued entry matches this defeat by mob_sid
+        -- (defeat messages don't carry mob_sid directly, but if the front entry
+        -- has been waiting without progress, it's likely stale — evict it)
+        table.remove(tracker.pending_mob_resolves, 1);
+        if (#tracker.pending_mob_resolves == 0) then return; end
+        entry = tracker.pending_mob_resolves[1];
+    end
 
     -- Resolve name on first chat message for this mob (defeat or loot)
     if (tracker.mob_names[entry.mob_sid] == nil or tracker.mob_names[entry.mob_sid] == 'Unknown') then
@@ -628,8 +783,8 @@ local function detect_container_type(target_index)
     --    Ignore render flags — the entity may have just despawned but its name
     --    buffer is still valid in the entity array. Only require a valid name
     --    and position within 20 yalms of the player.
-    local px = entity:GetLocalPositionX(0);
-    local py = entity:GetLocalPositionY(0);
+    local px = entity:GetLocalPositionX(0);  -- east/west
+    local py = entity:GetLocalPositionY(0);  -- north/south (Y = horizontal, Z = elevation)
     if (px ~= nil and (px ~= 0 or py ~= 0)) then
         local best_dist = 20.0;
         local best_ctype = nil;
@@ -1215,7 +1370,6 @@ function tracker.check_zone()
             tracker.battlefield.active = false;
             tracker.battlefield.name = nil;
             tracker.battlefield.level_cap = nil;
-            tracker.battlefield.real_level = nil;
             tracker.battlefield.cap_check_pending = false;
             tracker.battlefield.last_kill_id = nil;
             tracker.battlefield.gil_handled = false;
@@ -1226,12 +1380,19 @@ function tracker.check_zone()
         tracker.th_actions = {};
         tracker.active_pool = {};
         tracker.mob_kills = {};
+        tracker.mob_kill_times = {};
         tracker.mob_names = {};
+        tracker.pet_to_master = {};
         tracker.pending_mob_resolves = {};
+        tracker.drop_sequence = {};
         tracker.distant_kill_credits = 0;
         tracker.chest_unlock_pending = nil;
+        tracker.chest_packet_handled_at = 0;
         tracker.last_gil_update = nil;
         tracker.mob_gil_queue = {};
+        tracker.htbf_info = nil;
+        tracker.last_interact = nil;
+        tracker.content_info = nil;
     end
 
     tracker.current_zone_id = zone_id;
@@ -1247,6 +1408,14 @@ function tracker.check_zone()
         tracker.current_zone_name = res:GetString('zones.names', zone_id) or '';
     else
         tracker.current_zone_name = '';
+    end
+
+    -- Dynamis detection: zone name starts with "Dynamis" for all 14 zones
+    -- (original: 39-42, 134-135, 185-188; Divergence: 294-297).
+    -- This covers both variants without needing 0x0075 (which original Dynamis
+    -- never sends) or zone ID tables.
+    if (tracker.content_info == nil and tracker.current_zone_name:match('^Dynamis')) then
+        tracker.content_info = { type = 'Dynamis' };
     end
 end
 
@@ -1356,6 +1525,39 @@ local function classify_source(entity_name, target_index)
 end
 
 -------------------------------------------------------------------------------
+-- Helper: Check if an entity is a pet of another mob
+-- Scans nearby Monster entities to see if any claim this target_index as pet.
+-- Returns owner's target_index, or nil if not a pet.
+-------------------------------------------------------------------------------
+
+local function find_pet_owner(target_index)
+    if (target_index == nil or target_index <= 0) then return nil; end
+
+    local ok, result = pcall(function()
+        local mem = AshitaCore:GetMemoryManager();
+        if (mem == nil) then return nil; end
+        local entity = mem:GetEntity();
+        if (entity == nil) then return nil; end
+
+        for i = 0, 2303 do
+            if (i ~= target_index) then
+                local flags = entity:GetSpawnFlags(i);
+                if (flags ~= nil and bit.band(flags, 0x0010) ~= 0) then
+                    local pet_tidx = entity:GetPetTargetIndex(i);
+                    if (pet_tidx == target_index) then
+                        return i;
+                    end
+                end
+            end
+        end
+        return nil;
+    end);
+
+    if (ok) then return result; end
+    return nil;
+end
+
+-------------------------------------------------------------------------------
 -- Character Detection (deferred DB init)
 -------------------------------------------------------------------------------
 
@@ -1405,6 +1607,15 @@ function tracker.check_character()
     tracker.scan_pool();
     init_weather_pointer();
     tracker.check_battlefield_reconnect();
+
+    -- Fallback: if 0x0075 hasn't fired yet but we're in a known zone,
+    -- set content_info so kills aren't unclassified on addon reload.
+    -- WIP: Instance zone detection (Ambuscade/Omen/Sortie) disabled until tested.
+    if (tracker.content_info == nil and tracker.current_zone_id > 0) then
+        if (tracker.current_zone_name:match('^Dynamis')) then
+            tracker.content_info = { type = 'Dynamis' };
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1475,6 +1686,7 @@ function tracker.scan_pool()
                         player_action = (info.lot > 0) and 1 or 0,
                         highest_lot   = info.winning_lot,
                         late_join     = true,
+                        source_type   = tracker.SOURCE_MOB,  -- best guess; entity unavailable at scan time
                     };
                 end
                 scanned = scanned + 1;
@@ -1547,7 +1759,74 @@ function tracker.handle_defeat(data)
     end
 
     if (message_id ~= 6) then return; end
-    if (tracker.mob_kills[mob_sid] ~= nil) then return; end
+
+    -- Server ID reuse: FFXI recycles mob server IDs from a fixed pool per zone.
+    -- When a mob respawns and gets the same ID as a previously killed mob, clear
+    -- stale state so the new kill is recorded correctly.
+    --
+    -- Race guard: In AoE/rapid kill scenarios, 0x00D2 (drop) can arrive before
+    -- 0x0029 (defeat) for the same mob. The 0x00D2 fallback path creates a kill
+    -- record and sets mob_kills[sid]. If we blindly clear it here, we'd create a
+    -- duplicate kill. Check the timestamp: if the existing entry is recent (< 5s),
+    -- it's from the same kill cycle — reuse it instead of creating a duplicate.
+    if (tracker.mob_kills[mob_sid] ~= nil) then
+        local kill_time = tracker.mob_kill_times[mob_sid] or 0;
+        if ((os.clock() - kill_time) < 5.0) then
+            -- Recent kill: 0x00D2 fallback already created this kill record.
+            -- Don't duplicate. Patch the record with defeat metadata (clears
+            -- is_distant flag, adds killer/TH info the fallback path lacked).
+            local existing_kill = tracker.mob_kills[mob_sid];
+            if (existing_kill ~= nil) then
+                local th_level = tracker.th_levels[mob_sid] or 0;
+                local th_action = tracker.th_actions[mob_sid];
+                local killer_name = '';
+                if (killer_tidx > 0) then
+                    local kn = get_entity_name(killer_tidx);
+                    if (kn ~= 'Unknown') then killer_name = kn; end
+                end
+                db.patch_kill_on_defeat(
+                    existing_kill, killer_id, killer_name,
+                    th_level,
+                    th_action and th_action.cmd_no or 0,
+                    th_action and th_action.cmd_arg or 0
+                );
+                tracker.mob_gil_queue[#tracker.mob_gil_queue + 1] = {
+                    kill_id  = existing_kill,
+                    time     = os.clock(),
+                    mob_name = tracker.mob_names[mob_sid] or get_entity_name(mob_tidx),
+                };
+            end
+            return;
+        end
+        -- Old kill (server ID reuse from mob respawn) — clear stale state
+        tracker.mob_kills[mob_sid] = nil;
+        tracker.mob_kill_times[mob_sid] = nil;
+        tracker.drop_sequence[mob_sid] = nil;
+        tracker.pet_to_master[mob_sid] = nil;
+        tracker.th_levels[mob_sid] = nil;
+        tracker.th_actions[mob_sid] = nil;
+    end
+
+    -- Pet detection: if this defeated entity is a pet of another mob,
+    -- don't create a standalone kill record. Map it to the master mob
+    -- so any drops from the pet entity are attributed to the master.
+    local owner_tidx = find_pet_owner(mob_tidx);
+    if (owner_tidx ~= nil) then
+        local mem = AshitaCore:GetMemoryManager();
+        if (mem ~= nil) then
+            local entity = mem:GetEntity();
+            if (entity ~= nil) then
+                local master_sid = entity:GetServerId(owner_tidx);
+                if (master_sid ~= nil and master_sid > 0) then
+                    tracker.pet_to_master[mob_sid] = {
+                        master_sid  = master_sid,
+                        master_tidx = owner_tidx,
+                    };
+                end
+            end
+        end
+        return;
+    end
 
     local mob_name = get_entity_name(mob_tidx);
     tracker.mob_names[mob_sid] = mob_name;
@@ -1564,6 +1843,22 @@ function tracker.handle_defeat(data)
 
     local vana_info = capture_vana_info();
 
+    local ki = {
+        killer_id      = killer_id,
+        killer_name    = killer_name,
+        th_action_type = th_action and th_action.cmd_no or 0,
+        th_action_id   = th_action and th_action.cmd_arg or 0,
+        bf_name        = tracker.htbf_info and tracker.htbf_info.bf_name or nil,
+        bf_difficulty  = tracker.htbf_info and tracker.htbf_info.difficulty or 0,
+        content_type   = tracker.get_content_type(),
+    };
+
+    -- Tag mob kills inside an active battlefield so the UI can show [BCNM]/[HTBF]
+    if (tracker.battlefield.active) then
+        ki.battlefield = tracker.battlefield.name;
+        ki.level_cap = tracker.battlefield.level_cap;
+    end
+
     local kill_id = db.record_kill(
         mob_name,
         mob_sid,
@@ -1572,14 +1867,11 @@ function tracker.handle_defeat(data)
         th_level,
         tracker.SOURCE_MOB,
         vana_info,
-        {
-            killer_id      = killer_id,
-            killer_name    = killer_name,
-            th_action_type = th_action and th_action.cmd_no or 0,
-            th_action_id   = th_action and th_action.cmd_arg or 0,
-        }
+        ki
     );
     tracker.mob_kills[mob_sid] = kill_id;
+    tracker.mob_kill_times[mob_sid] = os.clock();
+    tracker.drop_sequence[mob_sid] = 0;
 
     -- Queue this kill for mob gil detection.
     -- DistributeGil sends 0x0029 msg_id=565 with exact amount shortly after defeat.
@@ -1660,6 +1952,14 @@ function tracker.handle_treasure_pool(data)
                 item_name = item.Name[1] or 'Unknown';
             end
         end
+        -- Try to classify source while entity may still be in memory
+        local stub_source = tracker.SOURCE_MOB;
+        if (is_container == 1) then
+            local stub_name = get_entity_name(mob_tidx);
+            if (stub_name ~= 'Unknown') then
+                stub_source = classify_source(stub_name, mob_tidx);
+            end
+        end
         tracker.active_pool[pool_slot] = {
             kill_id       = nil,
             item_id       = item_id,
@@ -1670,19 +1970,41 @@ function tracker.handle_treasure_pool(data)
             player_lot    = 0,
             player_action = 0,
             late_join     = true,
+            source_type   = stub_source,
         };
         return;
     end
 
-    local mob_name = tracker.mob_names[mob_sid] or get_entity_name(mob_tidx);
-    tracker.mob_names[mob_sid] = mob_name;
+    -- Pet-to-master redirect: if this drop came from a pet entity,
+    -- attribute it to the master mob instead (handles AOE pet kills)
+    local effective_sid = mob_sid;
+    local effective_tidx = mob_tidx;
+    local pet_info = tracker.pet_to_master[mob_sid];
+    if (pet_info ~= nil) then
+        effective_sid = pet_info.master_sid;
+        effective_tidx = pet_info.master_tidx;
+    end
+
+    local mob_name = tracker.mob_names[effective_sid] or get_entity_name(effective_tidx);
+
+    -- If entity memory returned 'Unknown' for a container, try last_interact
+    -- (outgoing 0x1A pre-identified the target before it despawned)
+    if (mob_name == 'Unknown' and is_container == 1 and tracker.last_interact ~= nil) then
+        if (tracker.last_interact.server_id == effective_sid
+            and (os.clock() - tracker.last_interact.timestamp) < 5.0
+            and tracker.last_interact.name ~= 'Unknown') then
+            mob_name = tracker.last_interact.name;
+        end
+    end
+
+    tracker.mob_names[effective_sid] = mob_name;
 
     local source_type = tracker.SOURCE_MOB;
     if (is_container == 1) then
-        source_type = classify_source(mob_name, mob_tidx);
+        source_type = classify_source(mob_name, effective_tidx);
     end
 
-    -- Auto-activate battlefield session when Armoury Crate detected but session
+    -- Auto-activate battlefield session when chest detected but session
     -- was lost (addon reload after buff expired, or reload after fight ended).
     -- This ensures 0x001E/0x0053 gil handlers see battlefield.active = true.
     if (source_type == tracker.SOURCE_BCNM and not tracker.battlefield.active) then
@@ -1703,11 +2025,36 @@ function tracker.handle_treasure_pool(data)
         tracker.battlefield.zone_id = tracker.current_zone_id;
     end
 
-    local th_level = tracker.th_levels[mob_sid] or 0;
+    local th_level = tracker.th_levels[effective_sid] or 0;
 
     -- Use existing kill record from 0x0029 defeat, or create one for
     -- containers/chests that don't send defeat messages, or late-join pool items
-    local kill_id = tracker.mob_kills[mob_sid];
+    local kill_id = tracker.mob_kills[effective_sid];
+    if (kill_id == nil and source_type == tracker.SOURCE_MOB and pet_info == nil) then
+        -- Check if this entity is a pet whose 0x0029 defeat hasn't arrived yet.
+        -- If so, redirect to master so drops are attributed correctly.
+        local owner_tidx = find_pet_owner(effective_tidx);
+        if (owner_tidx ~= nil) then
+            local mem = AshitaCore:GetMemoryManager();
+            if (mem ~= nil) then
+                local entity = mem:GetEntity();
+                if (entity ~= nil) then
+                    local master_sid = entity:GetServerId(owner_tidx);
+                    if (master_sid ~= nil and master_sid > 0) then
+                        tracker.pet_to_master[mob_sid] = {
+                            master_sid  = master_sid,
+                            master_tidx = owner_tidx,
+                        };
+                        effective_sid = master_sid;
+                        effective_tidx = owner_tidx;
+                        mob_name = tracker.mob_names[effective_sid] or get_entity_name(effective_tidx);
+                        tracker.mob_names[effective_sid] = mob_name;
+                        kill_id = tracker.mob_kills[effective_sid];
+                    end
+                end
+            end
+        end
+    end
     if (kill_id == nil) then
         local vana_info = capture_vana_info();
         local ki = {};
@@ -1720,9 +2067,13 @@ function tracker.handle_treasure_pool(data)
         if (is_old == 0 and source_type == tracker.SOURCE_MOB) then
             ki.is_distant = 1;
         end
+        -- Attach HTBF info if active
+        ki.bf_name = tracker.htbf_info and tracker.htbf_info.bf_name or nil;
+        ki.bf_difficulty = tracker.htbf_info and tracker.htbf_info.difficulty or 0;
+        ki.content_type = tracker.get_content_type();
         kill_id = db.record_kill(
             mob_name,
-            mob_sid,
+            effective_sid,
             tracker.current_zone_id,
             tracker.current_zone_name,
             th_level,
@@ -1730,7 +2081,8 @@ function tracker.handle_treasure_pool(data)
             vana_info,
             ki
         );
-        tracker.mob_kills[mob_sid] = kill_id;
+        tracker.mob_kills[effective_sid] = kill_id;
+        tracker.mob_kill_times[effective_sid] = os.clock();
 
         -- Track last BCNM kill_id so 0x001E/0x0053 can attach gil to it
         if (source_type == tracker.SOURCE_BCNM and kill_id ~= nil) then
@@ -1747,7 +2099,7 @@ function tracker.handle_treasure_pool(data)
 
         -- Flag for chat-based name resolution if entity was out of range
         if (mob_name == 'Unknown' and kill_id ~= nil) then
-            set_pending_mob_resolve(mob_sid, kill_id);
+            set_pending_mob_resolve(effective_sid, kill_id);
         end
 
         -- Credit: 0x00D2 without prior defeat = distant kill with drops.
@@ -1769,7 +2121,12 @@ function tracker.handle_treasure_pool(data)
         end
     end
 
-    local drop_id = db.record_drop(kill_id, pool_slot, item_id, item_name, quantity);
+    -- Track drop arrival order per mob for slot analysis
+    local seq_key = effective_sid;
+    local cur_order = tracker.drop_sequence[seq_key] or 0;
+    tracker.drop_sequence[seq_key] = cur_order + 1;
+
+    local drop_id = db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, nil, cur_order);
 
     if (mob_name == 'Unknown') then
         increment_pending_resolve(kill_id);
@@ -1778,6 +2135,8 @@ function tracker.handle_treasure_pool(data)
     tracker.active_pool[pool_slot] = {
         kill_id       = kill_id,
         item_id       = item_id,
+        item_name     = item_name,
+        item_count    = quantity,
         mob_sid       = mob_sid,
         drop_id       = drop_id,
         player_lot    = 0,
@@ -1907,7 +2266,7 @@ function tracker.handle_lot_result(data)
             tracker.current_zone_id,
             tracker.current_zone_name,
             0,
-            tracker.SOURCE_MOB,
+            pool_entry.source_type or tracker.SOURCE_MOB,
             vana_info
         );
         if (kill_id ~= nil) then
@@ -2024,6 +2383,67 @@ function tracker.handle_action(data)
 end
 
 -------------------------------------------------------------------------------
+-- Packet: 0x005C - GP_SERV_COMMAND_PENDINGNUM (HTBF entry detection)
+-- 8 x int32 params starting at offset 0x04.
+-- When num[0]==2: HTBF entry event.
+--   num[1] = bit position (battlefield name index within zone)
+--   num[2] = difficulty: 1=VD, 2=D, 3=N, 4=E, 5=VE
+--   num[3] = instance ID (unstable, not stored)
+-------------------------------------------------------------------------------
+
+function tracker.handle_pending_num(data)
+    if (#data < 36) then return; end  -- need at least 8 uint32s (32 bytes) + 4 header
+
+    local num0 = sunpack('I', data, 0x04 + 1);
+    if (num0 ~= 2) then return; end  -- only HTBF entry events
+
+    local bit_pos    = sunpack('I', data, 0x08 + 1);
+    local difficulty = sunpack('I', data, 0x0C + 1);
+
+    -- Range guard: BCNMs send 0, Sortie sends 0xFF — only HTBF uses 1-5
+    if (difficulty < 1 or difficulty > 5) then return; end
+
+    -- Resolve battlefield name from zone dialog DAT
+    local bf_name = nil;
+    if (datreader ~= nil and tracker.current_zone_id > 0) then
+        bf_name = datreader.get_battlefield_name(tracker.current_zone_id, bit_pos);
+    end
+
+    tracker.htbf_info = {
+        difficulty = difficulty,
+        bf_name    = bf_name,
+    };
+end
+
+-------------------------------------------------------------------------------
+-- Packet: 0x1A (outgoing) - GP_CLI_COMMAND_ACTION (chest interaction)
+-- Tracks the most recent NPC interaction so we can pre-identify
+-- chest/coffer targets before 0x00D2 drops arrive.
+--   Offset 0x04: UniqueNo (uint32) — target entity server ID
+--   Offset 0x08: ActIndex (uint16) — target entity index
+--   Offset 0x0A: ActionID (uint16) — 0x00 = Talk/NPC Interact
+-------------------------------------------------------------------------------
+
+function tracker.handle_outgoing_action(data)
+    if (#data < 12) then return; end
+
+    local action_id = sunpack('H', data, 0x0A + 1);
+    if (action_id ~= 0) then return; end  -- only Talk/Interact
+
+    local server_id    = sunpack('I', data, 0x04 + 1);
+    local target_index = sunpack('H', data, 0x08 + 1);
+
+    local name = get_entity_name(target_index);
+
+    tracker.last_interact = {
+        server_id    = server_id,
+        target_index = target_index,
+        name         = name,
+        timestamp    = os.clock(),
+    };
+end
+
+-------------------------------------------------------------------------------
 -- Reset
 -------------------------------------------------------------------------------
 
@@ -2032,9 +2452,12 @@ function tracker.reset()
     tracker.th_actions = {};
     tracker.active_pool = {};
     tracker.mob_kills = {};
+    tracker.mob_kill_times = {};
     tracker.mob_names = {};
+    tracker.pet_to_master = {};
     tracker.pending_mob_resolves = {};
     tracker.dat_names = {};
+    tracker.drop_sequence = {};
     tracker.distant_kill_credits = 0;
     tracker.chest_unlock_pending = nil;
     tracker.chest_packet_handled_at = 0;
@@ -2047,11 +2470,13 @@ function tracker.reset()
     tracker.battlefield.name = nil;
     tracker.battlefield.zone_id = nil;
     tracker.battlefield.level_cap = nil;
-    tracker.battlefield.real_level = nil;
     tracker.battlefield.cap_check_pending = false;
     tracker.battlefield.last_kill_id = nil;
     tracker.battlefield.gil_handled = false;
     tracker.battlefield.pending_gil = nil;
+    tracker.htbf_info = nil;
+    tracker.last_interact = nil;
+    tracker.content_info = nil;
 end
 
 return tracker;

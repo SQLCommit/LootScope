@@ -1,9 +1,16 @@
 --[[
-    LootScope v1.0.0 - Loot Drop Tracker for Ashita v4
+    LootScope v1.1.1 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
-    a dashboard UI with live feed, statistics, export, and compact mode.
+    a dashboard UI with live feed, statistics, slot analysis, export,
+    and compact mode.
+
+    v1.1.1: Slot Analysis tab, content type detection (0x0075),
+    grouped statistics filters, battlefield mode, advanced export
+    content-type filtering, dead code cleanup.
+    v1.1.0: HTBF difficulty tracking (via 0x005C), chest interaction
+    pre-identification (via outgoing 0x1A).
 
     Commands:
         /loot or /lootscope    - Toggle the LootScope window
@@ -14,12 +21,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.0.0
+    Version: 1.1.1
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.0.0';
+addon.version = '1.1.1';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -31,6 +38,7 @@ local settings = require 'settings';
 local ok_db, db = pcall(require, 'db');
 local ok_tr, tracker = pcall(require, 'tracker');
 local ok_ui, ui = pcall(require, 'ui');
+local ok_an, analysis = pcall(require, 'analysis');
 
 if (not ok_db or not ok_tr or not ok_ui) then
     print(chat.header('lootscope'):append(chat.error(
@@ -40,6 +48,13 @@ if (not ok_db or not ok_tr or not ok_ui) then
         .. (not ok_ui and 'ui(' .. tostring(ui) .. ')' or '')
     )));
     return;
+end
+
+if (not ok_an) then
+    print(chat.header('lootscope'):append(chat.error(
+        'Failed to load analysis module: ' .. tostring(analysis)
+        .. '. Slot Analysis tab will be unavailable.')));
+    analysis = nil;
 end
 
 -------------------------------------------------------------------------------
@@ -87,10 +102,11 @@ local function csv_escape(val)
     return str;
 end
 
--- Shared CSV header (28 columns)
+-- Shared CSV header (33 columns)
 local CSV_HEADER = 'Kill ID,Date,Time,Mob,Mob Server ID,Zone,Zone ID,Source,TH,'
     .. 'Killer,Killer ID,TH Action,TH Action ID,'
     .. 'Vana Day,Vana Hour,Moon Phase,Moon %,Weather,'
+    .. 'Battlefield,Difficulty,Content Type,Distant,Level Cap,'
     .. 'Item,Item ID,Qty,Won,Lot,'
     .. 'Winner ID,Winner,Player Lot,Player Action,Drop Time\n';
 
@@ -112,12 +128,11 @@ local function export_data()
 
     -- Wrap streaming in pcall so file handle is always closed on error
     local write_ok, write_err = pcall(function()
-        -- Fix 2: Stream one kill at a time instead of loading entire DB into memory
         db.stream_export_all(function(kill, drops)
             local ts      = kill.timestamp or 0;
             local date_s  = os.date('%Y-%m-%d', ts);
             local time_s  = os.date('%H:%M:%S', ts);
-            local source  = tracker.get_source_label(kill.source_type);
+            local source  = tracker.get_source_label(kill.source_type, kill.bf_difficulty);
             local weekday = tracker.get_weekday_label(kill.vana_weekday);
             local vh      = (kill.vana_hour ~= nil and kill.vana_hour >= 0) and string.format('%02d:00', kill.vana_hour) or '';
             local mp      = (kill.moon_percent ~= nil and kill.moon_percent >= 0) and tostring(kill.moon_percent) or '';
@@ -135,6 +150,11 @@ local function export_data()
                 csv_escape(weekday), csv_escape(vh),
                 csv_escape(phase), csv_escape(mp),
                 csv_escape(weather),
+                csv_escape(kill.bf_name or ''),
+                csv_escape(tracker.get_difficulty_label(kill.bf_difficulty)),
+                csv_escape(kill.content_type or ''),
+                tostring(kill.is_distant or 0),
+                tostring(kill.level_cap or ''),
             };
             local kill_prefix = table.concat(kp, ',');
 
@@ -191,6 +211,7 @@ local function export_data()
     f:close();
 
     if (not write_ok) then
+        pcall(os.remove, file_path);  -- clean up partial file
         msg_error('Export write failed: ' .. tostring(write_err));
         return;
     end
@@ -237,7 +258,7 @@ local function export_filtered_data()
             local ts      = row.timestamp or 0;
             local date_s  = os.date('%Y-%m-%d', ts);
             local time_s  = os.date('%H:%M:%S', ts);
-            local source  = tracker.get_source_label(row.source_type);
+            local source  = tracker.get_source_label(row.source_type, row.bf_difficulty);
             local weekday = tracker.get_weekday_label(row.vana_weekday);
             local vh      = (row.vana_hour ~= nil and row.vana_hour >= 0) and string.format('%02d:00', row.vana_hour) or '';
             local mp      = (row.moon_percent ~= nil and row.moon_percent >= 0) and tostring(row.moon_percent) or '';
@@ -256,6 +277,11 @@ local function export_filtered_data()
                 csv_escape(weekday), csv_escape(vh),
                 csv_escape(phase), csv_escape(mp),
                 csv_escape(weather),
+                csv_escape(row.bf_name or ''),
+                csv_escape(tracker.get_difficulty_label(row.bf_difficulty)),
+                csv_escape(row.content_type or ''),
+                tostring(row.is_distant or 0),
+                tostring(row.level_cap or ''),
                 csv_escape(row.item_name or ''), tostring(row.item_id or 0),
                 tostring(row.quantity or 1), tostring(row.won or 0),
                 tostring(row.lot_value or 0),
@@ -271,6 +297,7 @@ local function export_filtered_data()
     f:close();
 
     if (not write_ok) then
+        pcall(os.remove, file_path);  -- clean up partial file
         msg_error('Filtered export write failed: ' .. tostring(write_err));
         return;
     end
@@ -316,7 +343,7 @@ local function print_stats(mob_name)
     local all = db.get_all_mob_stats();
     local found = false;
     for _, row in ipairs(all) do
-        if (row.mob_name:lower() == mob_name:lower()) then
+        if (row.mob_name ~= nil and row.mob_name:lower() == mob_name:lower()) then
             found = true;
             local mob_distant = row.distant_kills or 0;
             local nearby = row.kill_count - mob_distant;
@@ -368,7 +395,7 @@ ashita.events.register('load', 'lootscope_load', function()
 
     -- DB init is deferred until character name is detected (tracker.check_character)
     tracker.init(db, config_path);
-    ui.init(db, tracker, s);
+    ui.init(db, tracker, s, analysis);
 
     if (not s.show_on_load) then
         ui.hide();
@@ -391,10 +418,8 @@ ashita.events.register('unload', 'lootscope_unload', function()
 end);
 
 -------------------------------------------------------------------------------
--- Event: Text In (chat message parsing for mob name resolution)
--- When the player is too far from a mob to read its entity name, the chat
--- message "X defeats the MobName." and "You find [item] on the [mob]."
--- still contain the correct name. Defeat messages cover empty kills (no drops).
+-- Event: Text In (mob name resolution from chat when entity is out of range)
+-- Parses "X defeats MobName." and "You find ... on MobName." messages.
 -------------------------------------------------------------------------------
 ashita.events.register('text_in', 'lootscope_text_in', function(e)
     local text = e.message_modified;
@@ -410,19 +435,17 @@ ashita.events.register('text_in', 'lootscope_text_in', function(e)
         -- Only parse mob name resolution when we have unresolved mob names pending
         if (#tracker.pending_mob_resolves == 0) then return; end
 
-        -- Strip non-ASCII bytes before pattern matching (FFXI control bytes,
-        -- Shift-JIS fragments, auto-translate markers)
+        -- Strip non-ASCII bytes (FFXI control bytes, auto-translate markers)
         local clean = text:gsub('[^\x20-\x7E]', '');
 
-        -- Match defeat message: "X defeats the MobName." or "X defeats MobName."
-        -- This fires for ALL kills (with or without drops), fixing empty kill tracking.
+        -- Match defeat message (fires for all kills including empty)
         local defeat_mob = clean:match('defeats the (.+)%.') or clean:match('defeats (.+)%.');
         if (defeat_mob ~= nil and defeat_mob ~= '') then
             tracker.resolve_mob_name_from_chat(defeat_mob, true);
             return;
         end
 
-        -- Match loot message: "You find ... on the MobName." or "You find ... on MobName."
+        -- Match loot message
         local loot_mob = clean:match('find .+ on the (.+)%.') or clean:match('find .+ on (.+)%.');
         if (loot_mob ~= nil and loot_mob ~= '') then
             tracker.resolve_mob_name_from_chat(loot_mob, false);
@@ -476,6 +499,22 @@ ashita.events.register('command', 'lootscope_command', function(e)
 end);
 
 -------------------------------------------------------------------------------
+-- Helper: Throttled pcall for per-frame functions (logs each unique error once)
+-------------------------------------------------------------------------------
+local _frame_errors = {};
+
+local function safe_frame_call(fn, label)
+    local ok, err = pcall(fn);
+    if (not ok) then
+        local key = label .. tostring(err);
+        if (not _frame_errors[key]) then
+            _frame_errors[key] = true;
+            msg_error(label .. ': ' .. tostring(err));
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Helper: Error-capturing pcall (logs errors instead of silently eating them)
 -------------------------------------------------------------------------------
 local function safe_call(fn, data, label)
@@ -519,10 +558,7 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
         return;
     end
 
-    -- 0x001E: Item Quantity Update (chest gil detection via inventory change)
-    -- When addGil() fires, 0x001E updates the gil slot. If a chest unlock is
-    -- pending, the diff from the snapshot = chest gil amount.
-    -- This works for both field chests (messageSpecial) and BCNM crates (messageSystem).
+    -- 0x001E: Item Quantity Update (chest gil detection — diff from snapshot)
     if (e.id == 0x001E) then
         safe_call(tracker.handle_item_quantity_update, e.data_modified, '0x001E');
         -- Do NOT return — other handlers may want this packet too
@@ -532,6 +568,26 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
     if (e.id == 0x0053) then
         safe_call(tracker.handle_system_message, e.data_modified, '0x0053');
     end
+
+    -- 0x005C: GP_SERV_COMMAND_PENDINGNUM (HTBF entry detection)
+    if (e.id == 0x005C) then
+        safe_call(tracker.handle_pending_num, e.data_modified, '0x005C');
+    end
+
+    -- 0x0075: GP_SERV_COMMAND_BATTLEFIELD (content type detection)
+    if (e.id == 0x0075) then
+        safe_call(tracker.handle_battlefield_packet, e.data_modified, '0x0075');
+    end
+end);
+
+-------------------------------------------------------------------------------
+-- Event: Outgoing Packet
+-------------------------------------------------------------------------------
+ashita.events.register('packet_out', 'lootscope_packet_out', function(e)
+    -- 0x001A: GP_CLI_COMMAND_ACTION (chest/NPC interaction pre-identification)
+    if (e.id == 0x001A) then
+        safe_call(tracker.handle_outgoing_action, e.data_modified, '0x1A out');
+    end
 end);
 
 -------------------------------------------------------------------------------
@@ -539,34 +595,32 @@ end);
 -------------------------------------------------------------------------------
 ashita.events.register('d3d_present', 'lootscope_present', function()
     -- Deferred DB init: detect character name once logged in
-    pcall(tracker.check_character);
+    safe_frame_call(tracker.check_character, 'check_character');
 
-    pcall(tracker.check_zone);
-    pcall(tracker.check_battlefield_level_cap);
+    safe_frame_call(tracker.check_zone, 'check_zone');
+    safe_frame_call(tracker.check_battlefield_level_cap, 'check_bf_cap');
 
-    -- Retry deferred pool scan if it was skipped on initial login
-    -- (pool wasn't loaded yet when check_character first ran scan_pool)
-    -- Throttled to once per second to avoid debug spam.
+    -- Retry deferred pool scan (throttled to 1/sec)
     if (tracker.pool_scan_pending) then
         local now = os.clock();
         if (now - tracker.pool_scan_last_try >= 1.0) then
             tracker.pool_scan_last_try = now;
-            pcall(tracker.scan_pool);
+            safe_frame_call(tracker.scan_pool, 'scan_pool');
         end
     end
 
     -- Proactive stale resolve cleanup (every 5s)
-    pcall(tracker.cleanup_stale_resolves);
+    safe_frame_call(tracker.cleanup_stale_resolves, 'stale_resolves');
 
     -- Check chest unlock timeout (pending gil detection)
-    pcall(tracker.check_chest_timeout);
+    safe_frame_call(tracker.check_chest_timeout, 'chest_timeout');
 
-    pcall(db.flush_writes_if_due);
+    safe_frame_call(db.flush_writes_if_due, 'db_flush');
 
     if (ui.settings_dirty) then
         ui.settings_dirty = false;
-        pcall(ui.sync_settings);
-        pcall(settings.save);
+        safe_frame_call(ui.sync_settings, 'sync_settings');
+        safe_frame_call(settings.save, 'settings_save');
     end
 
     if (ui.export_requested) then
@@ -590,13 +644,14 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
         local ok, err = pcall(db.clear_data);
         if (ok) then
             tracker.reset();
+            if (analysis ~= nil) then analysis.invalidate(); end
             msg_success('All loot data cleared.');
         else
             msg_error('Clear failed: ' .. tostring(err));
         end
     end
 
-    pcall(ui.render);
+    safe_frame_call(ui.render, 'render');
 end);
 
 -------------------------------------------------------------------------------
