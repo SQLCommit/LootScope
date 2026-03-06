@@ -1,6 +1,6 @@
-# LootScope v1.1.1 - Loot Drop Tracker for Ashita v4.30
+# LootScope v1.1.1 - Loot Drop Tracker for Ashita v4.3
 
-Loot drop tracker for Ashita v4.30 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
+Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
 
 ---
 
@@ -30,8 +30,8 @@ Loot drop tracker for Ashita v4.30 with statistics, Treasure Hunter monitoring, 
 
 ## Requirements
 
-- Ashita v4.30 (uses LuaSQLite3, ImGui Tables, bitreader)
-	- This release has only been tested with Ashita v4.30
+- Ashita v4.3.0.2 (uses LuaSQLite3, ImGui Tables, bitreader)
+	- This release has only been tested with Ashita v4.3.0.2	
 
 ## Installation
 
@@ -314,6 +314,10 @@ These columns are added via automatic schema migration when loading the addon wi
 ## Version History
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
+
+## Slot Analysis Methodology
+
+See [SLOT_ANALYSIS.md](SLOT_ANALYSIS.md) for the statistical methodology behind the Slot Analysis tab — model assumptions, method choices, and alternatives considered.
 
 ## Thanks
 
