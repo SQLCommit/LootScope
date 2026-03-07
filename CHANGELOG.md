@@ -1,5 +1,20 @@
 # LootScope Changelog
 
+## v1.2.1
+
+### Added
+- **Voidwatch Loot Tracking** *(suggestion by Chihiro)*: Tracks loot from Riftworn Pyxis after VW NM kills. VW bypasses the treasure pool entirely — items are delivered via S2C 0x034 (GP_SERV_COMMAND_EVENTNUM) event params. Up to 8 offered items per Pyxis are recorded as drops.
+- **Voidwatch Selection Tracking**: Three-layer detection for taken items: (1) subsequent 0x034 events where param is zeroed out, (2) S2C 0x01F for stackable items delivered to inventory, (3) S2C 0x020 for equipment/augmented items delivered to inventory. Obtain All (won=1) and Relinquish All (won=-1) tracked via C2S 0x05B EventEnd (EndPara=10 and 9 respectively).
+- **Voidwatch Statistics Category**: New "Voidwatch" radio button in Statistics tab (5th category). Groups by NM name per zone, same pattern as Dynamis/Omen. Source filter value sf=10, content_type='Voidwatch'.
+- **Advanced Export Voidwatch Filter**: Voidwatch option in the Advanced Export Source filter combo. Filters exported data to `content_type='Voidwatch'` kills only.
+
+### Design Notes
+- **Buff-Based VW Kill Tagging**: `handle_defeat` checks for Voidwatcher buff (ID 475) and tags the kill as `content_type='Voidwatch'` immediately at defeat time. No retroactive tagging needed — the buff is active during the entire VW cycle and prevents attacking non-VW mobs, so there's no risk of false positives. Unlike BCNM/Dynamis, VW does NOT set `content_info` on the tracker.
+- **Direct Kill Linkage**: `last_vw_kill` reference set in `handle_defeat` links Pyxis drops to the correct kill. No time-window scanning needed.
+- **Three-Layer Finalization Redundancy**: (1) C2S 0x05B EventEnd (immediate), (2) Voidwatcher buff loss poll in d3d_present (safety net), (3) zone change / new Pyxis interaction (ultimate fallback). All idempotent via `finalize_vw_interaction()`.
+- **Consecutive VW Cycle Support**: Riftworn Pyxis reuses the same server_id across VW cycles. Same-Pyxis guard compares `last_vw_kill` against stored `kill_id` to detect new cycles and reset state.
+- VW item delivery uses **two different packets** depending on item type: stackable items (materials, seals) arrive via S2C 0x01F (ItemNo at offset 0x08), while equipment/augmented items arrive via S2C 0x020 (ItemNo at offset 0x0C). The subsequent 0x034 zeroing serves as a third fallback for both types. Verified via retail packet captures (Kaggen, Gugalanna).
+
 ## v1.1.1
 
 ### Added

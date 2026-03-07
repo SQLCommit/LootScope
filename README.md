@@ -1,4 +1,4 @@
-# LootScope v1.1.1 - Loot Drop Tracker for Ashita v4.3
+# LootScope v1.2.1 - Loot Drop Tracker for Ashita v4.3
 
 Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
 
@@ -7,7 +7,7 @@ Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, a
 ## Features
 
 - **Live Feed**: Real-time scrolling table of all loot drops with configurable columns. Tooltips show Mob ID, Vana'diel time, moon phase, and weather. Filterable: hide empty kills or mob gil drops.
-- **Statistics**: Per-mob kill counts (nearby + distant), drop rates (nearby rate + combined rate with distant bias), unique items, per-item breakdowns, and per-spawn (Mob ID) breakdown with sortable columns. Two-row grouped filter: Row 1 selects a category (Field, Battlefields, Instances, Chest/Coffer), Row 2 shows context-sensitive sub-filters (Battlefields: All/BCNM/HTBF; Instances: Dynamis — Ambuscade/Omen/Sortie WIP). Each category has a `(?)` tooltip explaining detection methods and edge cases. Filter combo dropdown below for zone/battlefield selection. The "All" Battlefields view shows battlefield names with both Lv Cap and Difficulty columns, grouping by battlefield + zone + level cap + difficulty.
+- **Statistics**: Per-mob kill counts (nearby + distant), drop rates (nearby rate + combined rate with distant bias), unique items, per-item breakdowns, and per-spawn (Mob ID) breakdown with sortable columns. Two-row grouped filter: Row 1 selects a category (Field, Battlefields, Instances, Chest/Coffer, Voidwatch), Row 2 shows context-sensitive sub-filters (Battlefields: All/BCNM/HTBF; Instances: Dynamis — Ambuscade/Omen/Sortie WIP). Each category has a `(?)` tooltip explaining detection methods and edge cases. Filter combo dropdown below for zone/battlefield selection. The "All" Battlefields view shows battlefield names with both Lv Cap and Difficulty columns, grouping by battlefield + zone + level cap + difficulty.
 - **Slot Analysis**: Per-mob drop slot probability analysis. Wilson score 95% confidence intervals, slot count estimation (rate sum, empty kill model fit), items-per-kill distribution with Poisson Binomial expected values, co-occurrence analysis (deviation from independence), shared slot candidate detection (items that never co-occur), and drop arrival order tracking for drop table position inference. Battlefield mode (BCNM/HTBF/All Battlefields) automatically switches to specialized sections: Drop Structure (guaranteed vs variable items, items-per-encounter stats) and Inferred Drop Table (union-find grouping of co-occurrence data into probable slots). All data visible from the first kill — low-sample warnings shown when appropriate, but nothing gated behind minimum kill counts. Tooltips adapt to context (kills/runs, per-kill/per-encounter). Chest/Coffer excluded (independent slot model doesn't apply). Uses same category/zone/mob filter system as Statistics.
 - **Two-Tier Distant Kill Tracking**: Per-mob distant kills with drops (flagged `is_distant=1` via 0x00D2) shown as blue `(+N)` with separate combined rate. Zone-level missed kills (msg_id=37, no mob identity) informational count only in DB — not applied to per-mob rates.
 - **Treasure Hunter Tracking**: Detects TH procs from action packets and records TH level at time of kill
@@ -19,7 +19,8 @@ Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, a
 - **Mob Spawn ID Tracking**: Each kill records the mob's permanent server ID, enabling per-spawn point drop rate analysis. Gil-only spawns are hidden from the per-spawn breakdown.
 - **Source Classification**: Distinguishes drops from mobs, chests, coffers, and BCNM crates using SpawnFlags
 - **BCNM Detection**: Captures battlefield name from chat ("Entering the battlefield for X!"), detects level cap via two methods (chat text parsing of "{Name}'s level is currently restricted to {N}" + `GetJobLevel()` vs `GetMainJobLevel()` memory comparison fallback), tracks battlefield sessions in SQLite, and reconnects on addon reload via buff icon 254. Stale sessions auto-cleaned after 4 hours.
-- **Content Type Detection**: Classifies endgame content (BCNM, HTBF, Dynamis). BCNM/HTBF detected via S2C 0x0075 battlefield packet (mode 0x0001 = countdown timer). Dynamis (original + Divergence) detected by zone name prefix — covers all 14 zones without packet dependency. Crash-resilient. Ambuscade, Omen, and Sortie are WIP — more packet research needed.
+- **Content Type Detection**: Classifies endgame content (BCNM, HTBF, Dynamis, Voidwatch). BCNM/HTBF detected via S2C 0x0075 battlefield packet (mode 0x0001 = countdown timer). Dynamis (original + Divergence) detected by zone name prefix — covers all 14 zones without packet dependency. Voidwatch tagged retroactively when Riftworn Pyxis delivers items (does not use persistent content_info — VW occurs in open-world zones). Crash-resilient. Ambuscade, Omen, and Sortie are WIP — more packet research needed.
+- **Voidwatch Loot Tracking**: Tracks loot from Riftworn Pyxis after VW NM kills. VW bypasses the treasure pool entirely — items are delivered via S2C 0x034 event params. Up to 8 offered items per Pyxis interaction are recorded as drops. Selection tracking: taken items marked as won, untaken items marked as relinquished. Dedicated Voidwatch statistics category with per-NM/zone grouping.
 - **HTBF Difficulty Tracking**: Detects High-Tier Battlefield entry via S2C 0x005C packet (`num[0]==2`). Records difficulty level (VD/D/N/E/VE) and resolves battlefield name from zone dialog DAT files. Separate HTBF tab in Statistics with per-difficulty grouping. Color-coded `[VD]`/`[D]`/`[N]`/`[E]`/`[VE]` badges in Live Feed and Compact mode. Mob kills inside battlefields show `[BCNM]`/`[HTBF]` prefix. Difficulty range guard (1-5) prevents BCNMs from setting false HTBF info.
 - **Chest Interaction Pre-identification**: Tracks outgoing C2S 0x1A (Talk/Interact) packets to pre-identify chest/coffer targets before 0x00D2 drops arrive. Improves container name resolution when the entity despawns before drops are processed.
 - **Compact Mode**: Minimal overlay with configurable opacity and columns
@@ -64,11 +65,15 @@ LootScope passively monitors these packets:
 - **0x0053 (System Message)**: MsgStd 19 = "Obtains X gil". Secondary chest gil detection (LSB uses `messageSystem(OBTAINS_GIL)` for chest gil distribution).
 - **0x005C (GP_SERV_COMMAND_PENDINGNUM)**: HTBF entry detection. 8 x int32 params: `num[0]==2` = HTBF entry, `num[1]` = bit position (battlefield name index), `num[2]` = difficulty (1=VD, 2=D, 3=N, 4=E, 5=VE). Difficulty range guard rejects values outside 1-5 (BCNMs send 0). Battlefield name resolved from zone dialog DAT files.
 - **0x0075 (GP_SERV_COMMAND_BATTLEFIELD)**: Content type detection. Mode field at offset 0x04 (uint16 LE): 0x0001=countdown timer (all battlefields), 0xFFFF=progress bars, 0x1000=scoreboard. Currently maps 0x0001 to BCNM (HTBF distinguished by bf_difficulty). NOT sent for original Dynamis. Dynamis detected by zone name prefix. Ambuscade/Omen/Sortie detection via this packet is WIP — more packet research needed.
+- **0x0034 (GP_SERV_COMMAND_EVENTNUM)**: NPC event begin. Used for Voidwatch Riftworn Pyxis loot detection. Params[0-7] (int32) contain offered item IDs when interacting with a Pyxis. First event records all offered items; subsequent events detect which items were taken (param zeroed out) vs relinquished.
+- **0x001F (GP_SERV_COMMAND_ITEM_LIST)**: Inventory item assign. Used for Voidwatch stackable item delivery (materials, seals). ItemNo at offset 0x08 (uint16). Matched against offered Pyxis items.
+- **0x0020 (GP_SERV_COMMAND_ITEM_ATTR)**: Item full info with augments. Used for Voidwatch equipment/augmented item delivery. ItemNo at offset 0x0C (uint16). Matched against offered Pyxis items.
 - **0x00D2 (Treasure Pool Item)**: Fired when a drop appears in the treasure pool. Contains item ID, quantity, mob server ID, and pool slot. Sent to ALL party members regardless of distance.
 - **0x00D3 (Lot Result)**: Fired when a lot is resolved. Contains pool slot, winner name, lot value, and win/loss/error flag.
 
 **Outgoing (C2S):**
-- **0x1A (GP_CLI_COMMAND_ACTION)**: Tracks NPC interactions (ActionID=0x00 = Talk/Interact). Pre-identifies chest/coffer targets before 0x00D2 drops arrive.
+- **0x1A (GP_CLI_COMMAND_ACTION)**: Tracks NPC interactions (ActionID=0x00 = Talk/Interact). Pre-identifies chest/coffer targets before 0x00D2 drops arrive. Also detects Voidwatch context when interacting with Riftworn Pyxis entities.
+- **0x5B (GP_CLI_COMMAND_EVENTEND)**: Event end. Used for Voidwatch Pyxis finalization. EndPara values: 1-8 = item selection, 9 = exit/leave, 10 = obtain all. EndPara=9 marks remaining items as relinquished (won=-1). EndPara=10 marks remaining items as obtained (won=1). Fires before delivery packets (0x01F/0x020), so won status must be set here.
 
 ### Ashita SDK API
 
@@ -79,7 +84,7 @@ Beyond packet capture, LootScope uses these Ashita SDK interfaces for client-sid
 | **IEntity** | `GetName(idx)`, `GetSpawnFlags(idx)`, `GetLocalPositionX/Y(idx)` | Mob name resolution (primary), source classification (Monster vs Object flags), entity scanning for nearby containers |
 | **IInventory** | `GetTreasurePoolItem(slot)`, `GetTreasurePoolStatus()`, `GetContainerItem(bag, slot)` | Pool scanning on addon reload/late join, pool active check, gil snapshot before/after chest opens |
 | **IParty** | `GetMemberZone(0)` | Zone detection, character login gate (`zone > 0` = in-game) |
-| **IPlayer** | `GetMainJob()`, `GetMainJobLevel()`, `GetJobLevel(id)`, `GetBuffs()` | BCNM level cap detection (`GetMainJobLevel()` capped vs `GetJobLevel()` uncapped), battlefield reconnect (buff ID 71/73) |
+| **IPlayer** | `GetMainJob()`, `GetMainJobLevel()`, `GetJobLevel(id)`, `GetBuffs()` | BCNM level cap detection (`GetMainJobLevel()` capped vs `GetJobLevel()` uncapped), battlefield reconnect (buff ID 71/73), Voidwatch kill tagging (buff ID 475) |
 | **ITarget** | `GetTargetIndex(0)` | Container detection — checks if player is targeting a chest/coffer |
 | **IResourceManager** | `GetItemById(id)`, `GetString('zones.names', id)` | Item name resolution from pool data, zone name lookup |
 | **GetPlayerEntity()** | `.ServerId` | Character identity for per-character database selection |
@@ -96,8 +101,9 @@ Beyond packet capture, LootScope uses these Ashita SDK interfaces for client-sid
 5. Containers/chests that don't send 0x0029 get kill records created on first 0x00D2
 6. Chest/coffer interactions: 0x002A detects unlock/fail -> 0x001E or 0x0053 captures gil amount
 7. When lots resolve, 0x00D3 updates the drop's status (Got/Full/Lost) with winner info
-8. Zone changes mark any pending pool items as Zoned and clear in-memory tracking
-9. Distant kills detected via msg_id=37 are counted for drop rate adjustment (see below)
+8. Voidwatch: Kill tagged as Voidwatch at defeat time via Voidwatcher buff (ID 475). Riftworn Pyxis interaction triggers 0x034 event with offered items. Three-layer selection tracking: (1) subsequent 0x034 param zeroing, (2) 0x01F stackable item delivery, (3) 0x020 equipment item delivery. Three-layer finalization: (1) C2S 0x05B EventEnd, (2) buff loss poll, (3) zone change.
+9. Zone changes mark any pending pool items as Zoned and clear in-memory tracking
+10. Distant kills detected via msg_id=37 are counted for drop rate adjustment (see below)
 
 ### Mob Name Resolution
 
@@ -219,7 +225,7 @@ Export options:
 lootscope/
   lootscope.lua   -- Main addon: metadata, events, commands, CSV export
   db.lua          -- SQLite schema, migrations, queries, dirty-flag caching, transaction batching
-  tracker.lua     -- Packet parsing (0x0028/0x0029/0x002A/0x001E/0x0053/0x005C/0x0075/0x00D2/0x00D3), content detection, weather scan, DAT lookup, credit system, drop order tracking
+  tracker.lua     -- Packet parsing (0x0028/0x0029/0x002A/0x001E/0x001F/0x0020/0x0053/0x005B/0x005C/0x0075/0x0034/0x00D2/0x00D3), content detection, weather scan, DAT lookup, credit system, drop order tracking, Voidwatch Pyxis loot + buff detection
   analysis.lua    -- Statistical engine: Wilson CI, Poisson Binomial, co-occurrence, shared slot detection, battlefield drop structure, union-find inferred slots
   datreader.lua   -- Zone dialog DAT reader: d_msg/event_msg parsing for HTBF battlefield name resolution
   ui.lua          -- ImGui dashboard with tabs, compact mode, advanced export, nearby/combined rates, slot analysis (field + battlefield modes)
@@ -322,7 +328,7 @@ See [SLOT_ANALYSIS.md](SLOT_ANALYSIS.md) for the statistical methodology behind 
 ## Thanks
 
 - **Thorny** - Slot Analysis concept, drop order tracking idea, outgoing 0x1A chest pre-identification approach, and ongoing feedback
-- **Chihiro** - HTBF difficulty tracking suggestion
+- **Chihiro** - HTBF difficulty and VW tracking suggestion
 - **Ashita Team** - atom0s, thorny, and the [Ashita Discord](https://discord.gg/Ashita) community
 
 ## License

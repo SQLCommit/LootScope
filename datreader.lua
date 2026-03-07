@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.1.1 - Zone Dialog DAT Reader
+    LootScope v1.2.1 - Zone Dialog DAT Reader
     Reads zone dialog DAT files to resolve HTBF battlefield names from
     the "Entering the battlefield for..." template strings.
 
@@ -16,7 +16,7 @@
       Indexed by bit position from 0x005C packet's num[1].
 
     Author: SQLCommit
-    Version: 1.1.1
+    Version: 1.2.1
 ]]--
 
 require 'common';

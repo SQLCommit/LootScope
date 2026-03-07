@@ -1,10 +1,10 @@
 --[[
-    LootScope v1.1.1 - UI Module
+    LootScope v1.2.1 - UI Module
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.1.1
+    Version: 1.2.1
 ]]--
 
 require 'common';
@@ -57,8 +57,8 @@ local stats_expanded_spawns = {};  -- [mob_key .. '_' .. server_id] = true if sp
 local stats_cache_data = nil;       -- cached filtered+sorted result
 local stats_cache_zone = -1;        -- zone filter when cache was built
 local stats_cache_dirty = true;     -- tracks if db.stats_dirty changed
-local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst
-local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer
+local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch
+local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer, 4=Voidwatch
 local stats_cache_source = -1;      -- source filter when cache was built
 local stats_name_filter = nil;       -- name filter for BCNM/Chest-Coffer (nil = all)
 local stats_cache_name = nil;        -- name filter when cache was built
@@ -1096,6 +1096,26 @@ local function render_statistics()
             .. '  timers (respawn ~3min, illusion 30-60min).');
     end
 
+    imgui.SameLine();
+    if imgui.RadioButton('Voidwatch', stats_category == 4) then
+        stats_category = 4;
+        reset_stats_filter(10);
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Voidwatch Statistics\n'
+            .. '------------------------------\n'
+            .. 'Loot from Riftworn Pyxis after VW NM kills.\n\n'
+            .. 'Detection: entity name "Planar Rift" or\n'
+            .. '"Riftworn Pyxis" during NPC interaction.\n\n'
+            .. 'Items recorded from Pyxis event data\n'
+            .. '(bypasses treasure pool — uses 0x034).\n\n'
+            .. 'All offered items are recorded as drops.\n'
+            .. 'Taken = won, relinquished = lost.');
+    end
+
     -- Row 2: Sub-filter radio buttons (only for Battlefields and Instances)
     if (stats_category == 1) then
         -- Battlefields: All | BCNM | HTBF
@@ -1776,6 +1796,8 @@ local function apply_filters()
         htbf_only = true;          -- content_type='BCNM' AND bf_difficulty>0
     elseif (ef.source_idx[1] == 6) then
         content_type = 'Dynamis';
+    elseif (ef.source_idx[1] == 7) then
+        content_type = 'Voidwatch';
     end
 
     local status = af_status_map[ef.status_idx[1]];
@@ -1965,7 +1987,7 @@ local function render_advanced_export_window()
             imgui.Text('Source:');
             imgui.SameLine(col2);
             imgui.PushItemWidth(w2);
-            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0\0') then
+            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0\0') then
                 ef.auto_dirty = true;
             end
             imgui.PopItemWidth();
@@ -3490,9 +3512,9 @@ local function render_slot_analysis()
             .. '  Field — Open-world mobs (excludes instance content)\n'
             .. '  Battlefields — BCNM (chest drops) and HTBF (direct drops)\n'
             .. '  Instances — Dynamis (Omen/Ambuscade/Sortie WIP)\n\n'
-            .. 'Chest/Coffer is not shown here — chests give one\n'
-            .. 'outcome per open, so slot analysis does not apply.\n'
-            .. 'See the Statistics tab for chest/coffer drop rates.');
+            .. 'Chest/Coffer and Voidwatch are not shown here —\n'
+            .. 'slot analysis requires treasure pool drops.\n'
+            .. 'See the Statistics tab for those categories.');
     end
 
     -- Row 2: Sub-filter radio buttons (Battlefields / Instances)

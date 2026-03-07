@@ -1,13 +1,13 @@
 --[[
-    LootScope v1.1.1 - Packet Tracker
+    LootScope v1.2.1 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
-    and outgoing 0x1A (chest interaction) packets to track kills, loot
-    drops, lot outcomes, Treasure Hunter procs, content type, and HTBF
-    difficulty.
+    0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
+    packets to track kills, loot drops, lot outcomes, Treasure Hunter
+    procs, content type, HTBF difficulty, and Voidwatch Pyxis loot.
 
     Author: SQLCommit
-    Version: 1.1.1
+    Version: 1.2.1
 ]]--
 
 require 'common';
@@ -80,7 +80,17 @@ tracker.htbf_info = nil;  -- { zone_id, bit_pos, difficulty, bf_name }
 tracker.last_interact = nil;  -- { server_id, target_index, name, timestamp }
 
 -- Content type — set by 0x0075, persists until zone change
-tracker.content_info = nil;  -- { type='BCNM'|'Dynamis'|..., mode=0x0001, ... }
+tracker.content_info = nil;  -- { type='BCNM'|'Dynamis'|'Voidwatch'|..., mode=0x0001, ... }
+
+-- Voidwatch state (Riftworn Pyxis loot tracking via 0x034)
+tracker.voidwatch = {
+    pyxis_active = false,       -- player talked to Riftworn Pyxis
+    pyxis_sid = nil,            -- Pyxis entity server ID
+    items_captured = false,     -- first 0x034 processed
+    kill_id = nil,              -- linked kill record
+    offered = {},               -- { [slot] = item_id } from first 0x034
+    last_vw_kill = nil,         -- most recent VW NM kill_id (set by handle_defeat)
+};
 
 -- Drop arrival order per mob (for slot analysis ordering queries)
 -- mob_server_id -> next sequence number, reset to 0 on kill, incremented per 0x00D2
@@ -1334,6 +1344,54 @@ local function load_zone_dat(zone_id)
 end
 
 -------------------------------------------------------------------------------
+-- Voidwatch Helpers (must be defined before check_zone which calls finalize)
+-------------------------------------------------------------------------------
+
+-- Check if the player currently has the Voidwatcher buff (ID 475).
+-- Active during a VW cycle — wears off after Pyxis interaction completes.
+local function has_voidwatcher_buff()
+    local mem = AshitaCore:GetMemoryManager();
+    if (mem == nil) then return false; end
+    local player = mem:GetPlayer();
+    if (player == nil) then return false; end
+    local buffs = player:GetBuffs();
+    if (buffs == nil) then return false; end
+    for i = 0, 31 do
+        if (buffs[i] == 475) then return true; end
+    end
+    return false;
+end
+
+-- Finalize VW Pyxis interaction. Marks remaining offered items with the
+-- given won value: -1 = relinquished (default), 1 = obtained (Obtain All).
+local function finalize_vw_interaction(won_value)
+    local vw = tracker.voidwatch;
+    if (not vw.items_captured or vw.kill_id == nil) then return; end
+    if (db == nil) then return; end
+
+    won_value = won_value or -1;
+
+    for slot, _item_id in pairs(vw.offered) do
+        db.update_drop_won(vw.kill_id, slot, won_value, 0);
+    end
+
+    vw.items_captured = false;
+    vw.kill_id = nil;
+    vw.offered = {};
+end
+
+-- Redundant VW finalization: if the Voidwatcher buff wears off while items
+-- are still pending, finalize. Catches edge cases where 0x05B was missed
+-- (addon reload mid-event, packet issues). Called from d3d_present.
+function tracker.check_voidwatch_buff()
+    if (not tracker.voidwatch.items_captured) then return; end
+    if (tracker.voidwatch.kill_id == nil) then return; end
+    if (not has_voidwatcher_buff()) then
+        finalize_vw_interaction();
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Zone Change Detection
 -------------------------------------------------------------------------------
 
@@ -1392,6 +1450,9 @@ function tracker.check_zone()
         tracker.mob_gil_queue = {};
         tracker.htbf_info = nil;
         tracker.last_interact = nil;
+        finalize_vw_interaction();
+        tracker.voidwatch.pyxis_active = false;
+        tracker.voidwatch.last_vw_kill = nil;
         tracker.content_info = nil;
     end
 
@@ -1843,6 +1904,13 @@ function tracker.handle_defeat(data)
 
     local vana_info = capture_vana_info();
 
+    -- Determine content type: Voidwatcher buff (475) = VW kill, else use
+    -- the normal content_info (BCNM/HTBF/Dynamis from 0x0075 packet).
+    local ct = tracker.get_content_type();
+    if (ct == '' and has_voidwatcher_buff()) then
+        ct = 'Voidwatch';
+    end
+
     local ki = {
         killer_id      = killer_id,
         killer_name    = killer_name,
@@ -1850,7 +1918,7 @@ function tracker.handle_defeat(data)
         th_action_id   = th_action and th_action.cmd_arg or 0,
         bf_name        = tracker.htbf_info and tracker.htbf_info.bf_name or nil,
         bf_difficulty  = tracker.htbf_info and tracker.htbf_info.difficulty or 0,
-        content_type   = tracker.get_content_type(),
+        content_type   = ct,
     };
 
     -- Tag mob kills inside an active battlefield so the UI can show [BCNM]/[HTBF]
@@ -1872,6 +1940,11 @@ function tracker.handle_defeat(data)
     tracker.mob_kills[mob_sid] = kill_id;
     tracker.mob_kill_times[mob_sid] = os.clock();
     tracker.drop_sequence[mob_sid] = 0;
+
+    -- Track VW kill directly so handle_event_begin doesn't need to scan
+    if (ct == 'Voidwatch') then
+        tracker.voidwatch.last_vw_kill = kill_id;
+    end
 
     -- Queue this kill for mob gil detection.
     -- DistributeGil sends 0x0029 msg_id=565 with exact amount shortly after defeat.
@@ -2416,6 +2489,148 @@ function tracker.handle_pending_num(data)
 end
 
 -------------------------------------------------------------------------------
+-- Packet: 0x034 (S2C) - GP_SERV_COMMAND_EVENTNUM (Voidwatch Pyxis loot)
+-- Riftworn Pyxis sends item IDs in params[0-7] as int32.
+-- First 0x034: record all offered items. Subsequent: detect taken items.
+-------------------------------------------------------------------------------
+
+function tracker.handle_event_begin(data)
+    if (db == nil) then return; end
+    if (not tracker.voidwatch.pyxis_active) then return; end
+    if (#data < 0x34) then return; end
+
+    local npc_sid = sunpack('I', data, 0x04 + 1);
+    if (npc_sid ~= tracker.voidwatch.pyxis_sid) then return; end
+
+    -- Read 8 int32 params at offset 0x08
+    local params = {};
+    for i = 0, 7 do
+        local val = sunpack('i', data, 0x08 + (i * 4) + 1);
+        params[i] = (val ~= nil and val > 0 and val < 65536) and val or 0;
+    end
+
+    if (not tracker.voidwatch.items_captured) then
+        -------------------------------------------------
+        -- FIRST 0x034: Record all offered items (won=0)
+        -------------------------------------------------
+        local items = {};
+        for i = 0, 7 do
+            if (params[i] > 0) then
+                items[#items + 1] = { slot = i, item_id = params[i] };
+            end
+        end
+        if (#items == 0) then return; end
+
+        local kill_id = tracker.voidwatch.last_vw_kill;
+        if (kill_id == nil) then return; end
+
+        -- Record each offered item as a drop (won=0 = pending)
+        local res = AshitaCore:GetResourceManager();
+        for _, entry in ipairs(items) do
+            local item_name = 'Unknown';
+            if (res ~= nil) then
+                local item = res:GetItemById(entry.item_id);
+                if (item ~= nil and item.Name ~= nil) then
+                    item_name = item.Name[1] or 'Unknown';
+                end
+            end
+            db.record_drop(kill_id, entry.slot, entry.item_id, item_name, 1, 0);
+        end
+
+        tracker.voidwatch.items_captured = true;
+        tracker.voidwatch.kill_id = kill_id;
+        tracker.voidwatch.offered = {};
+        for i = 0, 7 do
+            if (params[i] > 0) then
+                tracker.voidwatch.offered[i] = params[i];
+            end
+        end
+    else
+        -------------------------------------------------
+        -- SUBSEQUENT 0x034: Detect taken items
+        -- Param went from non-zero to zero → item taken
+        -------------------------------------------------
+        local kill_id = tracker.voidwatch.kill_id;
+        if (kill_id == nil) then return; end
+
+        for slot, item_id in pairs(tracker.voidwatch.offered) do
+            if (params[slot] == 0) then
+                db.update_drop_won(kill_id, slot, 1, 0);
+                tracker.voidwatch.offered[slot] = nil;
+            end
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Voidwatch: Match an incoming inventory item against offered Pyxis items.
+-- Called by both 0x01F (stackable items) and 0x020 (equipment/augmented).
+-------------------------------------------------------------------------------
+
+local function match_vw_item(item_id)
+    if (db == nil) then return; end
+    if (not tracker.voidwatch.pyxis_active) then return; end
+    if (not tracker.voidwatch.items_captured) then return; end
+    if (tracker.voidwatch.kill_id == nil) then return; end
+    if (item_id == nil or item_id == 0) then return; end
+
+    for slot, offered_id in pairs(tracker.voidwatch.offered) do
+        if (offered_id == item_id) then
+            db.update_drop_won(tracker.voidwatch.kill_id, slot, 1, 0);
+            tracker.voidwatch.offered[slot] = nil;
+            return;  -- match first occurrence only (handles duplicate item IDs)
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Packet: 0x01F (S2C) - GP_SERV_COMMAND_ITEM_LIST (inventory item assign)
+-- Stackable VW items (materials, seals) are delivered via 0x01F.
+--   Offset 0x08: ItemNo (uint16)
+-------------------------------------------------------------------------------
+
+function tracker.handle_item_assign(data)
+    if (#data < 0x0C) then return; end
+    local item_id = sunpack('H', data, 0x08 + 1);
+    match_vw_item(item_id);
+end
+
+-------------------------------------------------------------------------------
+-- Packet: 0x020 (S2C) - GP_SERV_COMMAND_ITEM_ATTR (item full info)
+-- Equipment/augmented VW items are delivered via 0x020.
+--   Offset 0x0C: ItemNo (uint16)
+-------------------------------------------------------------------------------
+
+function tracker.handle_item_full_info(data)
+    if (#data < 0x0E) then return; end
+    local item_id = sunpack('H', data, 0x0C + 1);
+    match_vw_item(item_id);
+end
+
+-------------------------------------------------------------------------------
+-- Packet: 0x5B (outgoing) - GP_CLI_COMMAND_EVENTEND (Voidwatch Pyxis close)
+-- EndPara values for Pyxis: 1-8 = item selection, 9 = exit/leave,
+-- 10 = obtain all remaining. 0x05B fires BEFORE delivery packets (0x01F/0x020),
+-- so we must set the won value here — delivery packets arrive too late.
+-------------------------------------------------------------------------------
+
+function tracker.handle_event_end(data)
+    if (not tracker.voidwatch.pyxis_active) then return; end
+    if (not tracker.voidwatch.items_captured) then return; end
+    if (#data < 0x0C) then return; end
+
+    local npc_sid  = sunpack('I', data, 0x04 + 1);
+    if (npc_sid ~= tracker.voidwatch.pyxis_sid) then return; end
+
+    local end_para = sunpack('I', data, 0x08 + 1);
+    if (end_para == 10) then
+        finalize_vw_interaction(1);   -- obtain all = won
+    elseif (end_para == 9) then
+        finalize_vw_interaction(-1);  -- exit/leave = relinquished
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Packet: 0x1A (outgoing) - GP_CLI_COMMAND_ACTION (chest interaction)
 -- Tracks the most recent NPC interaction so we can pre-identify
 -- chest/coffer targets before 0x00D2 drops arrive.
@@ -2441,6 +2656,40 @@ function tracker.handle_outgoing_action(data)
         name         = name,
         timestamp    = os.clock(),
     };
+
+    -- Detect Voidwatch Riftworn Pyxis interaction.
+    -- Content type is tagged at kill time via Voidwatcher buff (475) in
+    -- handle_defeat, NOT here — VW happens in open-world zones.
+    if (name ~= nil) then
+        local lower = name:lower();
+        if (lower == 'riftworn pyxis') then
+            if (tracker.voidwatch.pyxis_active
+                and tracker.voidwatch.pyxis_sid == server_id
+                and tracker.voidwatch.items_captured) then
+                -- Same Pyxis entity with items already captured.
+                -- Check if a new kill occurred (new VW cycle, Pyxis reused).
+                local recent_kill = tracker.voidwatch.last_vw_kill;
+                if (recent_kill ~= nil and recent_kill ~= tracker.voidwatch.kill_id) then
+                    -- New kill → new cycle → reset state
+                    finalize_vw_interaction();
+                    tracker.voidwatch.pyxis_active = true;
+                    tracker.voidwatch.pyxis_sid = server_id;
+                    tracker.voidwatch.items_captured = false;
+                    tracker.voidwatch.kill_id = nil;
+                    tracker.voidwatch.offered = {};
+                end
+                -- else: same kill or no new kill → genuine re-interaction, keep state
+            else
+                -- Different Pyxis or first interaction
+                finalize_vw_interaction();
+                tracker.voidwatch.pyxis_active = true;
+                tracker.voidwatch.pyxis_sid = server_id;
+                tracker.voidwatch.items_captured = false;
+                tracker.voidwatch.kill_id = nil;
+                tracker.voidwatch.offered = {};
+            end
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -2477,6 +2726,7 @@ function tracker.reset()
     tracker.htbf_info = nil;
     tracker.last_interact = nil;
     tracker.content_info = nil;
+    tracker.voidwatch = { pyxis_active = false, pyxis_sid = nil, items_captured = false, kill_id = nil, offered = {}, last_vw_kill = nil };
 end
 
 return tracker;

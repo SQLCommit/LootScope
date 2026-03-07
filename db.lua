@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.1.1 - SQLite3 Persistence Layer
+    LootScope v1.2.1 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +10,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.1.1
+    Version: 1.2.1
 ]]--
 
 require 'common';
@@ -614,6 +614,27 @@ function db.find_pending_drop(pool_slot, item_id)
 end
 
 -------------------------------------------------------------------------------
+-- Kill Content Type Update (retroactive tagging)
+-- Currently unused — VW kills are tagged at defeat time via buff check.
+-- Kept for future content types (Omen, Ambuscade, Sortie) that may need retroactive tagging.
+-------------------------------------------------------------------------------
+
+function db.update_kill_content_type(kill_id, content_type)
+    if (db.conn == nil or kill_id == nil) then return; end
+
+    begin_batch();
+
+    local stmt = db.conn:prepare('UPDATE kills SET content_type = ? WHERE id = ?');
+    if (stmt == nil) then maybe_commit(); return; end
+    stmt:bind_values(content_type, kill_id);
+    stmt:step();
+    stmt:finalize();
+
+    invalidate_kills();
+    maybe_commit();
+end
+
+-------------------------------------------------------------------------------
 -- Kill Name Update (retroactive mob name from chat when entity was out of range)
 -------------------------------------------------------------------------------
 
@@ -788,10 +809,11 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     -- BCNM mode: match by battlefield name instead of mob_name
     local is_bcnm = (source_filter == 2);
     local is_htbf = (source_filter == 3);
-    local is_content = (source_filter ~= nil and source_filter >= 4 and source_filter <= 7);
+    local is_content = (source_filter ~= nil and source_filter >= 4 and source_filter <= 7)
+                       or (source_filter == 10);
     local is_all_bf = (source_filter == 8);
     local is_all_inst = (source_filter == 9);
-    local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis' };
+    local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch' };
     local kill_query, item_query;
 
     if (is_htbf) then
@@ -1140,6 +1162,8 @@ function db.get_all_mob_stats(source_filter)
         where_clause = ' WHERE (k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0';
     elseif (source_filter == 9) then
         where_clause = " WHERE COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+    elseif (source_filter == 10) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = 'Voidwatch'";
     end
 
     -- BCNM/HTBF view: group by battlefield name; gil excluded from drop counts

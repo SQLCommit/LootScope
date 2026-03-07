@@ -1,11 +1,16 @@
 --[[
-    LootScope v1.1.1 - Loot Drop Tracker for Ashita v4
+    LootScope v1.2.1 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
 
+    v1.2.1: VW bug fixes — consecutive cycle detection, relinquish
+    tracking via 0x05B EventEnd, buff-based kill tagging (ID 475),
+    three-layer finalization redundancy.
+    v1.2.0: Voidwatch loot tracking (Riftworn Pyxis via 0x034),
+    Voidwatch statistics category, content type tagging.
     v1.1.1: Slot Analysis tab, content type detection (0x0075),
     grouped statistics filters, battlefield mode, advanced export
     content-type filtering, dead code cleanup.
@@ -21,12 +26,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.1.1
+    Version: 1.2.1
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.1.1';
+addon.version = '1.2.1';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -578,6 +583,21 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
     if (e.id == 0x0075) then
         safe_call(tracker.handle_battlefield_packet, e.data_modified, '0x0075');
     end
+
+    -- 0x0034: GP_SERV_COMMAND_EVENTNUM (Voidwatch Pyxis loot detection)
+    if (e.id == 0x0034) then
+        safe_call(tracker.handle_event_begin, e.data_modified, '0x034');
+    end
+
+    -- 0x001F: GP_SERV_COMMAND_ITEM_LIST (Voidwatch stackable item delivery)
+    if (e.id == 0x001F) then
+        safe_call(tracker.handle_item_assign, e.data_modified, '0x01F');
+    end
+
+    -- 0x0020: GP_SERV_COMMAND_ITEM_ATTR (Voidwatch equipment/augmented item delivery)
+    if (e.id == 0x0020) then
+        safe_call(tracker.handle_item_full_info, e.data_modified, '0x020');
+    end
 end);
 
 -------------------------------------------------------------------------------
@@ -587,6 +607,11 @@ ashita.events.register('packet_out', 'lootscope_packet_out', function(e)
     -- 0x001A: GP_CLI_COMMAND_ACTION (chest/NPC interaction pre-identification)
     if (e.id == 0x001A) then
         safe_call(tracker.handle_outgoing_action, e.data_modified, '0x1A out');
+    end
+
+    -- 0x005B: GP_CLI_COMMAND_EVENTEND (Voidwatch Pyxis close / relinquish all)
+    if (e.id == 0x005B) then
+        safe_call(tracker.handle_event_end, e.data_modified, '0x5B out');
     end
 end);
 
@@ -599,6 +624,7 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
 
     safe_frame_call(tracker.check_zone, 'check_zone');
     safe_frame_call(tracker.check_battlefield_level_cap, 'check_bf_cap');
+    safe_frame_call(tracker.check_voidwatch_buff, 'check_vw_buff');
 
     -- Retry deferred pool scan (throttled to 1/sec)
     if (tracker.pool_scan_pending) then
