@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.2.1 - Packet Tracker
+    LootScope v1.3.0 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
     0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
@@ -12,12 +12,15 @@
 
 require 'common';
 
+local ffi = require 'ffi';
 local sunpack = struct.unpack;
 local breader = require 'bitreader';
 local vana_time = require 'ffxi.time';
 local dats = require 'ffxi.dats';
 local ok_dat, datreader = pcall(require, 'datreader');
 if (not ok_dat) then datreader = nil; end
+local ok_itemdata, itemdata_lib = pcall(require, 'libs/ffxi/itemdata');
+if (not ok_itemdata) then itemdata_lib = nil; end
 local tracker = {};
 
 -------------------------------------------------------------------------------
@@ -104,6 +107,206 @@ tracker.drop_sequence = {};
 -- Each entry: { kill_id, time, mob_name }
 tracker.mob_gil_queue = {};
 
+-- TH gear estimation state (cleared on zone change)
+tracker.th_estimated = {};     -- mob_server_id -> max TH estimate seen across all scans
+tracker.engaged_mobs = {};     -- mob_server_id -> true (mobs we're actively fighting)
+
+-- TH trust/pet tracking: name of active TH trust/pet (for UI display, cleared on zone change)
+tracker.th_trust_source = nil;     -- name of last TH trust/pet that hit a mob
+
+-- TH items lookup cache (rebuilt when profile changes)
+tracker.th_items_cache = nil;  -- item_id -> { th_value, slot_id } (from active profile)
+tracker.th_profile_id = nil;   -- active profile id for cache invalidation
+
+-- Cached player server ID (updated on zone/login, avoids per-action lookup)
+local cached_player_sid = nil;
+
+-------------------------------------------------------------------------------
+-- BLU Spell-Set Trait Detection
+-- BLU's TH+1 trait requires Charged Whisker + Everyone's Grudge + Amorphic Spikes
+-- all set simultaneously. We read the set spells from memory (same as blusets addon).
+-- Spell IDs confirmed from LSB sql/blue_spell_list.sql.
+-------------------------------------------------------------------------------
+local BLU_JOB_ID = 16;
+-- BLU memory stores spell IDs as (actual_id - 512)
+local BLU_TH_SPELLS = {
+    [168] = true,  -- Charged Whisker  (spell 680)
+    [171] = true,  -- Everyone's Grudge (spell 683)
+    [185] = true,  -- Amorphic Spikes  (spell 697)
+};
+local BLU_TH_SPELL_COUNT = 3;
+
+-- Lazy-init BLU spell memory offset (nil=not attempted, false=failed)
+local blu_mem_offset = nil;
+
+local function get_blu_mem_offset()
+    if (blu_mem_offset ~= nil) then return blu_mem_offset; end
+    local ok, ptr = pcall(ashita.memory.find, 0, 0,
+        'C1E1032BC8B0018D????????????B9????????F3A55F5E5B', 10, 0);
+    if (not ok or ptr == nil or ptr == 0) then
+        blu_mem_offset = false;
+        return false;
+    end
+    blu_mem_offset = ffi.cast('uint32_t*', ptr);
+    return blu_mem_offset;
+end
+
+-- Check if the 3 BLU spells for TH trait are currently set.
+-- is_main: true = check main job spell set, false = check sub job spell set
+local function are_blu_th_spells_set(is_main)
+    local offset = get_blu_mem_offset();
+    if (not offset) then return false; end
+
+    local inv_ptr = AshitaCore:GetPointerManager():Get('inventory');
+    if (inv_ptr == nil or inv_ptr == 0) then return false; end
+    local ptr = ashita.memory.read_uint32(inv_ptr);
+    if (ptr == 0) then return false; end
+    ptr = ashita.memory.read_uint32(ptr);
+    if (ptr == 0) then return false; end
+
+    -- Main job spells at +0x04, sub job spells at +0xA0 (20 slots × 1 byte each)
+    local ok_read, spell_data = pcall(ashita.memory.read_array,
+        (ptr + offset[0]) + (is_main and 0x04 or 0xA0), 0x14);
+    if (not ok_read or spell_data == nil) then return false; end
+
+    local found = 0;
+    for _, spell_id in ipairs(spell_data) do
+        if (BLU_TH_SPELLS[spell_id]) then
+            found = found + 1;
+            if (found >= BLU_TH_SPELL_COUNT) then return true; end
+        end
+    end
+    return false;
+end
+
+-------------------------------------------------------------------------------
+-- TH Cap Constants
+-- THF main base cap = 8 (server procs can push to 12-14 with JP gifts)
+-- Non-THF main cap = 4
+-------------------------------------------------------------------------------
+local THF_JOB_ID = 6;
+local TH_CAP_THF  = 8;
+local TH_CAP_OTHER = 4;
+local SIGNET_BUFF_ID = 253;
+local DIFFICULTY_UNKNOWN = 6;  -- sentinel: HTBF detected from ★ prefix, difficulty not yet resolved
+
+-- Ashita API may return server IDs as signed int32; convert to unsigned.
+local function unsigned_sid(sid)
+    if (sid ~= nil and sid < 0) then return sid + 4294967296; end
+    return sid;
+end
+
+-------------------------------------------------------------------------------
+-- Trust / Pet TH Detection
+-- Trusts on THF or /THF apply TH1. BST jug pets with THF apply TH1.
+-- Source: BG-Wiki Treasure_Hunter, confirmed against LSB mob_pools.sql
+-------------------------------------------------------------------------------
+local TH_TRUST_NAMES = {
+    -- THF main trusts
+    ['Aldo'] = true,
+    ['Chacharoon'] = true,
+    ['Fablinix'] = true,
+    ['JakohWahcondalo'] = true,  -- no space (LSB mob_pools)
+    ['Jakoh Wahcondalo'] = true, -- space variant (retail)
+    ['Lehko Habhoka'] = true,
+    ['Lion'] = true,
+    ['Maximilian'] = true,
+    ['Nanaa Mihgo'] = true,
+    ['Romaa Mihgo'] = true,
+    -- /THF sub trusts
+    ['Ark Angel MR'] = true,
+    ['Maat'] = true,
+    ['Margret'] = true,
+};
+
+-- BST jug pets that apply TH1 (THF-based pets)
+-- Include name variants: in-game display may differ from wiki/pet_list
+local TH_PET_NAMES = {
+    ['Dipper Yuly'] = true,
+    ['DipperYuly'] = true,
+    ['Faithful Falcorr'] = true,
+    ['Faithful Falcor'] = true,   -- LSB pet_list spelling
+    ['FaithfulFalcorr'] = true,
+    ['Threestar Lynn'] = true,    -- may not be in LSB yet
+    ['ThreestarLynn'] = true,
+};
+
+-- Cache: server_id -> true/false/name (is this actor a TH trust/pet?)
+-- Populated lazily on first offensive action, cleared on zone change.
+local th_source_cache = {};
+
+-- Resolve whether an actor server ID is a TH trust or pet.
+-- Returns name string if TH source, false if not. Caches result per SID.
+local function resolve_th_source(actor_sid)
+    local cached = th_source_cache[actor_sid];
+    if (cached ~= nil) then return cached; end
+
+    local mem = AshitaCore:GetMemoryManager();
+    if (mem == nil) then th_source_cache[actor_sid] = false; return false; end
+
+    -- Check party members (covers trusts — they appear as party members)
+    local party = mem:GetParty();
+    if (party ~= nil) then
+        for i = 1, 5 do
+            if (party:GetMemberIsActive(i) == 1) then
+                local sid = unsigned_sid(party:GetMemberServerId(i));
+                if (sid == actor_sid) then
+                    local name = party:GetMemberName(i);
+                    if (name ~= nil and TH_TRUST_NAMES[name]) then
+                        th_source_cache[actor_sid] = name;
+                        return name;
+                    end
+                    th_source_cache[actor_sid] = false;
+                    return false;
+                end
+            end
+        end
+    end
+
+    -- Check if it's our BST pet (GetPetTargetIndex → single entity read, no scan)
+    local entity = mem:GetEntity();
+    if (entity ~= nil and party ~= nil) then
+        local my_idx = party:GetMemberTargetIndex(0);
+        local pet_idx = (my_idx ~= nil and my_idx > 0) and entity:GetPetTargetIndex(my_idx) or nil;
+        if (pet_idx ~= nil and pet_idx ~= 0) then
+            local pet_sid = unsigned_sid(entity:GetServerId(pet_idx));
+            if (pet_sid == actor_sid) then
+                local name = entity:GetName(pet_idx);
+                if (name ~= nil and TH_PET_NAMES[name]) then
+                    th_source_cache[actor_sid] = name;
+                    return name;
+                end
+                th_source_cache[actor_sid] = false;
+                return false;
+            end
+        end
+    end
+
+    -- Unknown actor — not a TH source
+    th_source_cache[actor_sid] = false;
+    return false;
+end
+
+-------------------------------------------------------------------------------
+-- Super Kupower: Treasure Hound Detection
+-- Detected via zone-in chat message. Grants TH+1 when Signet (buff 253) is
+-- active. Cached per-zone: the kupower persists for the week regardless of
+-- Signet status, so we cache the zone flag and check Signet live at scan time.
+-- TODO: Atma of Dread (Abyssea, buff 287) and Prowess TH (GoV, buff 474) —
+--       these require user configuration since the buff only indicates the
+--       system is active, not which specific bonuses are applied.
+--       Prowess TH: +1 per level, max 3 levels (TH+1 to TH+3).
+-------------------------------------------------------------------------------
+tracker.zone_has_treasure_hound = false;
+
+function tracker.handle_kupower_text(msg)
+    if (msg == nil or msg == '') then return; end
+    -- FFXI sends: "This area is currently affected by the Super Kupower: Treasure Hound!"
+    -- Match loosely in case of slight wording variations across servers.
+    if (msg:find('Treasure Hound', 1, true)) then
+        tracker.zone_has_treasure_hound = true;
+    end
+end
 
 -- References set during init
 local db = nil;
@@ -280,6 +483,7 @@ local difficulty_labels = {
     [3] = 'N',
     [4] = 'E',
     [5] = 'VE',
+    [6] = '?',
 };
 
 local difficulty_full_labels = {
@@ -288,6 +492,7 @@ local difficulty_full_labels = {
     [3] = 'Normal',
     [4] = 'Easy',
     [5] = 'Very Easy',
+    [6] = 'Unknown',
 };
 
 function tracker.get_difficulty_label(difficulty)
@@ -297,6 +502,13 @@ end
 function tracker.get_difficulty_full_label(difficulty)
     return difficulty_full_labels[tonumber(difficulty)] or '';
 end
+
+-- Inverse of difficulty_full_labels: maps chat text to difficulty number.
+-- Note: chat text uses lowercase ("Very difficult") vs label titlecase ("Very Difficult").
+local chat_text_to_difficulty = {
+    ['Very difficult'] = 1, ['Difficult'] = 2, ['Normal'] = 3,
+    ['Easy'] = 4, ['Very easy'] = 5,
+};
 
 -------------------------------------------------------------------------------
 -- Action Type Labels (cmd_no from 0x0028 action packet)
@@ -387,6 +599,229 @@ local function capture_vana_info()
 end
 
 -------------------------------------------------------------------------------
+-- TH Gear Estimation (scans equipped gear against active TH profile)
+-------------------------------------------------------------------------------
+
+-- Settings reference (set by tracker.set_settings)
+local th_settings = nil;
+
+function tracker.set_settings(s)
+    th_settings = s;
+end
+
+-- Rebuild item lookup cache from DB for active profile
+local function refresh_th_items_cache(profile_id)
+    if (db == nil or profile_id == nil) then
+        tracker.th_items_cache = nil;
+        tracker.th_profile_id = nil;
+        return;
+    end
+    tracker.th_items_cache = db.get_th_items_by_item_id(profile_id);
+    tracker.th_profile_id = profile_id;
+end
+
+-- Get current profile ID from settings, refreshing cache if needed
+local cached_profile_name = nil;  -- tracks which profile name the cache was built for
+
+local function get_active_profile_id()
+    if (th_settings == nil) then return nil; end
+    if (not th_settings.th_estimation_enabled) then return nil; end
+    local profile_name = th_settings.th_profile;
+    if (profile_name == nil or profile_name == '') then return nil; end
+
+    -- Check if cache matches current profile name
+    if (tracker.th_items_cache ~= nil and tracker.th_profile_id ~= nil and cached_profile_name == profile_name) then
+        return tracker.th_profile_id;
+    end
+
+    -- Resolve profile name to ID (profile changed or cache empty)
+    local profile = db.get_th_profile_by_name(profile_name);
+    if (profile == nil) then return nil; end
+    refresh_th_items_cache(profile.id);
+    cached_profile_name = profile_name;
+    return profile.id;
+end
+
+-- Scan all 16 equipment slots and compute total TH from gear + traits + augments.
+-- Result is cached; invalidated by equipment change (0x0050) or zone change.
+-- Check if the player currently has a specific buff/status effect.
+-- Defined early so TH bonus detection (get_live_th_bonus) and VW/DI helpers can use it.
+local function has_buff(buff_id)
+    local mem = AshitaCore:GetMemoryManager();
+    if (mem == nil) then return false; end
+    local player = mem:GetPlayer();
+    if (player == nil) then return false; end
+    local buffs = player:GetBuffs();
+    if (buffs == nil) then return false; end
+    for i = 0, 31 do
+        if (buffs[i] == buff_id) then return true; end
+    end
+    return false;
+end
+
+local cached_gear_th = nil;  -- nil = needs rescan
+local cached_th_cap = nil;   -- nil = needs resolve (8 for THF, 4 for others)
+
+local function scan_th_gear()
+    if (cached_gear_th ~= nil) then return cached_gear_th; end
+
+    local profile_id = get_active_profile_id();
+    if (profile_id == nil) then return 0; end
+
+    local mem = AshitaCore:GetMemoryManager();
+    if (mem == nil) then return 0; end
+    local inv = mem:GetInventory();
+    if (inv == nil) then return 0; end
+    local player = mem:GetPlayer();
+    if (player == nil) then return 0; end
+
+    -- Job trait TH
+    local main_job = player:GetMainJob();
+    local sub_job = player:GetSubJob();
+    local main_level = player:GetMainJobLevel();
+    local sub_level = player:GetSubJobLevel();
+
+    -- BLU spell-set trait check: TH+1 requires 3 specific spells to be set
+    local skip_blu = false;
+    if (main_job == BLU_JOB_ID or sub_job == BLU_JOB_ID) then
+        local is_main = (main_job == BLU_JOB_ID);
+        skip_blu = not are_blu_th_spells_set(is_main);
+    end
+
+    local trait_th = db.compute_trait_th(profile_id, main_job, sub_job, main_level, sub_level, skip_blu);
+
+    -- Gear TH (intrinsic + augmented)
+    local gear_th = 0;
+    local augmented_th = 0;
+    local item_lookup = tracker.th_items_cache or {};
+
+    local res = AshitaCore:GetResourceManager();
+
+    for slot = 0, 15 do
+        local eitem = inv:GetEquippedItem(slot);
+        if (eitem ~= nil and eitem.Index ~= 0) then
+            local container = bit.rshift(bit.band(eitem.Index, 0xFF00), 8);
+            local index = eitem.Index % 0x0100;
+            local item = inv:GetContainerItem(container, index);
+            if (item ~= nil and item.Id > 0) then
+                -- Layer 1: Intrinsic TH from profile
+                local th_entry = item_lookup[item.Id];
+                if (th_entry ~= nil) then
+                    gear_th = gear_th + th_entry.th_value;
+                end
+
+                -- Layer 2: Augmented TH (augment ID 147)
+                if (itemdata_lib ~= nil and res ~= nil) then
+                    local ritem = res:GetItemById(item.Id);
+                    if (ritem ~= nil) then
+                        local ok_aug, augments = pcall(itemdata_lib.parse_augments, item, ritem);
+                        if (ok_aug and augments ~= nil) then
+                            for _, aug in ipairs(augments) do
+                                if (aug.index == 147) then
+                                    augmented_th = augmented_th + (tonumber(aug.value) or 0) + 1;
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local total = trait_th + gear_th + augmented_th;
+
+    -- Apply TH cap based on main job (THF=8, others=4)
+    -- Server-confirmed procs (th_level) can exceed this cap; gear estimate cannot.
+    local cap = (main_job == THF_JOB_ID) and TH_CAP_THF or TH_CAP_OTHER;
+    cached_th_cap = cap;
+    if (total > 0) then
+        total = math.min(total, cap);
+    end
+
+    cached_gear_th = total;
+    return total;
+end
+
+-- Compute live TH bonus from zone-wide effects (not cached — checked per call).
+-- Currently: Treasure Hound kupower (+1 with Signet).
+-- Cheap: one boolean check + one buff scan (32 slots) when kupower is active.
+-- Gated on th_zone_effects setting.
+local function get_live_th_bonus()
+    if (not th_settings or not th_settings.th_zone_effects) then return 0; end
+    if (tracker.zone_has_treasure_hound and has_buff(SIGNET_BUFF_ID)) then
+        return 1;
+    end
+    -- TODO: Atma of Dread (Abyssea, buff 287) — needs user toggle
+    -- TODO: Prowess TH (GoV, buff 474) — +1 per level, max 3 levels; needs user toggle for tier
+    return 0;
+end
+
+-- Update TH estimate for a mob (max tracking — never decreases per mob)
+-- Short-circuits when mob already has our current gear TH (avoids redundant work per hit).
+local function update_th_estimate(mob_sid)
+    local gear = scan_th_gear();
+    local bonus = get_live_th_bonus();
+    local total = gear + bonus;
+    -- Apply cap (cached_th_cap set by scan_th_gear)
+    if (total > 0 and cached_th_cap ~= nil) then
+        total = math.min(total, cached_th_cap);
+    end
+    if (total <= 0) then return; end
+    local current = tracker.th_estimated[mob_sid] or 0;
+    if (current >= total) then return; end
+    tracker.th_estimated[mob_sid] = total;
+end
+
+-- Clear all TH-related per-mob state (zone change + reset)
+function tracker.clear_th_state()
+    tracker.th_levels = {};
+    tracker.th_actions = {};
+    tracker.th_estimated = {};
+    tracker.engaged_mobs = {};
+    tracker.th_trust_source = nil;
+    tracker.zone_has_treasure_hound = false;
+    th_source_cache = {};
+    cached_gear_th = nil;
+    cached_th_cap = nil;
+end
+
+-- Handle equipment change packet (0x0050)
+function tracker.handle_equipment_change(data)
+    if (#data < 8) then return; end
+    cached_gear_th = nil;
+    -- If engaged with any mobs, recalculate TH for all.
+    -- Max-tracking means we only need to update if new total exceeds stored estimates.
+    if (not th_settings or not th_settings.th_estimation_enabled) then return; end
+    if (next(tracker.engaged_mobs) == nil) then return; end
+    local gear = scan_th_gear();
+    local total = gear + get_live_th_bonus();
+    local cap = cached_th_cap;  -- set by scan_th_gear() above
+    if (cap ~= nil and total > cap) then total = cap; end
+    if (total <= 0) then return; end
+    for mob_sid, _ in pairs(tracker.engaged_mobs) do
+        local mob_th = math.max(tracker.th_levels[mob_sid] or 0, tracker.th_estimated[mob_sid] or 0);
+        if (mob_th < total and (cap == nil or mob_th < cap)) then
+            tracker.th_estimated[mob_sid] = total;
+        end
+    end
+end
+
+-- Public wrapper for BLU TH spell check (used by /loot bluspells debug command)
+function tracker.check_blu_th_spells(is_main)
+    return are_blu_th_spells_set(is_main);
+end
+
+-- Invalidate TH items cache (called when profile changes in UI)
+function tracker.invalidate_th_cache()
+    tracker.th_items_cache = nil;
+    tracker.th_profile_id = nil;
+    cached_profile_name = nil;
+    cached_gear_th = nil;
+    cached_th_cap = nil;
+    th_source_cache = {};
+end
+
+-------------------------------------------------------------------------------
 -- Battlefield Detection (BCNM name from chat, level cap from memory)
 -------------------------------------------------------------------------------
 
@@ -396,6 +831,11 @@ function tracker.handle_battlefield_text(msg)
     -- 1. BCNM/HTBF: "Entering the battlefield for X!"
     local bf_name = msg:match('Entering the battlefield for (.+)!');
     if (bf_name ~= nil) then
+        -- Detect HTBF ★ prefix BEFORE stripping non-ASCII bytes.
+        -- HTBF names start with ★ (U+2605, Shift-JIS 0x8599).
+        -- The gsub below strips it, so check the raw string first.
+        local has_star = (bf_name:byte(1) or 0) > 127;
+
         -- Strip non-ASCII bytes (FFXI control bytes, Shift-JIS fragments, auto-translate markers)
         bf_name = bf_name:gsub('[^ -~]', '');
         bf_name = bf_name:trim();
@@ -424,7 +864,16 @@ function tracker.handle_battlefield_text(msg)
         if (tracker.content_info == nil) then
             tracker.content_info = { type = 'BCNM' };
         end
-        -- bf_name is stored on htbf_info, not content_info
+
+        -- Fallback HTBF detection: ★ prefix in battlefield name indicates HTBF.
+        -- If 0x005C was missed (addon loaded mid-BF), use ★ as secondary signal.
+        -- Difficulty is set to 6 ("Unknown") since we can't determine it from text.
+        if (has_star and tracker.htbf_info == nil) then
+            tracker.htbf_info = {
+                difficulty = DIFFICULTY_UNKNOWN,
+                bf_name    = bf_name,
+            };
+        end
         return;
     end
 
@@ -440,6 +889,19 @@ function tracker.handle_battlefield_text(msg)
             end
         end
         return;
+    end
+
+    -- 2b. HTBF difficulty from chat: "Current difficulty level: Very difficult."
+    -- Refines the ★-detected fallback (difficulty=6 "Unknown") with the real value.
+    if (tracker.htbf_info ~= nil and tracker.htbf_info.difficulty == DIFFICULTY_UNKNOWN) then
+        local diff_text = msg:match('Current difficulty level: (.+)%.');
+        if (diff_text ~= nil) then
+            local d = chat_text_to_difficulty[diff_text];
+            if (d ~= nil) then
+                tracker.htbf_info.difficulty = d;
+            end
+            return;
+        end
     end
 
     -- WIP: Ambuscade/Omen/Sortie chat detection disabled.
@@ -500,19 +962,8 @@ function tracker.check_battlefield_reconnect()
     local player = mem:GetPlayer();
     if (player == nil) then return; end
 
-    -- Check for battlefield status effect (icon 254)
-    local buffs = player:GetBuffs();
-    if (buffs == nil) then return; end
-
-    local in_bcnm = false;
-    for i = 0, 31 do
-        if (buffs[i] == 254) then
-            in_bcnm = true;
-            break;
-        end
-    end
-
-    if (not in_bcnm) then return; end
+    -- Check for battlefield status effect (buff 254)
+    if (not has_buff(254)) then return; end
 
     -- Recover session from DB
     if (db ~= nil and tracker.current_zone_id > 0) then
@@ -1344,21 +1795,50 @@ local function load_zone_dat(zone_id)
 end
 
 -------------------------------------------------------------------------------
--- Voidwatch Helpers (must be defined before check_zone which calls finalize)
+-- Voidwatch / Domain Invasion Helpers
+-- (has_buff defined earlier near TH scanning; wrappers here for readability)
 -------------------------------------------------------------------------------
 
--- Check if the player currently has the Voidwatcher buff (ID 475).
--- Active during a VW cycle — wears off after Pyxis interaction completes.
-local function has_voidwatcher_buff()
+local function has_voidwatcher_buff() return has_buff(475); end  -- Active during VW cycle
+local function has_elvorseal_buff()   return has_buff(603); end  -- Active during Domain Invasion
+
+-- Domain Invasion zones (Escha Zi'Tah, Escha Ru'Aun, Reisenjima)
+local DOMAIN_INVASION_ZONES = { [288] = true, [289] = true, [291] = true };
+
+-- Check if a killer server ID belongs to any party/alliance member (or their pet).
+-- Returns true if the kill should be attributed to the player's group.
+local function party_has_sid(party, sid)
+    for i = 0, 17 do
+        if (party:GetMemberIsActive(i) == 1) then
+            if (unsigned_sid(party:GetMemberServerId(i)) == sid) then return true; end
+        end
+    end
+    return false;
+end
+
+local function is_party_or_alliance_kill(killer_sid, killer_tidx)
     local mem = AshitaCore:GetMemoryManager();
     if (mem == nil) then return false; end
-    local player = mem:GetPlayer();
-    if (player == nil) then return false; end
-    local buffs = player:GetBuffs();
-    if (buffs == nil) then return false; end
-    for i = 0, 31 do
-        if (buffs[i] == 475) then return true; end
+    local party = mem:GetParty();
+    if (party == nil) then return false; end
+
+    -- Check all 18 party/alliance slots (0 = self, 1-5 = party, 6-17 = alliance)
+    if (party_has_sid(party, killer_sid)) then return true; end
+
+    -- Check if killer is a pet of a party/alliance member
+    if (killer_tidx ~= nil and killer_tidx > 0) then
+        local entity = mem:GetEntity();
+        if (entity ~= nil) then
+            local owner_tidx = find_pet_owner(killer_tidx);
+            if (owner_tidx ~= nil) then
+                local owner_sid = unsigned_sid(entity:GetServerId(owner_tidx));
+                if (owner_sid ~= nil) then
+                    return party_has_sid(party, owner_sid);
+                end
+            end
+        end
     end
+
     return false;
 end
 
@@ -1434,8 +1914,7 @@ function tracker.check_zone()
             tracker.battlefield.pending_gil = nil;
         end
 
-        tracker.th_levels = {};
-        tracker.th_actions = {};
+        tracker.clear_th_state();
         tracker.active_pool = {};
         tracker.mob_kills = {};
         tracker.mob_kill_times = {};
@@ -1454,6 +1933,7 @@ function tracker.check_zone()
         tracker.voidwatch.pyxis_active = false;
         tracker.voidwatch.last_vw_kill = nil;
         tracker.content_info = nil;
+        cached_player_sid = nil;
     end
 
     tracker.current_zone_id = zone_id;
@@ -1600,7 +2080,9 @@ local function find_pet_owner(target_index)
         local entity = mem:GetEntity();
         if (entity == nil) then return nil; end
 
-        for i = 0, 2303 do
+        -- Only scan PC range (1024-1791) — only player characters own combat pets.
+        -- NPCs (0-1023) and trusts/pets (1792-2303) don't own other pets.
+        for i = 1024, 1791 do
             if (i ~= target_index) then
                 local flags = entity:GetSpawnFlags(i);
                 if (flags ~= nil and bit.band(flags, 0x0010) ~= 0) then
@@ -1821,6 +2303,25 @@ function tracker.handle_defeat(data)
 
     if (message_id ~= 6) then return; end
 
+    -- Filter out non-mob entities: PCs (1024-1791) and trusts/pets (1792-2303).
+    -- Only NPC/mob entities (0-1023) should be recorded as kills.
+    if (mob_tidx >= 1024) then return; end
+
+    -- 3-tier kill attribution filter (short-circuit, cheapest first):
+    -- Tier 1: Player personally attacked this mob (hash lookup, O(1)).
+    -- Tier 2: Party/alliance member (or their pet) landed the killing blow.
+    -- Tier 3: Domain Invasion bypass — elvorseal buff active in an Escha zone.
+    local dominated = tracker.engaged_mobs[mob_sid];
+    if (not dominated) then
+        local party_kill = is_party_or_alliance_kill(killer_id, killer_tidx);
+        if (not party_kill) then
+            local in_escha = DOMAIN_INVASION_ZONES[tracker.current_zone_id];
+            if (not in_escha or not has_elvorseal_buff()) then
+                return;
+            end
+        end
+    end
+
     -- Server ID reuse: FFXI recycles mob server IDs from a fixed pool per zone.
     -- When a mob respawns and gets the same ID as a previously killed mob, clear
     -- stale state so the new kill is recorded correctly.
@@ -1845,12 +2346,14 @@ function tracker.handle_defeat(data)
                     local kn = get_entity_name(killer_tidx);
                     if (kn ~= 'Unknown') then killer_name = kn; end
                 end
-                db.patch_kill_on_defeat(
-                    existing_kill, killer_id, killer_name,
-                    th_level,
-                    th_action and th_action.cmd_no or 0,
-                    th_action and th_action.cmd_arg or 0
-                );
+                db.patch_kill_on_defeat(existing_kill, {
+                    killer_id      = killer_id,
+                    killer_name    = killer_name,
+                    th_level       = th_level,
+                    th_action_type = th_action and th_action.cmd_no or 0,
+                    th_action_id   = th_action and th_action.cmd_arg or 0,
+                    th_estimated   = tracker.th_estimated[mob_sid] or 0,
+                });
                 tracker.mob_gil_queue[#tracker.mob_gil_queue + 1] = {
                     kill_id  = existing_kill,
                     time     = os.clock(),
@@ -1866,6 +2369,8 @@ function tracker.handle_defeat(data)
         tracker.pet_to_master[mob_sid] = nil;
         tracker.th_levels[mob_sid] = nil;
         tracker.th_actions[mob_sid] = nil;
+        tracker.th_estimated[mob_sid] = nil;
+        tracker.engaged_mobs[mob_sid] = nil;
     end
 
     -- Pet detection: if this defeated entity is a pet of another mob,
@@ -1904,11 +2409,14 @@ function tracker.handle_defeat(data)
 
     local vana_info = capture_vana_info();
 
-    -- Determine content type: Voidwatcher buff (475) = VW kill, else use
-    -- the normal content_info (BCNM/HTBF/Dynamis from 0x0075 packet).
+    -- Determine content type: Voidwatcher buff (475) = VW kill,
+    -- Elvorseal buff (603) in Escha zone = Domain Invasion,
+    -- else use the normal content_info (BCNM/HTBF/Dynamis from 0x0075 packet).
     local ct = tracker.get_content_type();
     if (ct == '' and has_voidwatcher_buff()) then
         ct = 'Voidwatch';
+    elseif (ct == '' and DOMAIN_INVASION_ZONES[tracker.current_zone_id] and has_elvorseal_buff()) then
+        ct = 'Domain Invasion';
     end
 
     local ki = {
@@ -1919,6 +2427,7 @@ function tracker.handle_defeat(data)
         bf_name        = tracker.htbf_info and tracker.htbf_info.bf_name or nil,
         bf_difficulty  = tracker.htbf_info and tracker.htbf_info.difficulty or 0,
         content_type   = ct,
+        th_estimated   = tracker.th_estimated[mob_sid] or 0,
     };
 
     -- Tag mob kills inside an active battlefield so the UI can show [BCNM]/[HTBF]
@@ -1940,6 +2449,9 @@ function tracker.handle_defeat(data)
     tracker.mob_kills[mob_sid] = kill_id;
     tracker.mob_kill_times[mob_sid] = os.clock();
     tracker.drop_sequence[mob_sid] = 0;
+
+    -- Clean up engagement tracking for defeated mob
+    tracker.engaged_mobs[mob_sid] = nil;
 
     -- Track VW kill directly so handle_event_begin doesn't need to scan
     if (ct == 'Voidwatch') then
@@ -2405,6 +2917,30 @@ function tracker.handle_action(data)
     local _cmd_arg   = reader:read(32);
     local _info      = reader:read(32);
 
+    -- Normalize actor_id to unsigned for comparison
+    actor_id = unsigned_sid(actor_id);
+
+    -- Check if this is the local player's offensive action.
+    -- Used for both kill attribution (engaged_mobs) and TH gear estimation.
+    local is_self_offensive = false;
+    if (_cmd_no >= 1 and _cmd_no <= 6) then
+        -- Lazy-init cached player SID
+        if (cached_player_sid == nil) then
+            local mem = AshitaCore:GetMemoryManager();
+            if (mem ~= nil) then
+                local entity = mem:GetEntity();
+                local party = mem:GetParty();
+                if (entity ~= nil and party ~= nil) then
+                    local my_sid = unsigned_sid(entity:GetServerId(party:GetMemberTargetIndex(0)));
+                    if (my_sid ~= nil and my_sid ~= 0) then
+                        cached_player_sid = my_sid;
+                    end
+                end
+            end
+        end
+        is_self_offensive = (cached_player_sid ~= nil and actor_id == cached_player_sid);
+    end
+
     for _t = 0, trg_sum - 1 do
         local target_id  = reader:read(32);
 
@@ -2413,9 +2949,7 @@ function tracker.handle_action(data)
         -- handle_defeat/handle_treasure_pool for consistent table lookups.
         -- Note: bit.band(x, 0xFFFFFFFF) is a no-op in LuaJIT (still signed).
         -- Adding 2^32 promotes to double with the correct unsigned value.
-        if (target_id < 0) then
-            target_id = target_id + 4294967296;
-        end
+        target_id = unsigned_sid(target_id);
 
         local result_sum = reader:read(4);
 
@@ -2450,6 +2984,36 @@ function tracker.handle_action(data)
                 reader:read(4);   -- react_info
                 reader:read(14);  -- react_value
                 reader:read(10);  -- react_message
+            end
+        end
+
+        -- Kill attribution: always track engaged mobs (Tier 1 of kill filter).
+        if (is_self_offensive) then
+            tracker.engaged_mobs[target_id] = true;
+        end
+
+        -- TH estimation: skip entirely if mob already at TH cap for our job.
+        -- Once at cap, no gear scan, no trust check — nothing can improve it.
+        local mob_th = math.max(tracker.th_levels[target_id] or 0, tracker.th_estimated[target_id] or 0);
+        if (cached_th_cap ~= nil and mob_th >= cached_th_cap) then
+            -- Mob is at cap — no TH work needed.
+        elseif (is_self_offensive) then
+            -- Gear estimation: only when enabled and server TH hasn't already matched gear.
+            if (th_settings ~= nil and th_settings.th_estimation_enabled) then
+                local server_th = tracker.th_levels[target_id];
+                if (server_th == nil or cached_gear_th == nil or server_th < cached_gear_th) then
+                    update_th_estimate(target_id);
+                end
+            end
+        -- Trust/Pet TH: only check if mob doesn't already have trust TH applied.
+        -- Trusts contribute +1 max, so once set there's nothing more to gain.
+        elseif (_cmd_no >= 1 and _cmd_no <= 6 and th_settings ~= nil and th_settings.th_trust_detection) then
+            if ((tracker.th_estimated[target_id] or 0) < 1) then
+                local source_name = resolve_th_source(actor_id);
+                if (source_name) then
+                    tracker.th_estimated[target_id] = 1;
+                    tracker.th_trust_source = source_name;
+                end
             end
         end
     end
@@ -2697,8 +3261,7 @@ end
 -------------------------------------------------------------------------------
 
 function tracker.reset()
-    tracker.th_levels = {};
-    tracker.th_actions = {};
+    tracker.clear_th_state();
     tracker.active_pool = {};
     tracker.mob_kills = {};
     tracker.mob_kill_times = {};

@@ -1,5 +1,39 @@
 # LootScope Changelog
 
+## v1.3.0
+
+### Added
+
+- **TH Gear Estimation (Beta)**: Gear-based Treasure Hunter estimation for jobs and servers where server-confirmed TH messages (msg 603) don't fire. Produces `th_estimated` stored alongside the existing `th_level`. Combined display shows the higher of the two values.
+  - **Gear Scanning**: Continuously scans equipped TH gear during combat. Two-layer detection: intrinsic TH from profile gear list + augmented TH parsed from item augment data (augment ID 147). Scans on every offensive action (cached until gear swap via 0x0050). Supports mid-fight gear swaps (LuAshitacast/Ashitacast) with max-tracking per mob.
+  - **Job Trait Profiles**: Shared `th_items.db` with profile system. Pre-populated "Retail" profile with 25 TH gear items and THF/BLU job traits. Profiles support custom private server TH configurations. Job traits have enable/disable checkboxes for toggling without deletion.
+  - **Management Window**: Full CRUD UI for TH profiles, gear items, and job traits. Profile selector with New/Clone/Delete. Searchable item table with auto-fill from game data. Add Trait popup with job/role/level/value fields. Comprehensive tooltips throughout.
+  - **THF Trust/Pet TH+1 Detection**: Scans party trusts and BST jug pets for THF (main or sub) job. Adds TH+1 minimum when detected. Checked once per mob per trust.
+  - **Treasure Hound Kupower Detection**: Detects zone-in chat message for TH+1 kupower. Cached per-zone, checked live against Signet buff (ID 253).
+  - **BLU Spell-Set TH Trait**: Reads BLU set spells from memory to detect TH+1 trait (requires Charged Whisker + Everyone's Grudge + Amorphic Spikes). Debug command `/loot bluspells` to verify.
+  - **Display**: Combined TH in live feed and tables shows `math.max(th_level, th_estimated)`. Asterisk (*) suffix indicates estimated (no server confirmation). Both columns in CSV/JSON export.
+- **Domain Invasion Tracking**: Kills during Domain Invasion (Elvorseal buff ID 603) tagged as `content_type='Domain Invasion'`. Dedicated statistics category and export filter (sf=11).
+- **HTBF Fallback Detection**: Three-layer HTBF detection: (1) 0x005C packet (primary), (2) star prefix in "Entering the battlefield" chat text (fallback for addon reload), (3) "Current difficulty level" chat text (refines fallback difficulty).
+
+### Fixed
+- **False Kill Recording (Trusts, PCs, Unrelated Mobs)**: Previously `handle_defeat` recorded ANY mob defeat the client witnessed, including other players' kills, trust despawns, and PC deaths. Replaced with a 3-tier kill attribution filter:
+  - **Tier 1**: Player personally attacked this mob (`engaged_mobs` hash lookup, O(1)).
+  - **Tier 2**: Party/alliance member (or their pet) landed the killing blow. New `is_party_or_alliance_kill()` checks all 18 party/alliance slots + resolves pet owners via `find_pet_owner()`.
+  - **Tier 3**: Domain Invasion bypass (Elvorseal buff active in an Escha zone).
+  - Kills that don't match any tier are silently discarded. Entity index range guard (>= 1024) also rejects trusts and PCs before the attribution check runs.
+- **`engaged_mobs` Decoupled from TH**: Mob engagement tracking was gated behind TH estimation settings. Now always active so kill attribution works regardless of TH configuration.
+- **Pet Owner Scan Too Broad**: `find_pet_owner` scanned all 2304 entity slots including NPCs and trusts. Narrowed to PC range (1024-1791) since only player characters own combat pets.
+- **Chat Encoding**: Replaced UTF-8 em dashes in chat output with ASCII hyphens. FFXI chat uses Shift-JIS; multi-byte UTF-8 displayed as garbage characters. Fixed across lootscope, playernotes, zonelines, and mobhud addons.
+- **Domain Invasion Missing in Analysis**: `analysis.lua` content_type_map and is_content check were not updated for sf=11. Domain Invasion data would not route correctly through analysis functions.
+- **TH Slot Combo Init Order**: `TH_SLOT_COMBO` was built at module load time before `db.SLOT_NAMES` was available. Changed to lazy initialization on first use.
+- **Profile Clone Partial Failure**: `clone_th_profile` could leave a half-cloned profile if the trait copy step failed. Added `BEGIN`/`COMMIT`/`ROLLBACK` transaction wrapping.
+
+### Changed
+- **Content Type Map Consolidated**: Hoisted `content_type_map` to module-level `db.CONTENT_TYPE_MAP` constant. `get_all_mob_stats` elseif chain replaced with single lookup. `analysis.lua` uses matching local copy with sync note. Adding new content types now requires updating one table instead of 5+ locations.
+- **Party SID Helper Extracted**: Duplicated 18-slot party/alliance SID comparison loop unified into `party_has_sid()` helper.
+- **Unsigned SID Helper Consolidated**: Moved `unsigned_sid()` to top of tracker.lua, replaced 5 inline `+ 4294967296` patterns.
+- **Inline Buff Check Consolidated**: `check_battlefield_reconnect` replaced 12-line inline buff scan with `has_buff(254)`.
+
 ## v1.2.1
 
 ### Added

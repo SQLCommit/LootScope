@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.2.1 - SQLite3 Persistence Layer
+    LootScope v1.3.0 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -21,6 +21,9 @@ local os_time = os.time;
 local db = {};
 db.conn = nil;
 db.path = nil;
+
+-- Source filter → content type name mapping (shared across db.lua and analysis.lua)
+db.CONTENT_TYPE_MAP = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion' };
 db.char_name = nil;  -- character this DB belongs to
 db._init_failed = false;  -- true if DB open failed (one-shot warning, skip all writes)
 
@@ -205,6 +208,10 @@ function db.init(base_path, char_folder)
 
         if (not kills_has.content_type) then
             db.conn:exec("ALTER TABLE kills ADD COLUMN content_type TEXT DEFAULT '';");
+        end
+
+        if (not kills_has.th_estimated) then
+            db.conn:exec('ALTER TABLE kills ADD COLUMN th_estimated INTEGER DEFAULT 0;');
         end
 
         -- Migration: check existing drops columns in a single pass
@@ -483,8 +490,8 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
                            vana_weekday, vana_hour, moon_phase, moon_percent, timestamp,
                            killer_id, killer_name, th_action_type, th_action_id, weather,
                            battlefield, level_cap, is_distant,
-                           bf_name, bf_difficulty, content_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           bf_name, bf_difficulty, content_type, th_estimated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ]]);
     if (stmt == nil) then maybe_commit(); return nil; end
     stmt:bind_values(
@@ -499,7 +506,8 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
         ki.battlefield, ki.level_cap,
         ki.is_distant or 0,
         ki.bf_name or '', ki.bf_difficulty or 0,
-        ki.content_type or ''
+        ki.content_type or '',
+        ki.th_estimated or 0
     );
     local rc = stmt:step();
     stmt:finalize();
@@ -515,7 +523,7 @@ end
 
 -- Patch a kill record when 0x0029 defeat arrives after 0x00D2 fallback created it.
 -- Clears is_distant flag and adds killer/TH metadata that the fallback path lacks.
-function db.patch_kill_on_defeat(kill_id, killer_id, killer_name, th_level, th_action_type, th_action_id)
+function db.patch_kill_on_defeat(kill_id, info)
     if (db.conn == nil or kill_id == nil) then return; end
 
     begin_batch();
@@ -523,13 +531,15 @@ function db.patch_kill_on_defeat(kill_id, killer_id, killer_name, th_level, th_a
     local stmt = db.conn:prepare([[
         UPDATE kills SET is_distant = 0,
             killer_id = ?, killer_name = ?,
-            th_level = ?, th_action_type = ?, th_action_id = ?
+            th_level = ?, th_action_type = ?, th_action_id = ?,
+            th_estimated = ?
         WHERE id = ? AND is_distant = 1
     ]]);
     if (stmt == nil) then maybe_commit(); return; end
     stmt:bind_values(
-        killer_id or 0, killer_name or '',
-        th_level or 0, th_action_type or 0, th_action_id or 0,
+        info.killer_id or 0, info.killer_name or '',
+        info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
+        info.th_estimated or 0,
         kill_id
     );
     stmt:step();
@@ -750,7 +760,8 @@ function db.get_recent_feed(limit)
                0 as container_type, 0 as chest_result, 0 as gil_amount,
                k.bf_name, k.bf_difficulty,
                COALESCE(k.battlefield, '') as battlefield,
-               COALESCE(k.content_type, '') as content_type
+               COALESCE(k.content_type, '') as content_type,
+               COALESCE(k.th_estimated, 0) as th_estimated
         FROM drops d
         JOIN kills k ON d.kill_id = k.id
         UNION ALL
@@ -764,7 +775,8 @@ function db.get_recent_feed(limit)
                0, 0, 0,
                k.bf_name, k.bf_difficulty,
                COALESCE(k.battlefield, '') as battlefield,
-               COALESCE(k.content_type, '') as content_type
+               COALESCE(k.content_type, '') as content_type,
+               COALESCE(k.th_estimated, 0) as th_estimated
         FROM kills k
         WHERE NOT EXISTS (SELECT 1 FROM drops d WHERE d.kill_id = k.id)
         UNION ALL
@@ -777,7 +789,8 @@ function db.get_recent_feed(limit)
                ce.container_type, ce.result, ce.gil_amount,
                '' as bf_name, 0 as bf_difficulty,
                '' as battlefield,
-               '' as content_type
+               '' as content_type,
+               0 as th_estimated
         FROM chest_events ce
         ORDER BY ts DESC, kill_id DESC
         LIMIT ?
@@ -809,11 +822,9 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     -- BCNM mode: match by battlefield name instead of mob_name
     local is_bcnm = (source_filter == 2);
     local is_htbf = (source_filter == 3);
-    local is_content = (source_filter ~= nil and source_filter >= 4 and source_filter <= 7)
-                       or (source_filter == 10);
+    local is_content = (db.CONTENT_TYPE_MAP[source_filter] ~= nil);
     local is_all_bf = (source_filter == 8);
     local is_all_inst = (source_filter == 9);
-    local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch' };
     local kill_query, item_query;
 
     if (is_htbf) then
@@ -855,7 +866,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
         end
         item_query = item_query .. ' GROUP BY d.item_id ORDER BY times_dropped DESC';
     elseif (is_content) then
-        local ct = content_type_map[source_filter];
+        local ct = db.CONTENT_TYPE_MAP[source_filter];
         kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') = '" .. ct .. "'";
         item_query = [[
             SELECT d.item_id, d.item_name,
@@ -1028,7 +1039,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                     gil_params = { mob_name, zone_id };
                 end
             elseif (is_content) then
-                local ct = content_type_map[source_filter];
+                local ct = db.CONTENT_TYPE_MAP[source_filter];
                 gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') = '" .. ct .. "'";
                 gil_params = { mob_name, zone_id };
             elseif (is_all_bf) then
@@ -1150,20 +1161,12 @@ function db.get_all_mob_stats(source_filter)
         where_clause = ' WHERE k.source_type = 3 AND k.bf_difficulty = 0';
     elseif (source_filter == 3) then
         where_clause = ' WHERE k.bf_difficulty > 0';
-    elseif (source_filter == 4) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = 'Omen'";
-    elseif (source_filter == 5) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = 'Ambuscade'";
-    elseif (source_filter == 6) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = 'Sortie'";
-    elseif (source_filter == 7) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = 'Dynamis'";
+    elseif (db.CONTENT_TYPE_MAP[source_filter] ~= nil) then
+        where_clause = " WHERE COALESCE(k.content_type, '') = '" .. db.CONTENT_TYPE_MAP[source_filter] .. "'";
     elseif (source_filter == 8) then
         where_clause = ' WHERE (k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0';
     elseif (source_filter == 9) then
         where_clause = " WHERE COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
-    elseif (source_filter == 10) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = 'Voidwatch'";
     end
 
     -- BCNM/HTBF view: group by battlefield name; gil excluded from drop counts
@@ -1796,7 +1799,7 @@ local function build_chest_event_union(filters)
         .. ' ce.vana_weekday, ce.vana_hour, ce.moon_phase, ce.moon_percent,'
         .. " 0 AS killer_id, '' AS killer_name, 0 AS th_action_type, 0 AS th_action_id, ce.weather,"
         .. " '' AS bf_name, 0 AS bf_difficulty, '' AS content_type,"
-        .. ' 0 AS is_distant, NULL AS level_cap,'
+        .. ' 0 AS is_distant, NULL AS level_cap, 0 AS th_estimated,'
         .. " CASE ce.result"
         .. " WHEN 0 THEN 'Gil'"
         .. " WHEN 1 THEN 'Lockpick Failed'"
@@ -1835,6 +1838,7 @@ function db.get_filtered_export(filters, limit)
         .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
         .. " COALESCE(k.content_type, '') AS content_type,"
         .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
+        .. ' COALESCE(k.th_estimated, 0) AS th_estimated,'
         .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
         .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
         .. ' d.timestamp AS drop_timestamp'
@@ -2168,6 +2172,7 @@ function db.stream_export_all(write_row)
                COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,
                COALESCE(k.content_type, '') AS content_type,
                COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,
+               COALESCE(k.th_estimated, 0) AS th_estimated,
                d.item_name, d.item_id, d.pool_slot, d.quantity,
                d.won, d.lot_value, d.timestamp AS d_timestamp,
                d.winner_id, d.winner_name, d.player_lot, d.player_action
@@ -2211,6 +2216,7 @@ function db.stream_export_all(write_row)
                 content_type    = row.content_type,
                 is_distant      = row.is_distant,
                 level_cap       = row.level_cap,
+                th_estimated    = row.th_estimated,
             };
         end
 
@@ -2252,6 +2258,7 @@ function db.stream_filtered_export(filters, write_row)
         .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
         .. " COALESCE(k.content_type, '') AS content_type,"
         .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
+        .. ' COALESCE(k.th_estimated, 0) AS th_estimated,'
         .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
         .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
         .. ' d.timestamp AS drop_timestamp'
@@ -2284,6 +2291,462 @@ function db.stream_filtered_export(filters, write_row)
 end
 
 -------------------------------------------------------------------------------
+-- TH Items Database (shared, addon-local)
+-------------------------------------------------------------------------------
+
+db.th_conn = nil;       -- separate connection for th_items.db
+db.th_path = nil;
+db._th_init_failed = false;
+
+-- Equipment slot names for display
+db.SLOT_NAMES = {
+    [0] = 'Main', [1] = 'Sub', [2] = 'Range', [3] = 'Ammo',
+    [4] = 'Head', [5] = 'Body', [6] = 'Hands', [7] = 'Legs',
+    [8] = 'Feet', [9] = 'Neck', [10] = 'Waist',
+    [11] = 'Ear1', [12] = 'Ear2', [13] = 'Ring1', [14] = 'Ring2',
+    [15] = 'Back',
+};
+
+-- Retail TH gear seed data: { item_id, item_name, th_value, slot_id, notes }
+-- Source: https://www.bg-wiki.com/ffxi/Treasure_Hunter (verified 2026-03-07)
+-- Items with th_value=0 are augmentable — TH comes from augment, not intrinsic.
+-- Auto-detection reads augments from equipped gear at scan time.
+local RETAIL_TH_ITEMS = {
+    -- Daggers (Main hand, slot 0)
+    { 16480, 'Thief\'s Knife',         1,  0, '' },           -- THF
+    { 20618, 'Sandung',                1,  0, '' },           -- THF JSE
+    { 21573, 'Assassin\'s Knife',      1,  0, '' },           -- THF
+    { 21574, 'Plun. Knife',            2,  0, '' },           -- THF
+    { 21575, 'Gandring',               3,  0, '' },           -- THF
+    -- Ammo (slot 3)
+    { 22299, 'Per. Lucky Egg',         1,  3, '' },           -- All Jobs
+    -- Head (slot 4)
+    { 23713, 'Volte Cap',              1,  4, '' },           -- All Jobs
+    { 25679, 'Wh. Rarab Cap +1',       1,  4, '' },           -- All Jobs
+    -- Body (slot 5)
+    { 23717, 'Volte Jupon',            2,  5, '' },           -- All Jobs
+    -- Hands (slot 6)
+    { 15107, 'Asn. Armlets',           1,  6, '' },           -- THF
+    { 14914, 'Asn. Armlets +1',        1,  6, '' },           -- THF
+    { 10695, 'Asn. Armlets +2',        2,  6, '' },           -- THF
+    { 26986, 'Plun. Armlets',          2,  6, '' },           -- THF
+    { 26987, 'Plun. Armlets +1',       3,  6, '' },           -- THF
+    { 23202, 'Plun. Armlets +2',       3,  6, '' },           -- THF
+    { 23537, 'Plun. Armlets +3',       4,  6, '' },           -- THF
+    { 23721, 'Volte Bracers',          1,  6, '' },           -- All Jobs
+    -- Legs (slot 7)
+    { 23725, 'Volte Hose',             1,  7, '' },           -- All Jobs
+    -- Feet (slot 8)
+    { 11149, 'Raid. Poulaines +2',     1,  8, '' },           -- THF
+    { 27421, 'Skulk. Poulaines',       2,  8, '' },           -- THF
+    { 27422, 'Skulk. Poulaines +1',    3,  8, '' },           -- THF
+    { 23358, 'Skulk. Poulaines +2',    4,  8, '' },           -- THF
+    { 23693, 'Skulk. Poulaines +3',    5,  8, '' },           -- THF
+    { 23729, 'Volte Boots',            1,  8, '' },           -- All Jobs
+    -- Waist (slot 10)
+    { 28450, 'Chaac Belt',             1, 10, '' },           -- All Jobs
+    -- Ring (slot 13)
+    { 27585, 'Gorney Ring',            1, 13, '' },           -- All Jobs
+    { 26197, 'Gorney Ring +1',         1, 13, '' },           -- All Jobs
+    { 26236, 'Hoxne Ring',             2, 13, '' },           -- All Jobs
+    -- Augmentable gear (th_value=0, TH from augment auto-detected at scan time)
+    -- Set TH value manually if auto-detection doesn't work on your server.
+    -- Herculean (Oseem augments via Dark Matter / Stones)
+    { 25642, 'Herculean Helm',         0,  4, 'Augmentable (Oseem)' },
+    { 25718, 'Herculean Vest',         0,  5, 'Augmentable (Oseem)' },
+    { 27140, 'Herculean Gloves',       0,  6, 'Augmentable (Oseem)' },
+    { 25842, 'Herculean Trousers',     0,  7, 'Augmentable (Oseem)' },
+    { 27496, 'Herculean Boots',        0,  8, 'Augmentable (Oseem)' },
+    -- Other augmentable
+    { 20596, 'Taming Sari',            0,  0, 'Augmentable (Sinister Reign)' },  -- THF/BRD/DNC
+    { 13212, 'Tarutaru Sash',          0, 10, 'Augmentable (Abyssea)' },
+};
+
+-- Retail TH job trait seed data: { job_id, is_main, min_level, th_value }
+-- Source: https://www.bg-wiki.com/ffxi/Treasure_Hunter
+-- THF (6): innate job trait at 15/45/90
+-- BLU (16): spell-set trait (Charged Whisker + Evryone. Grudge + Amorphic Spikes)
+--           requires Lv98+ to learn Amorphic Spikes, main only (sub can't set enough)
+local RETAIL_TH_TRAITS = {
+    { 6, 1, 15, 1 },   -- THF main Lv15: TH+1
+    { 6, 1, 45, 2 },   -- THF main Lv45: TH+2
+    { 6, 1, 90, 3 },   -- THF main Lv90: TH+3
+    { 6, 0, 15, 1 },   -- THF sub Lv15: TH+1
+    { 6, 0, 45, 2 },   -- THF sub Lv45: TH+2
+    { 16, 1, 98, 1 },  -- BLU main Lv98: TH+1 (spell-set trait)
+};
+
+function db.init_th_items(addon_path)
+    if (db.th_conn ~= nil) then return true; end
+    if (db._th_init_failed) then return false; end
+
+    -- Store in data/ subfolder to keep shm/wal files out of the addon root
+    local th_dir = addon_path .. '\\data';
+    ashita.fs.create_directory(th_dir);
+    db.th_path = th_dir .. '\\th_items.db';
+
+    -- Migration: move legacy th_items.db from addon root to data/ subfolder
+    local legacy_path = addon_path .. '\\th_items.db';
+    local legacy_file = io.open(legacy_path, 'rb');
+    if (legacy_file ~= nil) then
+        legacy_file:close();
+        -- Only migrate if new path doesn't already exist
+        local new_file = io.open(db.th_path, 'rb');
+        if (new_file == nil) then
+            os.rename(legacy_path, db.th_path);
+            -- Also move shm/wal if present
+            os.rename(legacy_path .. '-shm', db.th_path .. '-shm');
+            os.rename(legacy_path .. '-wal', db.th_path .. '-wal');
+        else
+            new_file:close();
+            -- Both exist — remove legacy (new location takes priority)
+            os.remove(legacy_path);
+            os.remove(legacy_path .. '-shm');
+            os.remove(legacy_path .. '-wal');
+        end
+    end
+
+    local open_ok, open_err = pcall(function()
+        db.th_conn = sqlite3.open(db.th_path);
+    end);
+    if (not open_ok or db.th_conn == nil) then
+        db._th_init_failed = true;
+        return false;
+    end
+
+    local schema_ok, schema_err = pcall(function()
+        db.th_conn:exec('PRAGMA journal_mode=WAL;');
+        db.th_conn:exec('PRAGMA foreign_keys=ON;');
+        db.th_conn:exec('PRAGMA busy_timeout=3000;');
+
+        db.th_conn:exec([[
+            CREATE TABLE IF NOT EXISTS th_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS th_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                th_value INTEGER NOT NULL DEFAULT 1,
+                slot_id INTEGER NOT NULL DEFAULT -1,
+                notes TEXT DEFAULT '',
+                FOREIGN KEY (profile_id) REFERENCES th_profiles(id) ON DELETE CASCADE,
+                UNIQUE(profile_id, item_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS th_job_traits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL DEFAULT 6,
+                is_main INTEGER NOT NULL DEFAULT 1,
+                min_level INTEGER NOT NULL,
+                th_value INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (profile_id) REFERENCES th_profiles(id) ON DELETE CASCADE,
+                UNIQUE(profile_id, job_id, is_main, min_level)
+            );
+        ]]);
+
+        -- Migration: add enabled column to th_job_traits if missing (pre-existing DBs)
+        local has_enabled = false;
+        for row in db.th_conn:nrows("PRAGMA table_info(th_job_traits)") do
+            if (row.name == 'enabled') then has_enabled = true; break; end
+        end
+        if (not has_enabled) then
+            db.th_conn:exec('ALTER TABLE th_job_traits ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;');
+        end
+
+        -- Seed Retail profile if no profiles exist
+        local count = 0;
+        for row in db.th_conn:nrows('SELECT COUNT(*) as c FROM th_profiles') do
+            count = row.c;
+        end
+        if (count == 0) then
+            db.th_conn:exec("INSERT INTO th_profiles (name, created_at) VALUES ('Retail', " .. tostring(os_time()) .. ");");
+            local profile_id = db.th_conn:last_insert_rowid();
+
+            local item_stmt = db.th_conn:prepare(
+                'INSERT INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes) VALUES (?, ?, ?, ?, ?, ?)'
+            );
+            for _, item in ipairs(RETAIL_TH_ITEMS) do
+                item_stmt:bind_values(profile_id, item[1], item[2], item[3], item[4], item[5] or '');
+                item_stmt:step();
+                item_stmt:reset();
+            end
+            item_stmt:finalize();
+
+            local trait_stmt = db.th_conn:prepare(
+                'INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value) VALUES (?, ?, ?, ?, ?)'
+            );
+            for _, trait in ipairs(RETAIL_TH_TRAITS) do
+                trait_stmt:bind_values(profile_id, trait[1], trait[2], trait[3], trait[4]);
+                trait_stmt:step();
+                trait_stmt:reset();
+            end
+            trait_stmt:finalize();
+        end
+    end);
+
+    if (not schema_ok) then
+        db._th_init_failed = true;
+        pcall(function() db.th_conn:close(); end);
+        db.th_conn = nil;
+        return false;
+    end
+
+    return true;
+end
+
+-------------------------------------------------------------------------------
+-- TH Items: Profile CRUD
+-------------------------------------------------------------------------------
+
+function db.get_th_profiles()
+    if (db.th_conn == nil) then return {}; end
+    local results = {};
+    for row in db.th_conn:nrows('SELECT id, name, created_at FROM th_profiles ORDER BY id ASC') do
+        results[#results + 1] = row;
+    end
+    return results;
+end
+
+function db.get_th_profile_by_name(name)
+    if (db.th_conn == nil or name == nil) then return nil; end
+    local stmt = db.th_conn:prepare('SELECT id, name, created_at FROM th_profiles WHERE name = ?');
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(name);
+    local result = nil;
+    for row in stmt:nrows() do result = row; end
+    stmt:finalize();
+    return result;
+end
+
+function db.create_th_profile(name)
+    if (db.th_conn == nil or name == nil or name == '') then return nil; end
+    local stmt = db.th_conn:prepare('INSERT INTO th_profiles (name, created_at) VALUES (?, ?)');
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(name, os_time());
+    local rc = stmt:step();
+    stmt:finalize();
+    if (rc ~= sqlite3.DONE) then return nil; end
+    return db.th_conn:last_insert_rowid();
+end
+
+function db.clone_th_profile(source_id, new_name)
+    if (db.th_conn == nil) then return nil; end
+
+    db.th_conn:exec('BEGIN TRANSACTION');
+
+    local new_id = db.create_th_profile(new_name);
+    if (new_id == nil) then
+        db.th_conn:exec('ROLLBACK');
+        return nil;
+    end
+
+    -- Clone items
+    local stmt = db.th_conn:prepare([[
+        INSERT INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
+        SELECT ?, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ?
+    ]]);
+    if (stmt ~= nil) then
+        stmt:bind_values(new_id, source_id);
+        local rc = stmt:step();
+        stmt:finalize();
+        if (rc ~= sqlite3.DONE) then
+            db.th_conn:exec('ROLLBACK');
+            return nil;
+        end
+    end
+
+    -- Clone traits
+    local trait_stmt = db.th_conn:prepare([[
+        INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
+        SELECT ?, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ?
+    ]]);
+    if (trait_stmt ~= nil) then
+        trait_stmt:bind_values(new_id, source_id);
+        local rc = trait_stmt:step();
+        trait_stmt:finalize();
+        if (rc ~= sqlite3.DONE) then
+            db.th_conn:exec('ROLLBACK');
+            return nil;
+        end
+    end
+
+    db.th_conn:exec('COMMIT');
+    return new_id;
+end
+
+function db.delete_th_profile(profile_id)
+    if (db.th_conn == nil) then return false; end
+    local stmt = db.th_conn:prepare('DELETE FROM th_profiles WHERE id = ?');
+    if (stmt == nil) then return false; end
+    stmt:bind_values(profile_id);
+    stmt:step();
+    stmt:finalize();
+    return db.th_conn:changes() > 0;
+end
+
+-------------------------------------------------------------------------------
+-- TH Items: Item CRUD
+-------------------------------------------------------------------------------
+
+function db.get_th_items(profile_id)
+    if (db.th_conn == nil) then return {}; end
+    local results = {};
+    local stmt = db.th_conn:prepare(
+        'SELECT id, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ? ORDER BY slot_id ASC, item_name ASC'
+    );
+    if (stmt == nil) then return results; end
+    stmt:bind_values(profile_id);
+    for row in stmt:nrows() do
+        results[#results + 1] = row;
+    end
+    stmt:finalize();
+    return results;
+end
+
+function db.get_th_items_by_item_id(profile_id)
+    if (db.th_conn == nil) then return {}; end
+    local results = {};
+    local stmt = db.th_conn:prepare(
+        'SELECT item_id, th_value, slot_id FROM th_items WHERE profile_id = ?'
+    );
+    if (stmt == nil) then return results; end
+    stmt:bind_values(profile_id);
+    for row in stmt:nrows() do
+        results[row.item_id] = row;
+    end
+    stmt:finalize();
+    return results;
+end
+
+function db.add_th_item(profile_id, item_id, item_name, th_value, slot_id, notes)
+    if (db.th_conn == nil) then return nil; end
+    local stmt = db.th_conn:prepare(
+        'INSERT OR REPLACE INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(profile_id, item_id, item_name or '', th_value or 1, slot_id or -1, notes or '');
+    local rc = stmt:step();
+    stmt:finalize();
+    if (rc ~= sqlite3.DONE) then return nil; end
+    return db.th_conn:last_insert_rowid();
+end
+
+function db.update_th_item(row_id, th_value, slot_id, notes)
+    if (db.th_conn == nil) then return false; end
+    local stmt = db.th_conn:prepare(
+        'UPDATE th_items SET th_value = ?, slot_id = ?, notes = ? WHERE id = ?'
+    );
+    if (stmt == nil) then return false; end
+    stmt:bind_values(th_value or 1, slot_id or -1, notes or '', row_id);
+    stmt:step();
+    stmt:finalize();
+    return db.th_conn:changes() > 0;
+end
+
+function db.delete_th_item(row_id)
+    if (db.th_conn == nil) then return false; end
+    local stmt = db.th_conn:prepare('DELETE FROM th_items WHERE id = ?');
+    if (stmt == nil) then return false; end
+    stmt:bind_values(row_id);
+    stmt:step();
+    stmt:finalize();
+    return db.th_conn:changes() > 0;
+end
+
+-------------------------------------------------------------------------------
+-- TH Items: Job Trait CRUD
+-------------------------------------------------------------------------------
+
+function db.get_th_job_traits(profile_id)
+    if (db.th_conn == nil) then return {}; end
+    local results = {};
+    local stmt = db.th_conn:prepare(
+        'SELECT id, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ? ORDER BY is_main DESC, min_level ASC'
+    );
+    if (stmt == nil) then return results; end
+    stmt:bind_values(profile_id);
+    for row in stmt:nrows() do
+        results[#results + 1] = row;
+    end
+    stmt:finalize();
+    return results;
+end
+
+function db.add_th_job_trait(profile_id, job_id, is_main, min_level, th_value, enabled)
+    if (db.th_conn == nil) then return nil; end
+    local stmt = db.th_conn:prepare(
+        'INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(profile_id, job_id or 6, is_main or 1, min_level, th_value, (enabled == nil or enabled) and 1 or 0);
+    local rc = stmt:step();
+    stmt:finalize();
+    if (rc ~= sqlite3.DONE) then return nil; end
+    return db.th_conn:last_insert_rowid();
+end
+
+function db.set_th_job_trait_enabled(row_id, enabled)
+    if (db.th_conn == nil) then return false; end
+    local stmt = db.th_conn:prepare('UPDATE th_job_traits SET enabled = ? WHERE id = ?');
+    if (stmt == nil) then return false; end
+    stmt:bind_values(enabled and 1 or 0, row_id);
+    stmt:step();
+    stmt:finalize();
+    return db.th_conn:changes() > 0;
+end
+
+function db.delete_th_job_trait(row_id)
+    if (db.th_conn == nil) then return false; end
+    local stmt = db.th_conn:prepare('DELETE FROM th_job_traits WHERE id = ?');
+    if (stmt == nil) then return false; end
+    stmt:bind_values(row_id);
+    stmt:step();
+    stmt:finalize();
+    return db.th_conn:changes() > 0;
+end
+
+-------------------------------------------------------------------------------
+-- TH Items: Compute TH from traits for given job/level
+-------------------------------------------------------------------------------
+
+function db.compute_trait_th(profile_id, main_job, sub_job, main_level, sub_level, skip_blu)
+    if (db.th_conn == nil) then return 0; end
+
+    local main_th = 0;
+    local sub_th = 0;
+    local stmt = db.th_conn:prepare(
+        'SELECT job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ? ORDER BY min_level ASC'
+    );
+    if (stmt == nil) then return 0; end
+    stmt:bind_values(profile_id);
+
+    for row in stmt:nrows() do
+        -- Skip disabled traits
+        if (row.enabled == 0) then
+            -- disabled by user
+        -- BLU TH is a spell-set trait; skip if required spells are not set
+        elseif (skip_blu and row.job_id == 16) then
+            -- skip BLU trait (spells not set)
+        elseif (row.is_main == 1 and main_job == row.job_id and main_level >= row.min_level) then
+            main_th = row.th_value;  -- higher tier replaces previous
+        elseif (row.is_main == 0 and sub_job == row.job_id and sub_level >= row.min_level) then
+            sub_th = row.th_value;
+        end
+    end
+    stmt:finalize();
+
+    -- Use the higher of main or sub trait (they don't stack)
+    return math.max(main_th, sub_th);
+end
+
+-------------------------------------------------------------------------------
 -- Cleanup
 -------------------------------------------------------------------------------
 
@@ -2309,6 +2772,10 @@ function db.close()
         end
         pcall(db.conn.close, db.conn);
         db.conn = nil;
+    end
+    if (db.th_conn ~= nil) then
+        pcall(db.th_conn.close, db.th_conn);
+        db.th_conn = nil;
     end
 end
 

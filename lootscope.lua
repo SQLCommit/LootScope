@@ -1,12 +1,14 @@
 --[[
-    LootScope v1.2.1 - Loot Drop Tracker for Ashita v4
+    LootScope v1.3.0 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
 
-    v1.2.1: VW bug fixes — consecutive cycle detection, relinquish
+    v1.3.0: TH gear estimation, HTBF fallback detection, Domain Invasion,
+    TH Management UI with job trait profiles, code quality improvements.
+    v1.2.1: VW bug fixes - consecutive cycle detection, relinquish
     tracking via 0x05B EventEnd, buff-based kill tagging (ID 475),
     three-layer finalization redundancy.
     v1.2.0: Voidwatch loot tracking (Riftworn Pyxis via 0x034),
@@ -23,15 +25,17 @@
         /loot compact          - Toggle compact mode
         /loot resetui          - Reset window size and position
         /loot stats [mob]      - Print drop stats to chat
+        /loot thaugs           - Dump augment IDs from equipped gear
+        /loot bluspells        - Check BLU TH trait spell status
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.2.1
+    Version: 1.3.0
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.2.1';
+addon.version = '1.3.0';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -66,13 +70,17 @@ end
 -- Default Settings
 -------------------------------------------------------------------------------
 local default_settings = T{
-    feed_max_entries  = 100,
-    compact_mode      = false,
-    show_empty_kills  = true,
-    show_gil_drops    = true,
-    compact_bg_alpha  = 0.8,
-    compact_titlebar  = false,
-    show_on_load      = true,
+    feed_max_entries       = 100,
+    compact_mode           = false,
+    show_empty_kills       = true,
+    show_gil_drops         = true,
+    compact_bg_alpha       = 0.8,
+    compact_titlebar       = false,
+    show_on_load           = true,
+    th_profile             = 'Retail',
+    th_estimation_enabled  = true,
+    th_trust_detection     = true,
+    th_zone_effects        = true,
 };
 
 -------------------------------------------------------------------------------
@@ -107,8 +115,8 @@ local function csv_escape(val)
     return str;
 end
 
--- Shared CSV header (33 columns)
-local CSV_HEADER = 'Kill ID,Date,Time,Mob,Mob Server ID,Zone,Zone ID,Source,TH,'
+-- Shared CSV header (34 columns)
+local CSV_HEADER = 'Kill ID,Date,Time,Mob,Mob Server ID,Zone,Zone ID,Source,TH,TH Estimated,'
     .. 'Killer,Killer ID,TH Action,TH Action ID,'
     .. 'Vana Day,Vana Hour,Moon Phase,Moon %,Weather,'
     .. 'Battlefield,Difficulty,Content Type,Distant,Level Cap,'
@@ -150,6 +158,7 @@ local function export_data()
                 csv_escape(kill.mob_name), tostring(kill.mob_server_id or 0),
                 csv_escape(kill.zone_name), tostring(kill.zone_id or 0),
                 csv_escape(source), tostring(kill.th_level or 0),
+                tostring(kill.th_estimated or 0),
                 csv_escape(kill.killer_name or ''), tostring(kill.killer_id or 0),
                 csv_escape(th_act), tostring(kill.th_action_id or 0),
                 csv_escape(weekday), csv_escape(vh),
@@ -277,6 +286,7 @@ local function export_filtered_data()
                 csv_escape(row.mob_name or ''), tostring(row.mob_server_id or 0),
                 csv_escape(row.zone_name or ''), tostring(row.zone_id or 0),
                 csv_escape(source), tostring(row.th_level or 0),
+                tostring(row.th_estimated or 0),
                 csv_escape(row.killer_name or ''), tostring(row.killer_id or 0),
                 csv_escape(th_act), tostring(row.th_action_id or 0),
                 csv_escape(weekday), csv_escape(vh),
@@ -321,6 +331,8 @@ local function print_help()
         { '/loot compact',      'Toggle compact mode.' },
         { '/loot resetui',      'Reset window size and position.' },
         { '/loot stats [mob]',  'Print mob drop stats to chat.' },
+        { '/loot thaugs',       'Dump augment IDs from equipped gear (debug).' },
+        { '/loot bluspells',    'Check BLU TH trait spell status (debug).' },
         { '/loot help',         'Show this help message.' },
     };
     cmds:ieach(function (v)
@@ -400,7 +412,17 @@ ashita.events.register('load', 'lootscope_load', function()
 
     -- DB init is deferred until character name is detected (tracker.check_character)
     tracker.init(db, config_path);
+    tracker.set_settings(s);
     ui.init(db, tracker, s, analysis);
+
+    -- Init shared TH items database (addon-local, not per-character)
+    local addon_path = tostring(addon.path or '');
+    if (addon_path ~= '') then
+        local th_ok, th_err = pcall(db.init_th_items, addon_path);
+        if (not th_ok) then
+            msg_error('TH items DB failed: ' .. tostring(th_err));
+        end
+    end
 
     if (not s.show_on_load) then
         ui.hide();
@@ -436,6 +458,9 @@ ashita.events.register('text_in', 'lootscope_text_in', function(e)
 
         -- Battlefield entry detection (fires before mob name resolution check)
         tracker.handle_battlefield_text(text);
+
+        -- Kupower detection (Treasure Hound — zone-in chat message)
+        tracker.handle_kupower_text(text);
 
         -- Only parse mob name resolution when we have unresolved mob names pending
         if (#tracker.pending_mob_resolves == 0) then return; end
@@ -494,6 +519,65 @@ ashita.events.register('command', 'lootscope_command', function(e)
             mob_name = args:concat(' ', 3);
         end
         print_stats(mob_name);
+
+    elseif (cmd == 'thaugs') then
+        -- Debug: dump augment data from all equipped gear to chat
+        local ok_id, id_lib = pcall(require, 'libs/ffxi/itemdata');
+        if (not ok_id or id_lib == nil) then
+            msg_error('itemdata library not available.');
+            return;
+        end
+        local mem = AshitaCore:GetMemoryManager();
+        if (mem == nil) then return; end
+        local inv = mem:GetInventory();
+        local res = AshitaCore:GetResourceManager();
+        if (inv == nil or res == nil) then return; end
+        local slot_names = db.SLOT_NAMES;
+        print(chat.header(addon.name):append(chat.message('Equipped gear augments:')));
+        local found_any = false;
+        for slot = 0, 15 do
+            local eitem = inv:GetEquippedItem(slot);
+            if (eitem ~= nil and eitem.Index ~= 0) then
+                local container = bit.rshift(bit.band(eitem.Index, 0xFF00), 8);
+                local index = eitem.Index % 0x0100;
+                local item = inv:GetContainerItem(container, index);
+                if (item ~= nil and item.Id > 0) then
+                    local ritem = res:GetItemById(item.Id);
+                    if (ritem ~= nil) then
+                        local ok_aug, augments = pcall(id_lib.parse_augments, item, ritem);
+                        if (ok_aug and augments ~= nil and #augments > 0) then
+                            local name = (ritem.Name ~= nil and ritem.Name[1]) or tostring(item.Id);
+                            for _, aug in ipairs(augments) do
+                                found_any = true;
+                                print(chat.message(string.format(
+                                    '  [%s] %s (ID:%d) - aug index=%d value=%d',
+                                    slot_names[slot] or '?', name, item.Id, aug.index, aug.value
+                                )));
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if (not found_any) then
+            print(chat.message('  No augmented gear equipped.'));
+        end
+
+    elseif (cmd == 'bluspells') then
+        -- Debug: show currently set BLU spells and TH trait status
+        local player = AshitaCore:GetMemoryManager():GetPlayer();
+        if (player == nil) then msg_error('Player not available.'); return; end
+        local main_job = player:GetMainJob();
+        local sub_job = player:GetSubJob();
+        if (main_job ~= 16 and sub_job ~= 16) then
+            msg('Not on BLU main or sub. (Main: ' .. tostring(main_job) .. ', Sub: ' .. tostring(sub_job) .. ')');
+            return;
+        end
+        local is_main = (main_job == 16);
+        print(chat.header(addon.name):append(chat.message(
+            'BLU ' .. (is_main and 'main' or 'sub') .. ' - set spells:')));
+        local th_active = tracker.check_blu_th_spells(is_main);
+        print(chat.message('  TH trait spells set: ' .. (th_active and 'YES' or 'NO')));
 
     elseif (cmd == 'help') then
         print_help();
@@ -598,6 +682,11 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
     if (e.id == 0x0020) then
         safe_call(tracker.handle_item_full_info, e.data_modified, '0x020');
     end
+
+    -- 0x0050: Equipment Change (TH gear estimation — recalculate on gear swap)
+    if (e.id == 0x0050) then
+        safe_call(tracker.handle_equipment_change, e.data_modified, '0x050');
+    end
 end);
 
 -------------------------------------------------------------------------------
@@ -687,5 +776,6 @@ settings.register('settings', 'lootscope_settings_update', function(new_s)
     if (new_s ~= nil) then
         s = new_s;
         ui.apply_settings(s);
+        tracker.set_settings(s);
     end
 end);

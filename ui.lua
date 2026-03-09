@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.2.1 - UI Module
+    LootScope v1.3.0 - UI Module
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
@@ -22,6 +22,14 @@ local string_format = string.format;
 local os_date = os.date;
 local os_clock = os.clock;
 local tostring = tostring;
+
+-- Job abbreviation lookup (hoisted to avoid per-frame allocation)
+local JOB_ABBRS = {
+    [1]='WAR',[2]='MNK',[3]='WHM',[4]='BLM',[5]='RDM',[6]='THF',
+    [7]='PLD',[8]='DRK',[9]='BST',[10]='BRD',[11]='RNG',[12]='SAM',[13]='NIN',
+    [14]='DRG',[15]='SMN',[16]='BLU',[17]='COR',[18]='PUP',[19]='DNC',[20]='SCH',
+    [21]='GEO',[22]='RUN',
+};
 
 -------------------------------------------------------------------------------
 -- Module State
@@ -57,7 +65,7 @@ local stats_expanded_spawns = {};  -- [mob_key .. '_' .. server_id] = true if sp
 local stats_cache_data = nil;       -- cached filtered+sorted result
 local stats_cache_zone = -1;        -- zone filter when cache was built
 local stats_cache_dirty = true;     -- tracks if db.stats_dirty changed
-local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch
+local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch, 11=Domain Invasion
 local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer, 4=Voidwatch
 local stats_cache_source = -1;      -- source filter when cache was built
 local stats_name_filter = nil;       -- name filter for BCNM/Chest-Coffer (nil = all)
@@ -167,6 +175,81 @@ local an_mob_sel = { 0 };
 local set_int_buf = { 0 };        -- Settings tab: SliderInt buffer
 local set_float_buf = { 0.0 };    -- Settings tab: SliderFloat buffer
 local set_bool_buf = { false };    -- Settings tab: Checkbox buffer
+
+-- TH Advanced Management window state
+local th_adv_open = { false };
+local th_adv_profile_idx = { 0 };
+local th_adv_items_cache = nil;
+local th_adv_traits_cache = nil;
+local th_adv_profile_id = nil;
+local th_adv_dirty = true;
+local th_adv_search_buf = { '' };
+local th_adv_search_size = 64;
+-- Add item popup
+local th_add_open = false;
+local th_add_item_id = { 0 };
+local th_add_name_buf = { '' };
+local th_add_name_size = 64;
+local th_add_th_value = { 1 };
+local th_add_slot_idx = { 0 };
+local th_add_notes_buf = { '' };
+local th_add_notes_size = 64;
+local th_add_last_id = 0;  -- tracks last resolved ID for change detection
+
+-- Reusable buffer for per-trait enable/disable checkbox (avoids per-frame allocation)
+local th_trait_enabled_buf = { false };
+
+-- Add Trait popup state
+local th_add_trait_open = false;
+local th_add_trait_job_idx = { 5 };   -- default THF (index 5 in 0-based combo)
+local th_add_trait_role_idx = { 0 };  -- 0=Main, 1=Sub
+local th_add_trait_level = { 1 };
+local th_add_trait_th = { 1 };
+-- New profile popup
+local th_new_profile_buf = { '' };
+local th_new_profile_size = 64;
+local th_new_profile_open = false;
+local th_clone_mode = false;
+local th_new_profile_error = '';
+
+-- TH profiles cache (avoid per-frame DB queries)
+local th_profiles_cache = nil;
+local th_profiles_dirty = true;
+
+local function get_th_profiles_cached()
+    if (th_profiles_dirty or th_profiles_cache == nil) then
+        th_profiles_cache = db.get_th_profiles();
+        th_profiles_dirty = false;
+    end
+    return th_profiles_cache;
+end
+
+-- Render combined TH value (shared by live feed, export preview, kills detail)
+local function render_combined_th(th_srv, th_est, show_tooltip)
+    local th_combined = math_max(th_srv, th_est);
+    if (th_combined > 0) then
+        if (th_srv > 0 and th_srv >= th_est) then
+            imgui.Text(tostring(th_combined));
+        else
+            imgui.Text(tostring(th_combined) .. '*');
+        end
+    else
+        imgui.TextDisabled('-');
+    end
+    if (show_tooltip and imgui.IsItemHovered()) then
+        local tip = 'Treasure Hunter level on mob at time of kill.';
+        if (th_srv > 0 and th_est > 0) then
+            tip = tip .. '\nServer-confirmed: ' .. tostring(th_srv) .. '  |  Estimated: ' .. tostring(th_est);
+            tip = tip .. '\nEstimate = job traits + gear + augments + kupowers';
+        elseif (th_est > 0) then
+            tip = tip .. '\n* = Estimated from job traits, gear, augments, and kupowers.';
+            tip = tip .. '\nNo server TH proc (msg 603) was received for this mob.';
+        elseif (th_srv > 0) then
+            tip = tip .. '\nServer-confirmed via TH proc message.';
+        end
+        imgui.SetTooltip(tip);
+    end
+end
 
 -- Static sort key maps for sortable analysis tables (hoisted to avoid per-frame allocation)
 local ci_sort_keys = { 'item_name', 'drops', 'rate', 'ci_lower', 'ci_upper', 'ci_width', 'ci_width' };
@@ -289,10 +372,10 @@ local feed_col_defs = {
     { key = 'time',       label = 'Time',    flags = FW,      width = 45,  tip = 'Real time the drop/kill occurred' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'qty',        label = 'Qty',     flags = FW,      width = 30,  tip = 'Quantity of the item dropped' },
-    { key = 'th',         label = 'TH',      flags = FW,      width = 25,  tip = 'Treasure Hunter level active on the mob' },
+    { key = 'th',         label = 'TH',      flags = FW,      width = 25,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
     { key = 'status',     label = 'Status',  flags = FW,      width = 35,  tip = 'Won, Lost, or still in pool' },
     { key = 'lot',        label = 'Lot',     flags = FW + DH, width = 30,  tip = 'Winning lot value (0-999)' },
     { key = 'winner',     label = 'Winner',  flags = FS + DH, width = 0,   tip = 'Player who won the item' },
@@ -311,9 +394,9 @@ local compact_col_defs = {
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
     { key = 'qty',        label = 'Qty',     flags = FW + DH, width = 25,  tip = 'Quantity of the item dropped' },
-    { key = 'th',         label = 'TH',      flags = FW,      width = 22,  tip = 'Treasure Hunter level active on the mob' },
+    { key = 'th',         label = 'TH',      flags = FW,      width = 22,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
     { key = 'status',     label = 'Status',  flags = FW + DH, width = 30,  tip = 'Won, Lost, or still in pool' },
     { key = 'lot',        label = 'Lot',     flags = FW + DH, width = 25,  tip = 'Winning lot value (0-999)' },
     { key = 'winner',     label = 'Winner',  flags = FS + DH, width = 0,   tip = 'Player who won the item' },
@@ -342,8 +425,8 @@ local export_col_defs = {
     { label = 'Mob SID', flags = EP_FW+EP_DSC+EP_DH,        width = 50,  id = 3,  tip = 'Server entity ID of the defeated mob' },
     { label = 'Zone',    flags = EP_FW+EP_ASC,              width = 90,  id = 4,  tip = 'Zone where the kill happened' },
     { label = 'ZoneID',  flags = EP_FW+EP_ASC+EP_DH,        width = 38,  id = 5,  tip = 'Numeric zone ID' },
-    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, or HTBF' },
-    { label = 'TH',      flags = EP_FW+EP_DSC,              width = 25,  id = 7,  tip = 'Treasure Hunter level active on the mob' },
+    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
+    { label = 'TH',      flags = EP_FW+EP_DSC,              width = 25,  id = 7,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
     { label = 'Killer',  flags = EP_FW+EP_ASC,              width = 75,  id = 8,  tip = 'Entity that dealt the killing blow' },
     { label = 'TH Act',  flags = EP_FW+EP_ASC+EP_DH,        width = 55,  id = 9,  tip = 'Action type that last procced TH (melee, ranged, spell, etc.)' },
     { label = 'Act ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 10, tip = 'Specific ability/spell ID that procced TH' },
@@ -354,7 +437,7 @@ local export_col_defs = {
     { label = 'Weather', flags = EP_FW+EP_ASC,              width = 80,  id = 15, tip = 'Weather condition at time of kill' },
     { label = 'BF Name', flags = EP_FW+EP_ASC+EP_DH,        width = 80,  id = 16, tip = 'Battlefield name (HTBF only)' },
     { label = 'Diff',    flags = EP_FW+EP_ASC+EP_DH,        width = 30,  id = 17, tip = 'HTBF difficulty: VD, D, N, E, VE' },
-    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, Dynamis (Omen/Ambuscade/Sortie WIP)' },
+    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, HTBF, Dynamis, Voidwatch, Domain Invasion' },
     { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 19, tip = 'Item that appeared in the treasure pool' },
     { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 20, tip = 'Numeric item ID from the game database' },
     { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 21, tip = 'Quantity of the item dropped' },
@@ -741,14 +824,7 @@ local function render_live_feed()
         end
 
         imgui.TableNextColumn();
-        if (row.th_level > 0) then
-            imgui.Text(tostring(row.th_level));
-        else
-            imgui.TextDisabled('-');
-        end
-        if imgui.IsItemHovered() then
-            imgui.SetTooltip('Treasure Hunter level on mob at time of kill.');
-        end
+        render_combined_th(row.th_level or 0, row.th_estimated or 0, true);
 
         imgui.TableNextColumn();
         if (is_chest_event) then
@@ -1774,7 +1850,7 @@ local function apply_filters()
         zone_id = apply_zones[ef.zone_idx[1]].zone_id;
     end
 
-    -- Combo: 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6=Dynamis
+    -- Combo: 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6=Dynamis, 7=VW, 8=DI
     -- Filters by content_type so BF mob kills are grouped with their content.
     local source_type = nil;
     local source_type_list = nil;
@@ -1798,6 +1874,8 @@ local function apply_filters()
         content_type = 'Dynamis';
     elseif (ef.source_idx[1] == 7) then
         content_type = 'Voidwatch';
+    elseif (ef.source_idx[1] == 8) then
+        content_type = 'Domain Invasion';
     end
 
     local status = af_status_map[ef.status_idx[1]];
@@ -1987,7 +2065,7 @@ local function render_advanced_export_window()
             imgui.Text('Source:');
             imgui.SameLine(col2);
             imgui.PushItemWidth(w2);
-            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0\0') then
+            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0Domain Invasion\0\0') then
                 ef.auto_dirty = true;
             end
             imgui.PopItemWidth();
@@ -2430,11 +2508,7 @@ local function render_advanced_export_window()
                         imgui.TextColored(src_color, tracker.get_source_label(row.source_type, tonumber(row.bf_difficulty)));
 
                         imgui.TableNextColumn();
-                        if ((row.th_level or 0) > 0) then
-                            imgui.Text(tostring(row.th_level));
-                        else
-                            imgui.TextDisabled('-');
-                        end
+                        render_combined_th(row.th_level or 0, row.th_estimated or 0, false);
 
                         imgui.TableNextColumn();
                         local kname = row.killer_name or '';
@@ -3852,6 +3926,490 @@ local function render_export_tab()
 end
 
 -------------------------------------------------------------------------------
+-- TH Advanced Management Window
+-------------------------------------------------------------------------------
+
+-- Derive slot labels from db.SLOT_NAMES (0-indexed) into 1-indexed array for ImGui combo
+-- Built lazily on first use (db is nil at require time, set later in ui.init)
+local TH_SLOT_LABELS = nil;
+local TH_SLOT_COMBO = nil;
+
+local function get_th_slot_combo()
+    if (TH_SLOT_COMBO == nil and db ~= nil) then
+        TH_SLOT_LABELS = {};
+        for i = 0, 15 do TH_SLOT_LABELS[i + 1] = db.SLOT_NAMES[i] or '?'; end
+        TH_SLOT_COMBO = table.concat(TH_SLOT_LABELS, '\0') .. '\0';
+    end
+    return TH_SLOT_COMBO;
+end
+
+local function slot_id_to_combo_idx(slot_id)
+    if (slot_id == nil or slot_id < 0 or slot_id > 15) then return 0; end
+    return slot_id;
+end
+
+-- Convert IItem.Slots bitmask to first matching slot index (0-15)
+local function slots_bitmask_to_idx(slots)
+    if (slots == nil or slots == 0) then return 0; end
+    for i = 0, 15 do
+        if (bit.band(slots, bit.lshift(1, i)) ~= 0) then return i; end
+    end
+    return 0;
+end
+
+local function refresh_th_adv_data(profile_id)
+    if (profile_id == nil) then
+        th_adv_items_cache = {};
+        th_adv_traits_cache = {};
+        return;
+    end
+    th_adv_items_cache = db.get_th_items(profile_id);
+    th_adv_traits_cache = db.get_th_job_traits(profile_id);
+    th_adv_profile_id = profile_id;
+    th_adv_dirty = false;
+end
+
+local function render_th_advanced_window()
+    if (not th_adv_open[1]) then return; end
+
+    imgui.SetNextWindowSize({ 600, 500 }, ImGuiCond_FirstUseEver);
+    if (imgui.Begin('TH Management##adv', th_adv_open, ImGuiWindowFlags_None)) then
+        local profiles = get_th_profiles_cached();
+
+        -- Profile selector
+        local profile_names = {};
+        for i, p in ipairs(profiles) do
+            profile_names[i] = p.name;
+            if (p.id == th_adv_profile_id) then
+                th_adv_profile_idx[1] = i - 1;
+            end
+        end
+
+        -- Default to first profile if none selected
+        if (th_adv_profile_id == nil and #profiles > 0) then
+            th_adv_profile_idx[1] = 0;
+            refresh_th_adv_data(profiles[1].id);
+        end
+
+        local combo_str = (#profile_names > 0) and (table.concat(profile_names, '\0') .. '\0') or '\0';
+        imgui.PushItemWidth(200);
+        if imgui.Combo('Profile', th_adv_profile_idx, combo_str) then
+            local sel = profiles[th_adv_profile_idx[1] + 1];
+            if (sel ~= nil) then
+                refresh_th_adv_data(sel.id);
+            end
+        end
+        imgui.PopItemWidth();
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('TH profile defines which job traits and gear items grant TH.\nThe active profile is set in the Settings tab.\nUse different profiles for different servers (e.g., Retail vs HorizonXI).');
+        end
+
+        -- Profile actions
+        imgui.SameLine();
+        if imgui.Button('+ New') then
+            th_new_profile_open = true;
+            th_clone_mode = false;
+            th_new_profile_buf[1] = '';
+            th_new_profile_error = '';
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Create an empty profile with no traits or gear.');
+        end
+        imgui.SameLine();
+        if imgui.Button('Clone') then
+            th_new_profile_open = true;
+            th_clone_mode = true;
+            th_new_profile_buf[1] = '';
+            th_new_profile_error = '';
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Duplicate the current profile with all its traits and gear.\nUseful for creating a server-specific variant.');
+        end
+        imgui.SameLine();
+        if (#profiles > 1 and th_adv_profile_id ~= nil) then
+            -- Prevent deleting the active settings profile
+            local is_active = false;
+            if (s ~= nil and s.th_profile ~= nil) then
+                for _, p in ipairs(profiles) do
+                    if (p.id == th_adv_profile_id and p.name == s.th_profile) then
+                        is_active = true;
+                        break;
+                    end
+                end
+            end
+            if (is_active) then
+                imgui.BeginDisabled();
+                imgui.Button('Delete');
+                imgui.EndDisabled();
+                if imgui.IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) then
+                    imgui.SetTooltip('Cannot delete the active profile. Switch to a different profile first.');
+                end
+            else
+                if imgui.Button('Delete') then
+                    db.delete_th_profile(th_adv_profile_id);
+                    th_adv_profile_id = nil;
+                    th_adv_profile_idx[1] = 0;
+                    th_adv_dirty = true;
+                    th_profiles_dirty = true;
+                    if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                end
+            end
+        end
+
+        -- New/Clone profile modal
+        if (th_new_profile_open) then
+            imgui.OpenPopup('New TH Profile##modal');
+            th_new_profile_open = false;
+        end
+        if imgui.BeginPopupModal('New TH Profile##modal', nil, ImGuiWindowFlags_AlwaysAutoResize) then
+            imgui.Text(th_clone_mode and 'Clone profile as:' or 'New profile name:');
+            imgui.PushItemWidth(200);
+            imgui.InputText('##th_new_name', th_new_profile_buf, th_new_profile_size);
+            imgui.PopItemWidth();
+            if (th_new_profile_error ~= '') then
+                imgui.TextColored({1, 0.3, 0.3, 1}, th_new_profile_error);
+            end
+            if imgui.Button('Create') then
+                local name = th_new_profile_buf[1];
+                if (name == nil or name == '') then
+                    th_new_profile_error = 'Name cannot be empty.';
+                else
+                    local new_id;
+                    if (th_clone_mode and th_adv_profile_id ~= nil) then
+                        new_id = db.clone_th_profile(th_adv_profile_id, name);
+                    else
+                        new_id = db.create_th_profile(name);
+                    end
+                    if (new_id ~= nil) then
+                        refresh_th_adv_data(new_id);
+                        th_profiles_dirty = true;
+                        if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                        th_new_profile_error = '';
+                        imgui.CloseCurrentPopup();
+                    else
+                        th_new_profile_error = 'Profile "' .. name .. '" already exists.';
+                    end
+                end
+            end
+            imgui.SameLine();
+            if imgui.Button('Cancel') then
+                imgui.CloseCurrentPopup();
+            end
+            imgui.EndPopup();
+        end
+
+        if (th_adv_dirty and th_adv_profile_id ~= nil) then
+            refresh_th_adv_data(th_adv_profile_id);
+        end
+
+        imgui.Separator();
+
+        if (th_adv_profile_id ~= nil) then
+            -- Job Traits section
+            if imgui.CollapsingHeader('Job Traits', ImGuiTreeNodeFlags_DefaultOpen) then
+                -- Add Trait button (top of section)
+                if imgui.SmallButton('+ Add Trait') then
+                    th_add_trait_open = true;
+                    th_add_trait_job_idx[1] = 5;  -- THF
+                    th_add_trait_role_idx[1] = 0;  -- Main
+                    th_add_trait_level[1] = 1;
+                    th_add_trait_th[1] = 1;
+                end
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip('Add a job trait that grants TH at a certain level.\nUseful for private servers with custom TH on non-THF jobs.');
+                end
+
+                -- Add Trait modal
+                if (th_add_trait_open) then
+                    imgui.OpenPopup('Add Job Trait##modal');
+                    th_add_trait_open = false;
+                end
+                if imgui.BeginPopupModal('Add Job Trait##modal', nil, ImGuiWindowFlags_AlwaysAutoResize) then
+                    local job_combo = 'WAR\0MNK\0WHM\0BLM\0RDM\0THF\0PLD\0DRK\0BST\0BRD\0RNG\0SAM\0NIN\0DRG\0SMN\0BLU\0COR\0PUP\0DNC\0SCH\0GEO\0RUN\0';
+                    imgui.PushItemWidth(100);
+                    imgui.Combo('Job', th_add_trait_job_idx, job_combo);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('The job that receives this TH trait.');
+                    end
+                    imgui.Combo('Role', th_add_trait_role_idx, 'Main\0Sub\0');
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Main = when this job is your main job.\nSub = when this job is your subjob (usually lower TH).');
+                    end
+                    imgui.InputInt('Min Level', th_add_trait_level);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Minimum job level required to activate this trait.\nRetail THF gets TH at 15, 45, and 90.');
+                    end
+                    imgui.SliderInt('TH Value', th_add_trait_th, 1, 10);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('TH level granted by this trait.\nHigher-tier traits replace lower ones (they do not stack).');
+                    end
+                    imgui.PopItemWidth();
+
+                    -- Clamp level
+                    if (th_add_trait_level[1] < 1) then th_add_trait_level[1] = 1; end
+                    if (th_add_trait_level[1] > 99) then th_add_trait_level[1] = 99; end
+
+                    imgui.Spacing();
+                    imgui.TextDisabled('For private servers with custom TH traits.');
+                    imgui.TextDisabled('Retail THF traits are pre-populated.');
+
+                    if imgui.Button('Add##trait') then
+                        if (th_adv_profile_id ~= nil) then
+                            local job_id = th_add_trait_job_idx[1] + 1;  -- combo is 0-based, jobs are 1-based
+                            local is_main = (th_add_trait_role_idx[1] == 0) and 1 or 0;
+                            db.add_th_job_trait(th_adv_profile_id, job_id, is_main, th_add_trait_level[1], th_add_trait_th[1]);
+                            th_adv_dirty = true;
+                            if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                        end
+                        imgui.CloseCurrentPopup();
+                    end
+                    imgui.SameLine();
+                    if imgui.Button('Cancel##trait') then
+                        imgui.CloseCurrentPopup();
+                    end
+                    imgui.EndPopup();
+                end
+
+                imgui.Spacing();
+
+                if (th_adv_traits_cache ~= nil and #th_adv_traits_cache > 0) then
+                    for _, trait in ipairs(th_adv_traits_cache) do
+                        local role = trait.is_main == 1 and 'Main' or 'Sub';
+                        local job_abbr = JOB_ABBRS[trait.job_id] or ('Job' .. tostring(trait.job_id));
+                        local trait_label = string_format('%s %s  Lv%d: +%d', job_abbr, role, trait.min_level, trait.th_value);
+                        if (trait.job_id == 16) then
+                            trait_label = trait_label .. '  (spell-set)';
+                        end
+
+                        -- Enable/disable checkbox
+                        th_trait_enabled_buf[1] = (trait.enabled ~= 0);
+                        if imgui.Checkbox('##trait_en_' .. tostring(trait.id), th_trait_enabled_buf) then
+                            db.set_th_job_trait_enabled(trait.id, th_trait_enabled_buf[1]);
+                            th_adv_dirty = true;
+                            if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                        end
+                        if imgui.IsItemHovered() then
+                            imgui.SetTooltip(th_trait_enabled_buf[1] and 'Disable this trait (keeps it for later)' or 'Enable this trait');
+                        end
+                        imgui.SameLine();
+                        if (trait.enabled == 0) then
+                            imgui.TextDisabled(trait_label);
+                        else
+                            imgui.Text(trait_label);
+                        end
+                        if imgui.IsItemHovered() then
+                            if (trait.job_id == 16) then
+                                imgui.SetTooltip('BLU spell-set TH trait.\nRequires Charged Whisker + Everyone\'s Grudge + Amorphic Spikes all set.\nDetected automatically from memory. Use /loot bluspells to verify.');
+                            else
+                                imgui.SetTooltip(string_format('%s %s job: grants TH+%d at level %d and above.\nUncheck to disable without deleting. X to remove permanently.',
+                                    job_abbr, role, trait.th_value, trait.min_level));
+                            end
+                        end
+                        imgui.SameLine();
+                        if imgui.SmallButton('X##trait_' .. tostring(trait.id)) then
+                            db.delete_th_job_trait(trait.id);
+                            th_adv_dirty = true;
+                            if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                        end
+                        if imgui.IsItemHovered() then
+                            imgui.SetTooltip('Delete this trait permanently.');
+                        end
+                    end
+                else
+                    imgui.TextDisabled('  No job traits defined.');
+                end
+
+                if (tracker ~= nil and tracker.th_trust_source ~= nil) then
+                    imgui.TextDisabled('  Trust/Pet TH1 active: ' .. tracker.th_trust_source);
+                end
+            end
+
+            imgui.Spacing();
+
+            -- TH Gear section
+            if imgui.CollapsingHeader('TH Gear', ImGuiTreeNodeFlags_DefaultOpen) then
+                imgui.TextDisabled('Augmented TH (e.g., Herculean +TH) is auto-detected at scan time.');
+                imgui.TextDisabled('Add items here for intrinsic TH gear or custom server items.');
+                -- Search + Add
+                imgui.PushItemWidth(200);
+                imgui.InputTextWithHint('##th_search', 'Search by name or notes...', th_adv_search_buf, th_adv_search_size);
+                imgui.PopItemWidth();
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip('Filter items by name or notes.');
+                end
+                imgui.SameLine();
+                if imgui.Button('+ Add Item') then
+                    th_add_open = true;
+                    th_add_item_id[1] = 0;
+                    th_add_name_buf[1] = '';
+                    th_add_th_value[1] = 1;
+                    th_add_slot_idx[1] = 0;
+                    th_add_notes_buf[1] = '';
+                    th_add_last_id = 0;
+                end
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip('Add a gear item that grants TH when equipped.\nEnter the item ID and name/slot/TH auto-fill from game data.\nSet TH=0 for augmentable gear (augments detected automatically).');
+                end
+
+                -- Add item modal
+                if (th_add_open) then
+                    imgui.OpenPopup('Add TH Item##modal');
+                    th_add_open = false;
+                end
+                if imgui.BeginPopupModal('Add TH Item##modal', nil, ImGuiWindowFlags_AlwaysAutoResize) then
+                    imgui.PushItemWidth(120);
+                    if imgui.InputInt('Item ID', th_add_item_id) then
+                        -- ID changed — auto-fill name, slot, and TH value from resource
+                        local cur_id = th_add_item_id[1];
+                        if (cur_id > 0 and cur_id ~= th_add_last_id) then
+                            th_add_last_id = cur_id;
+                            local res = AshitaCore:GetResourceManager();
+                            if (res ~= nil) then
+                                local ritem = res:GetItemById(cur_id);
+                                if (ritem ~= nil) then
+                                    if (ritem.Name ~= nil and ritem.Name[1] ~= nil) then
+                                        th_add_name_buf[1] = ritem.Name[1];
+                                    end
+                                    th_add_slot_idx[1] = slots_bitmask_to_idx(ritem.Slots);
+                                end
+                            end
+                            -- Pre-fill TH value from existing profile entry if present
+                            if (th_adv_profile_id ~= nil) then
+                                local existing = db.get_th_items_by_item_id(th_adv_profile_id);
+                                if (existing ~= nil and existing[cur_id] ~= nil) then
+                                    th_add_th_value[1] = existing[cur_id].th_value or 1;
+                                else
+                                    th_add_th_value[1] = 1;
+                                end
+                            end
+                        elseif (cur_id <= 0) then
+                            th_add_last_id = 0;
+                            th_add_name_buf[1] = '';
+                            th_add_th_value[1] = 1;
+                            th_add_slot_idx[1] = 0;
+                        end
+                    end
+                    imgui.PopItemWidth();
+
+                    imgui.PushItemWidth(200);
+                    imgui.InputText('Item Name', th_add_name_buf, th_add_name_size);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Auto-filled from game data when a valid Item ID is entered.');
+                    end
+                    imgui.PopItemWidth();
+                    imgui.PushItemWidth(120);
+                    imgui.SliderInt('TH Value', th_add_th_value, 0, 10);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Intrinsic TH granted by this item.\nSet to 0 for augmentable gear (TH detected from augments).\nSet to the actual TH value for items with built-in TH.');
+                    end
+                    imgui.Combo('Slot', th_add_slot_idx, get_th_slot_combo() or '');
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Equipment slot this item occupies.\nAuto-filled from game data when a valid Item ID is entered.');
+                    end
+                    imgui.PopItemWidth();
+                    imgui.PushItemWidth(200);
+                    imgui.InputText('Notes', th_add_notes_buf, th_add_notes_size);
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip('Optional notes (e.g., "augmentable", "private server only").');
+                    end
+                    imgui.PopItemWidth();
+
+                    imgui.Spacing();
+                    imgui.TextDisabled('TH=0 for augmentable gear (TH detected from augments).');
+                    imgui.TextDisabled('Set TH value for intrinsic or custom server items.');
+
+                    if imgui.Button('Add') then
+                        if (th_add_item_id[1] > 0 and th_adv_profile_id ~= nil) then
+                            db.add_th_item(
+                                th_adv_profile_id,
+                                th_add_item_id[1],
+                                th_add_name_buf[1] or '',
+                                th_add_th_value[1],
+                                th_add_slot_idx[1],
+                                th_add_notes_buf[1] or ''
+                            );
+                            th_adv_dirty = true;
+                            if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                        end
+                        imgui.CloseCurrentPopup();
+                    end
+                    imgui.SameLine();
+                    if imgui.Button('Cancel##add') then
+                        imgui.CloseCurrentPopup();
+                    end
+                    imgui.EndPopup();
+                end
+
+                -- Items table
+                if (th_adv_items_cache ~= nil and #th_adv_items_cache > 0) then
+                    local search = (th_adv_search_buf[1] or ''):lower();
+                    local flags = ImGuiTableFlags_Borders + ImGuiTableFlags_RowBg + ImGuiTableFlags_ScrollY
+                        + ImGuiTableFlags_Resizable + ImGuiTableFlags_SizingStretchProp;
+                    if imgui.BeginTable('th_items_tbl', 6, flags, { 0, 280 }) then
+                        imgui.TableSetupColumn('ID', ImGuiTableColumnFlags_WidthFixed, 55);
+                        imgui.TableSetupColumn('Name', ImGuiTableColumnFlags_WidthStretch);
+                        imgui.TableSetupColumn('TH', ImGuiTableColumnFlags_WidthFixed, 35);
+                        imgui.TableSetupColumn('Slot', ImGuiTableColumnFlags_WidthFixed, 55);
+                        imgui.TableSetupColumn('Notes', ImGuiTableColumnFlags_WidthFixed, 120);
+                        imgui.TableSetupColumn('', ImGuiTableColumnFlags_WidthFixed, 25);
+                        imgui.TableHeadersRow();
+
+                        for _, item in ipairs(th_adv_items_cache) do
+                            local name_lower = (item.item_name or ''):lower();
+                            local notes_lower = (item.notes or ''):lower();
+                            if (search == '' or name_lower:find(search, 1, true) or notes_lower:find(search, 1, true)) then
+                                imgui.TableNextRow();
+                                imgui.TableNextColumn();
+                                imgui.Text(tostring(item.item_id));
+                                imgui.TableNextColumn();
+                                imgui.Text(item.item_name or '');
+                                imgui.TableNextColumn();
+                                if (item.th_value > 0) then
+                                    imgui.Text('+' .. tostring(item.th_value));
+                                    if imgui.IsItemHovered() then
+                                        imgui.SetTooltip('Intrinsic TH+%d from this item.', item.th_value);
+                                    end
+                                else
+                                    imgui.TextDisabled('aug');
+                                    if imgui.IsItemHovered() then
+                                        imgui.SetTooltip('TH from augments only (detected automatically at scan time).\nNo intrinsic TH value on the base item.');
+                                    end
+                                end
+                                imgui.TableNextColumn();
+                                local slot_name = db.SLOT_NAMES[item.slot_id] or '?';
+                                imgui.Text(slot_name);
+                                imgui.TableNextColumn();
+                                local notes = item.notes or '';
+                                if (notes ~= '') then
+                                    imgui.TextDisabled(notes);
+                                end
+                                imgui.TableNextColumn();
+                                if imgui.SmallButton('X##item_' .. tostring(item.id)) then
+                                    db.delete_th_item(item.id);
+                                    th_adv_dirty = true;
+                                    if (tracker ~= nil) then tracker.invalidate_th_cache(); end
+                                end
+                                if imgui.IsItemHovered() then
+                                    imgui.SetTooltip('Remove this item from the profile.');
+                                end
+                            end
+                        end
+                        imgui.EndTable();
+                    end
+
+                    imgui.TextDisabled(string_format('Items: %d', #th_adv_items_cache));
+                else
+                    imgui.TextDisabled('  No TH gear items defined.');
+                end
+            end
+        else
+            imgui.TextDisabled('No profile selected.');
+        end
+    end
+    imgui.End();
+end
+
+-------------------------------------------------------------------------------
 -- Tab 4: Settings
 -------------------------------------------------------------------------------
 local settings_header_color = { 1.0, 0.65, 0.26, 1.0 };
@@ -3913,6 +4471,76 @@ local function render_settings_tab()
     end
     if imgui.IsItemHovered() then
         imgui.SetTooltip('Show or hide the window title bar in compact mode.\nThe window is still draggable without it.');
+    end
+
+    imgui.Spacing();
+    imgui.TextColored(settings_header_color, 'TH Management');
+    imgui.Separator();
+
+    set_bool_buf[1] = s.th_estimation_enabled ~= false;
+    if imgui.Checkbox('Enable gear-based TH estimation (Beta)', set_bool_buf) then
+        s.th_estimation_enabled = set_bool_buf[1];
+        ui.settings_dirty = true;
+        if (tracker ~= nil) then tracker.set_settings(s); end
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Estimate TH from job traits, equipped gear, and augments.\nScans on each offensive action (cached until gear swap).\nSupports THF, BLU spell-set trait, and all TH gear.\nUseful for non-THF jobs and servers without TH proc messages.');
+    end
+
+    set_bool_buf[1] = s.th_trust_detection ~= false;
+    if imgui.Checkbox('Detect TH trusts and pets (Beta)', set_bool_buf) then
+        s.th_trust_detection = set_bool_buf[1];
+        ui.settings_dirty = true;
+        if (tracker ~= nil) then tracker.set_settings(s); end
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Detect party trusts (THF/sub-THF) and BST jug pets that apply TH+1.\nChecked once per mob per trust — no repeated scans.\nEnsures TH+1 minimum even when you have no TH gear equipped.');
+    end
+
+    set_bool_buf[1] = s.th_zone_effects ~= false;
+    if imgui.Checkbox('Detect zone TH effects (Beta)', set_bool_buf) then
+        s.th_zone_effects = set_bool_buf[1];
+        ui.settings_dirty = true;
+        if (tracker ~= nil) then tracker.set_settings(s); end
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Detect zone-wide TH bonuses that add to your estimate.\nCurrently supported:\n  - Treasure Hound kupower (+1 with Signet)\nPlanned:\n  - Atma of Dread (+1 in Abyssea)\n  - GoV Prowess TH (+1 per level, max 3 levels)');
+    end
+
+    -- Profile dropdown
+    local th_profiles = get_th_profiles_cached();
+    if (#th_profiles > 0) then
+        local profile_names = {};
+        local current_idx = 0;
+        for i, p in ipairs(th_profiles) do
+            profile_names[i] = p.name;
+            if (p.name == (s.th_profile or 'Retail')) then
+                current_idx = i - 1;
+            end
+        end
+        local combo_str = table.concat(profile_names, '\0') .. '\0';
+        set_int_buf[1] = current_idx;
+        imgui.PushItemWidth(math_min((imgui.GetContentRegionAvail()), 200));
+        if imgui.Combo('Active Profile', set_int_buf, combo_str) then
+            local new_name = profile_names[set_int_buf[1] + 1];
+            if (new_name ~= nil and new_name ~= s.th_profile) then
+                s.th_profile = new_name;
+                ui.settings_dirty = true;
+                if (tracker ~= nil) then
+                    tracker.invalidate_th_cache();
+                    tracker.set_settings(s);
+                end
+            end
+        end
+        imgui.PopItemWidth();
+    end
+
+    imgui.SameLine();
+    if imgui.Button('Advanced Settings##th') then
+        th_adv_open[1] = true;
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Manage TH gear profiles, items, and job traits.\nPre-populated with retail THF gear and trait data.\nCreate custom profiles for private servers.');
     end
 
     imgui.Spacing();
@@ -4137,14 +4765,7 @@ local function render_compact()
                     end
 
                     imgui.TableNextColumn();
-                    if (drop.th_level > 0) then
-                        imgui.Text(tostring(drop.th_level));
-                    else
-                        imgui.TextDisabled('-');
-                    end
-                    if imgui.IsItemHovered() then
-                        imgui.SetTooltip('Treasure Hunter level on mob at time of kill.');
-                    end
+                    render_combined_th(drop.th_level or 0, drop.th_estimated or 0, true);
 
                     imgui.TableNextColumn();
                     local sc = status_colors[drop.won] or status_colors[0];
@@ -4435,6 +5056,9 @@ function ui.render()
 
     -- Advanced Export is a standalone window (no dimming)
     render_advanced_export_window();
+
+    -- TH Advanced Management is a standalone window
+    render_th_advanced_window();
 
     -- Clear per-frame notification flags (per-cache dirty flags handle invalidation)
     db.stats_dirty = false;

@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.2.1 - Zone Dialog DAT Reader
+    LootScope v1.3.0 - Zone Dialog DAT Reader
     Reads zone dialog DAT files to resolve HTBF battlefield names from
     the "Entering the battlefield for..." template strings.
 
