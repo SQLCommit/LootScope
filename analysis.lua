@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.0 - Slot Analysis Engine
+    LootScope v1.3.1 - Slot Analysis Engine
     Statistical computation for drop slot probability analysis.
     Provides Wilson score confidence intervals, Poisson Binomial
     distribution, co-occurrence testing, and shared slot detection.
@@ -8,7 +8,7 @@
     and returns pre-computed result tables for ui.lua to render.
 
     Author: SQLCommit
-    Version: 1.2.1
+    Version: 1.3.1
 ]]--
 
 require 'common';
@@ -131,7 +131,7 @@ end
 -- Returns (where_clause, bind_params_array) for kills table alias 'k'.
 -- NOTE: must stay in sync with db.CONTENT_TYPE_MAP in db.lua.
 -------------------------------------------------------------------------------
-local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion' };
+local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper' };
 
 local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
     local parts = {};

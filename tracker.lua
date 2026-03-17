@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.0 - Packet Tracker
+    LootScope v1.3.1 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
     0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
@@ -7,7 +7,7 @@
     procs, content type, HTBF difficulty, and Voidwatch Pyxis loot.
 
     Author: SQLCommit
-    Version: 1.2.1
+    Version: 1.3.1
 ]]--
 
 require 'common';
@@ -93,6 +93,21 @@ tracker.voidwatch = {
     kill_id = nil,              -- linked kill record
     offered = {},               -- { [slot] = item_id } from first 0x034
     last_vw_kill = nil,         -- most recent VW NM kill_id (set by handle_defeat)
+};
+
+-- Wildskeeper Reive state (direct inventory loot via 0x034 Event 2007)
+tracker.wildskeeper = {
+    active = false,             -- Reive Mark buff (511) is active
+    last_boss_name = nil,       -- name of last defeated Naakual
+    last_boss_sid = nil,        -- server ID of last defeated Naakual
+    last_kill_id = nil,         -- kill record ID for last Naakual defeat
+    last_kill_time = 0,         -- os.clock() of last Naakual defeat
+};
+
+-- Wildskeeper Reive Naakual boss names (exact in-game names)
+local NAAKUAL_NAMES = {
+    ['Colkhab'] = true, ['Tchakka'] = true, ['Achuka'] = true,
+    ['Yumcax']  = true, ['Hurkan']  = true, ['Kumhau'] = true,
 };
 
 -- Drop arrival order per mob (for slot analysis ordering queries)
@@ -773,6 +788,19 @@ local function update_th_estimate(mob_sid)
 end
 
 -- Clear all TH-related per-mob state (zone change + reset)
+-- Clear stale per-mob state for a server ID (mob respawn reused same SID).
+-- Only clears kill-cycle data; th_estimated and engaged_mobs are intentionally
+-- NOT cleared — they belong to the NEW mob sharing this server ID (set by 0x0028).
+local function clear_stale_mob_state(sid)
+    tracker.mob_kills[sid] = nil;
+    tracker.mob_kill_times[sid] = nil;
+    tracker.drop_sequence[sid] = nil;
+    tracker.pet_to_master[sid] = nil;
+    tracker.th_levels[sid] = nil;
+    tracker.th_actions[sid] = nil;
+    tracker.mob_names[sid] = nil;
+end
+
 function tracker.clear_th_state()
     tracker.th_levels = {};
     tracker.th_actions = {};
@@ -1801,9 +1829,13 @@ end
 
 local function has_voidwatcher_buff() return has_buff(475); end  -- Active during VW cycle
 local function has_elvorseal_buff()   return has_buff(603); end  -- Active during Domain Invasion
+local function has_reive_mark_buff()  return has_buff(511); end  -- Active during Reive
 
 -- Domain Invasion zones (Escha Zi'Tah, Escha Ru'Aun, Reisenjima)
 local DOMAIN_INVASION_ZONES = { [288] = true, [289] = true, [291] = true };
+
+-- Forward declaration (defined later, needed by is_party_or_alliance_kill)
+local find_pet_owner;
 
 -- Check if a killer server ID belongs to any party/alliance member (or their pet).
 -- Returns true if the kill should be attributed to the player's group.
@@ -1871,6 +1903,33 @@ function tracker.check_voidwatch_buff()
     end
 end
 
+-- Wildskeeper Reive buff polling: detect Reive Mark gain/loss.
+-- On addon reload, recovers kill_id from DB if a recent Wildskeeper kill exists.
+-- Called from d3d_present.
+function tracker.check_reive_buff()
+    local has_mark = has_reive_mark_buff();
+    if (has_mark and not tracker.wildskeeper.active) then
+        -- Entered a Reive (or addon reloaded while in one)
+        tracker.wildskeeper.active = true;
+
+        -- Reload recovery: check DB for recent Wildskeeper kill in this zone
+        if (tracker.wildskeeper.last_kill_id == nil and tracker.current_zone_id ~= 0) then
+            local recent = db.find_recent_wildskeeper_kill(tracker.current_zone_id, 120);
+            if (recent) then
+                tracker.wildskeeper.last_kill_id = recent.kill_id;
+                tracker.wildskeeper.last_boss_name = recent.mob_name;
+            end
+        end
+    elseif (not has_mark and tracker.wildskeeper.active) then
+        -- Left the Reive — clear all state
+        tracker.wildskeeper.active = false;
+        tracker.wildskeeper.last_boss_name = nil;
+        tracker.wildskeeper.last_boss_sid = nil;
+        tracker.wildskeeper.last_kill_id = nil;
+        tracker.wildskeeper.last_kill_time = 0;
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Zone Change Detection
 -------------------------------------------------------------------------------
@@ -1932,6 +1991,11 @@ function tracker.check_zone()
         finalize_vw_interaction();
         tracker.voidwatch.pyxis_active = false;
         tracker.voidwatch.last_vw_kill = nil;
+        tracker.wildskeeper.active = false;
+        tracker.wildskeeper.last_boss_name = nil;
+        tracker.wildskeeper.last_boss_sid = nil;
+        tracker.wildskeeper.last_kill_id = nil;
+        tracker.wildskeeper.last_kill_time = 0;
         tracker.content_info = nil;
         cached_player_sid = nil;
     end
@@ -2071,7 +2135,7 @@ end
 -- Returns owner's target_index, or nil if not a pet.
 -------------------------------------------------------------------------------
 
-local function find_pet_owner(target_index)
+find_pet_owner = function(target_index)
     if (target_index == nil or target_index <= 0) then return nil; end
 
     local ok, result = pcall(function()
@@ -2082,10 +2146,10 @@ local function find_pet_owner(target_index)
 
         -- Only scan PC range (1024-1791) — only player characters own combat pets.
         -- NPCs (0-1023) and trusts/pets (1792-2303) don't own other pets.
+        -- Check render flags to skip empty slots, then check PetTargetIndex directly.
         for i = 1024, 1791 do
             if (i ~= target_index) then
-                local flags = entity:GetSpawnFlags(i);
-                if (flags ~= nil and bit.band(flags, 0x0010) ~= 0) then
+                if (entity:GetRenderFlags0(i) ~= 0) then
                     local pet_tidx = entity:GetPetTargetIndex(i);
                     if (pet_tidx == target_index) then
                         return i;
@@ -2362,15 +2426,8 @@ function tracker.handle_defeat(data)
             end
             return;
         end
-        -- Old kill (server ID reuse from mob respawn) — clear stale state
-        tracker.mob_kills[mob_sid] = nil;
-        tracker.mob_kill_times[mob_sid] = nil;
-        tracker.drop_sequence[mob_sid] = nil;
-        tracker.pet_to_master[mob_sid] = nil;
-        tracker.th_levels[mob_sid] = nil;
-        tracker.th_actions[mob_sid] = nil;
-        tracker.th_estimated[mob_sid] = nil;
-        tracker.engaged_mobs[mob_sid] = nil;
+        -- Old kill (server ID reuse from mob respawn) — clear stale state.
+        clear_stale_mob_state(mob_sid);
     end
 
     -- Pet detection: if this defeated entity is a pet of another mob,
@@ -2410,11 +2467,14 @@ function tracker.handle_defeat(data)
     local vana_info = capture_vana_info();
 
     -- Determine content type: Voidwatcher buff (475) = VW kill,
+    -- Reive Mark buff (511) + Naakual name = Wildskeeper Reive,
     -- Elvorseal buff (603) in Escha zone = Domain Invasion,
     -- else use the normal content_info (BCNM/HTBF/Dynamis from 0x0075 packet).
     local ct = tracker.get_content_type();
     if (ct == '' and has_voidwatcher_buff()) then
         ct = 'Voidwatch';
+    elseif (ct == '' and tracker.wildskeeper.active and NAAKUAL_NAMES[mob_name]) then
+        ct = 'Wildskeeper';
     elseif (ct == '' and DOMAIN_INVASION_ZONES[tracker.current_zone_id] and has_elvorseal_buff()) then
         ct = 'Domain Invasion';
     end
@@ -2456,6 +2516,14 @@ function tracker.handle_defeat(data)
     -- Track VW kill directly so handle_event_begin doesn't need to scan
     if (ct == 'Voidwatch') then
         tracker.voidwatch.last_vw_kill = kill_id;
+    end
+
+    -- Track Wildskeeper Reive Naakual kill for 0x034 Event 2007 loot attribution
+    if (ct == 'Wildskeeper') then
+        tracker.wildskeeper.last_boss_name = mob_name;
+        tracker.wildskeeper.last_boss_sid = mob_sid;
+        tracker.wildskeeper.last_kill_id = kill_id;
+        tracker.wildskeeper.last_kill_time = os.clock();
     end
 
     -- Queue this kill for mob gil detection.
@@ -2612,9 +2680,21 @@ function tracker.handle_treasure_pool(data)
 
     local th_level = tracker.th_levels[effective_sid] or 0;
 
+    -- Server ID reuse guard: if mob_kills has a stale entry from a previous mob
+    -- with the same server ID (>5s old), clear it so we don't attach new drops
+    -- to the old kill record.
+    local kill_id = tracker.mob_kills[effective_sid];
+    if (kill_id ~= nil) then
+        local kill_time = tracker.mob_kill_times[effective_sid] or 0;
+        if ((os.clock() - kill_time) > 5.0 and is_old == 0) then
+            clear_stale_mob_state(effective_sid);
+            kill_id = nil;
+            th_level = 0;
+        end
+    end
+
     -- Use existing kill record from 0x0029 defeat, or create one for
     -- containers/chests that don't send defeat messages, or late-join pool items
-    local kill_id = tracker.mob_kills[effective_sid];
     if (kill_id == nil and source_type == tracker.SOURCE_MOB and pet_info == nil) then
         -- Check if this entity is a pet whose 0x0029 defeat hasn't arrived yet.
         -- If so, redirect to master so drops are attributed correctly.
@@ -2642,7 +2722,9 @@ function tracker.handle_treasure_pool(data)
     end
     if (kill_id == nil) then
         local vana_info = capture_vana_info();
-        local ki = {};
+        local ki = {
+            th_estimated = tracker.th_estimated[effective_sid] or 0,
+        };
         if (source_type == tracker.SOURCE_BCNM and tracker.battlefield.active) then
             ki.battlefield = tracker.battlefield.name;
             ki.level_cap = tracker.battlefield.level_cap;
@@ -2668,6 +2750,7 @@ function tracker.handle_treasure_pool(data)
         );
         tracker.mob_kills[effective_sid] = kill_id;
         tracker.mob_kill_times[effective_sid] = os.clock();
+        tracker.drop_sequence[effective_sid] = 0;
 
         -- Track last BCNM kill_id so 0x001E/0x0053 can attach gil to it
         if (source_type == tracker.SOURCE_BCNM and kill_id ~= nil) then
@@ -3060,8 +3143,62 @@ end
 
 function tracker.handle_event_begin(data)
     if (db == nil) then return; end
-    if (not tracker.voidwatch.pyxis_active) then return; end
     if (#data < 0x34) then return; end
+
+    ---------------------------------------------------------------
+    -- Wildskeeper Reive: Event 2007 delivers items in num[1..3]
+    -- Items go directly to inventory — all are auto-obtained (won=1)
+    --
+    -- Fallback: if addon reloaded between kill and Event 2007,
+    -- last_kill_id is nil but Reive Mark buff is still active.
+    -- Query DB for most recent Wildskeeper kill in zone (2 min window).
+    ---------------------------------------------------------------
+    local event_num = sunpack('H', data, 0x2A + 1);
+    if (event_num == 2007) then
+        local kill_id = tracker.wildskeeper.last_kill_id;
+
+        -- Fallback: recover kill_id from DB after addon reload
+        if (kill_id == nil and tracker.wildskeeper.active) then
+            local recent = db.find_recent_wildskeeper_kill(tracker.current_zone_id, 120);
+            if (recent) then
+                kill_id = recent.kill_id;
+            end
+        end
+
+        if (kill_id ~= nil) then
+            -- Read 8 int32 params at offset 0x08
+            local params = {};
+            for i = 0, 7 do
+                local val = sunpack('i', data, 0x08 + (i * 4) + 1);
+                params[i] = (val ~= nil and val > 0 and val < 65536) and val or 0;
+            end
+
+            local res = AshitaCore:GetResourceManager();
+            local slot = 0;
+
+            -- Params 1-3 contain item IDs (param 0 is a flag/count)
+            for i = 1, 3 do
+                if (params[i] > 0) then
+                    local item_name = 'Unknown';
+                    if (res ~= nil) then
+                        local item = res:GetItemById(params[i]);
+                        if (item ~= nil and item.Name ~= nil) then
+                            item_name = item.Name[1] or 'Unknown';
+                        end
+                    end
+                    db.record_drop(kill_id, slot, params[i], item_name, 1, 1);  -- won=1 (auto-obtained)
+                    slot = slot + 1;
+                end
+            end
+
+            -- Clear after capturing — one Event 2007 per kill
+            tracker.wildskeeper.last_kill_id = nil;
+            return;
+        end
+    end
+
+    -- Voidwatch: Riftworn Pyxis loot (existing handler)
+    if (not tracker.voidwatch.pyxis_active) then return; end
 
     local npc_sid = sunpack('I', data, 0x04 + 1);
     if (npc_sid ~= tracker.voidwatch.pyxis_sid) then return; end
@@ -3290,6 +3427,7 @@ function tracker.reset()
     tracker.last_interact = nil;
     tracker.content_info = nil;
     tracker.voidwatch = { pyxis_active = false, pyxis_sid = nil, items_captured = false, kill_id = nil, offered = {}, last_vw_kill = nil };
+    tracker.wildskeeper = { active = false, last_boss_name = nil, last_boss_sid = nil, last_kill_id = nil, last_kill_time = 0 };
 end
 
 return tracker;

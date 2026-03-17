@@ -1,5 +1,15 @@
 # LootScope Changelog
 
+## v1.3.1
+
+### Added
+- **Wildskeeper Reive Loot Tracking**: Tracks items from Naakual boss kills (Colkhab, Tchakka, Achuka, Yumcax, Hurkan, Kumhau). Wildskeeper Reives bypass the treasure pool — items are delivered directly to inventory via S2C 0x034 Event 2007 with item IDs in params[1-3]. All items are auto-obtained (won=1). Detection: Reive Mark buff (ID 511) + Naakual boss name match at defeat time.
+- **Wildskeeper Statistics Category**: New "Wildskeeper" radio button in Statistics tab (6th category). Groups by Naakual boss per zone. Source filter value sf=12, content_type='Wildskeeper'.
+- **Advanced Export Wildskeeper Filter**: Wildskeeper option in the Advanced Export Source filter combo.
+
+### Fixed
+- **find_pet_owner Forward Reference Bug**: `is_party_or_alliance_kill()` (added in v1.3.0) called `find_pet_owner()` before it was defined, causing "attempt to call global 'find_pet_owner' a nil value" on 0x0029 packets. Added forward declaration.
+
 ## v1.3.0
 
 ### Added
@@ -23,10 +33,6 @@
   - Kills that don't match any tier are silently discarded. Entity index range guard (>= 1024) also rejects trusts and PCs before the attribution check runs.
 - **`engaged_mobs` Decoupled from TH**: Mob engagement tracking was gated behind TH estimation settings. Now always active so kill attribution works regardless of TH configuration.
 - **Pet Owner Scan Too Broad**: `find_pet_owner` scanned all 2304 entity slots including NPCs and trusts. Narrowed to PC range (1024-1791) since only player characters own combat pets.
-- **Chat Encoding**: Replaced UTF-8 em dashes in chat output with ASCII hyphens. FFXI chat uses Shift-JIS; multi-byte UTF-8 displayed as garbage characters. Fixed across lootscope, playernotes, zonelines, and mobhud addons.
-- **Domain Invasion Missing in Analysis**: `analysis.lua` content_type_map and is_content check were not updated for sf=11. Domain Invasion data would not route correctly through analysis functions.
-- **TH Slot Combo Init Order**: `TH_SLOT_COMBO` was built at module load time before `db.SLOT_NAMES` was available. Changed to lazy initialization on first use.
-- **Profile Clone Partial Failure**: `clone_th_profile` could leave a half-cloned profile if the trait copy step failed. Added `BEGIN`/`COMMIT`/`ROLLBACK` transaction wrapping.
 
 ### Changed
 - **Content Type Map Consolidated**: Hoisted `content_type_map` to module-level `db.CONTENT_TYPE_MAP` constant. `get_all_mob_stats` elseif chain replaced with single lookup. `analysis.lua` uses matching local copy with sync note. Adding new content types now requires updating one table instead of 5+ locations.

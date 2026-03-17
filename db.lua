@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.0 - SQLite3 Persistence Layer
+    LootScope v1.3.1 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +10,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.2.1
+    Version: 1.3.1
 ]]--
 
 require 'common';
@@ -23,7 +23,7 @@ db.conn = nil;
 db.path = nil;
 
 -- Source filter → content type name mapping (shared across db.lua and analysis.lua)
-db.CONTENT_TYPE_MAP = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion' };
+db.CONTENT_TYPE_MAP = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper' };
 db.char_name = nil;  -- character this DB belongs to
 db._init_failed = false;  -- true if DB open failed (one-shot warning, skip all writes)
 
@@ -642,6 +642,30 @@ function db.update_kill_content_type(kill_id, content_type)
 
     invalidate_kills();
     maybe_commit();
+end
+
+-------------------------------------------------------------------------------
+-- Find most recent Wildskeeper kill in zone (for addon reload recovery)
+-------------------------------------------------------------------------------
+
+function db.find_recent_wildskeeper_kill(zone_id, max_age_seconds)
+    if (db.conn == nil or zone_id == nil) then return nil; end
+    max_age_seconds = max_age_seconds or 120;
+
+    local cutoff = os.time() - max_age_seconds;
+    local stmt = db.conn:prepare(
+        "SELECT id, mob_name FROM kills WHERE content_type = 'Wildskeeper' AND zone_id = ? "
+        .. "AND timestamp >= ? ORDER BY id DESC LIMIT 1"
+    );
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(zone_id, cutoff);
+    local row = stmt:step();
+    local result = nil;
+    if (row == sqlite3.ROW) then
+        result = { kill_id = stmt:get_value(0), mob_name = stmt:get_value(1) };
+    end
+    stmt:finalize();
+    return result;
 end
 
 -------------------------------------------------------------------------------

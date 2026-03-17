@@ -1,11 +1,12 @@
 --[[
-    LootScope v1.3.0 - Loot Drop Tracker for Ashita v4
+    LootScope v1.3.1 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
 
+    v1.3.1: Wildskeeper Reive loot tracking, find_pet_owner forward-ref fix.
     v1.3.0: TH gear estimation, HTBF fallback detection, Domain Invasion,
     TH Management UI with job trait profiles, code quality improvements.
     v1.2.1: VW bug fixes - consecutive cycle detection, relinquish
@@ -30,12 +31,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.3.0
+    Version: 1.3.1
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.3.0';
+addon.version = '1.3.1';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -714,6 +715,7 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
     safe_frame_call(tracker.check_zone, 'check_zone');
     safe_frame_call(tracker.check_battlefield_level_cap, 'check_bf_cap');
     safe_frame_call(tracker.check_voidwatch_buff, 'check_vw_buff');
+    safe_frame_call(tracker.check_reive_buff, 'check_reive_buff');
 
     -- Retry deferred pool scan (throttled to 1/sec)
     if (tracker.pool_scan_pending) then

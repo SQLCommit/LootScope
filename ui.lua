@@ -1,10 +1,10 @@
 --[[
-    LootScope v1.3.0 - UI Module
+    LootScope v1.3.1 - UI Module
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.2.1
+    Version: 1.3.1
 ]]--
 
 require 'common';
@@ -65,8 +65,8 @@ local stats_expanded_spawns = {};  -- [mob_key .. '_' .. server_id] = true if sp
 local stats_cache_data = nil;       -- cached filtered+sorted result
 local stats_cache_zone = -1;        -- zone filter when cache was built
 local stats_cache_dirty = true;     -- tracks if db.stats_dirty changed
-local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch, 11=Domain Invasion
-local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer, 4=Voidwatch
+local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch, 11=Domain Invasion, 12=Wildskeeper
+local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer, 4=Voidwatch, 5=Wildskeeper, 6=Domain Invasion
 local stats_cache_source = -1;      -- source filter when cache was built
 local stats_name_filter = nil;       -- name filter for BCNM/Chest-Coffer (nil = all)
 local stats_cache_name = nil;        -- name filter when cache was built
@@ -437,7 +437,7 @@ local export_col_defs = {
     { label = 'Weather', flags = EP_FW+EP_ASC,              width = 80,  id = 15, tip = 'Weather condition at time of kill' },
     { label = 'BF Name', flags = EP_FW+EP_ASC+EP_DH,        width = 80,  id = 16, tip = 'Battlefield name (HTBF only)' },
     { label = 'Diff',    flags = EP_FW+EP_ASC+EP_DH,        width = 30,  id = 17, tip = 'HTBF difficulty: VD, D, N, E, VE' },
-    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, HTBF, Dynamis, Voidwatch, Domain Invasion' },
+    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, HTBF, Dynamis, Voidwatch, Domain Invasion, Wildskeeper' },
     { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 19, tip = 'Item that appeared in the treasure pool' },
     { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 20, tip = 'Numeric item ID from the game database' },
     { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 21, tip = 'Quantity of the item dropped' },
@@ -1061,7 +1061,7 @@ local function build_stats_filter(source_filter)
 end
 
 local function render_statistics()
-    -- Row 1: Category radio buttons (Field | Battlefields | Instances | Chest/Coffer)
+    -- Row 1a: General content categories (Field | Battlefields | Instances | Chest/Coffer)
     if imgui.RadioButton('Field', stats_category == 0) then
         stats_category = 0;
         reset_stats_filter(0);
@@ -1172,7 +1172,7 @@ local function render_statistics()
             .. '  timers (respawn ~3min, illusion 30-60min).');
     end
 
-    imgui.SameLine();
+    -- Row 1b: Buff-based content categories
     if imgui.RadioButton('Voidwatch', stats_category == 4) then
         stats_category = 4;
         reset_stats_filter(10);
@@ -1187,12 +1187,47 @@ local function render_statistics()
             .. 'Detection: entity name "Planar Rift" or\n'
             .. '"Riftworn Pyxis" during NPC interaction.\n\n'
             .. 'Items recorded from Pyxis event data\n'
-            .. '(bypasses treasure pool — uses 0x034).\n\n'
+            .. '(bypasses treasure pool - uses 0x034).\n\n'
             .. 'All offered items are recorded as drops.\n'
             .. 'Taken = won, relinquished = lost.');
     end
+    imgui.SameLine();
+    if imgui.RadioButton('Wildskeeper', stats_category == 5) then
+        stats_category = 5;
+        reset_stats_filter(12);
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Wildskeeper Reive Statistics\n'
+            .. '------------------------------\n'
+            .. 'Loot from Naakual boss kills.\n\n'
+            .. 'Detection: Reive Mark buff (511)\n'
+            .. '+ Naakual boss defeat.\n\n'
+            .. 'Items delivered directly to inventory\n'
+            .. 'via Event 2007 (no treasure pool).\n\n'
+            .. 'All items are auto-obtained (won=1).');
+    end
+    imgui.SameLine();
+    if imgui.RadioButton('Domain Inv.', stats_category == 6) then
+        stats_category = 6;
+        reset_stats_filter(11);
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Domain Invasion Statistics\n'
+            .. '------------------------------\n'
+            .. 'Kills during Domain Invasion events\n'
+            .. 'in Escha zones.\n\n'
+            .. 'Detection: Elvorseal buff (603)\n'
+            .. 'in Escha Zi\'Tah/Ru\'Aun/Reisenjima.\n\n'
+            .. 'Uses normal treasure pool for drops.');
+    end
 
-    -- Row 2: Sub-filter radio buttons (only for Battlefields and Instances)
+    -- Row 2: Sub-filter radio buttons (Battlefields: All/BCNM/HTBF, Instances: Dynamis)
     if (stats_category == 1) then
         -- Battlefields: All | BCNM | HTBF
         if imgui.RadioButton('All##bf', stats_source_filter == 8) then
@@ -1876,6 +1911,8 @@ local function apply_filters()
         content_type = 'Voidwatch';
     elseif (ef.source_idx[1] == 8) then
         content_type = 'Domain Invasion';
+    elseif (ef.source_idx[1] == 9) then
+        content_type = 'Wildskeeper';
     end
 
     local status = af_status_map[ef.status_idx[1]];
@@ -2065,7 +2102,7 @@ local function render_advanced_export_window()
             imgui.Text('Source:');
             imgui.SameLine(col2);
             imgui.PushItemWidth(w2);
-            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0Domain Invasion\0\0') then
+            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0Domain Invasion\0Wildskeeper\0\0') then
                 ef.auto_dirty = true;
             end
             imgui.PopItemWidth();
