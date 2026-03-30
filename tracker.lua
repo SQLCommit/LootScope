@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.1 - Packet Tracker
+    LootScope v1.4.0 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
     0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
@@ -7,7 +7,7 @@
     procs, content type, HTBF difficulty, and Voidwatch Pyxis loot.
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 require 'common';
@@ -22,6 +22,8 @@ if (not ok_dat) then datreader = nil; end
 local ok_itemdata, itemdata_lib = pcall(require, 'libs/ffxi/itemdata');
 if (not ok_itemdata) then itemdata_lib = nil; end
 local tracker = {};
+tracker.has_datreader = ok_dat;
+tracker.has_itemdata = ok_itemdata;
 
 -------------------------------------------------------------------------------
 -- In-Memory State (cleared on zone change)
@@ -47,6 +49,9 @@ tracker.dat_names = {};          -- target_index -> entity name (rebuilt on zone
 -- Pending mob name resolution queue (for mobs too far to read entity name)
 -- Each entry: {mob_sid, kill_id, time, expected_msgs, received_msgs}
 tracker.pending_mob_resolves = {};
+
+-- Previous zone ID: tracked for source-zone disambiguation (Odyssey vs WoE HTBF)
+tracker.previous_zone_id = 0;
 
 -- Distant kill dedup credits: each 0x00D2-created distant kill absorbs one msg_id=37
 -- Unmatched msg_id=37 events = genuinely missed empty kills
@@ -84,6 +89,13 @@ tracker.last_interact = nil;  -- { server_id, target_index, name, timestamp }
 
 -- Content type — set by 0x0075, persists until zone change
 tracker.content_info = nil;  -- { type='BCNM'|'Dynamis'|'Voidwatch'|..., mode=0x0001, ... }
+
+-- Pending WoE HTBF entry — survives one zone change.
+-- WoE HTBFs (Odin/Cait Sith/Alexander/Lilith) fire "Entering ★..." in the
+-- origin zone (Selbina) before zoning to Walk of Echoes P1/P2. The zone change
+-- clears all state, so we buffer the entry here and restore it after zoning.
+tracker.pending_htbf_entry = nil;   -- { name, difficulty, timestamp }
+tracker.pending_woe_difficulty = nil; -- int (1-5) from 0x005C num[0]=1, consumed by pending entry
 
 -- Voidwatch state (Riftworn Pyxis loot tracking via 0x034)
 tracker.voidwatch = {
@@ -337,16 +349,62 @@ tracker.SOURCE_BCNM   = 3;
 tracker.POOL_MAX_SLOT = 9;   -- FFXI treasure pool has slots 0-9
 
 -------------------------------------------------------------------------------
--- Instance Zone Lookup (WIP: Ambuscade/Omen/Sortie need more packet research)
--- Dynamis is detected by zone name prefix instead.
+-- Odyssey NPC Instance IDs (from upper 12 bits of entity server IDs).
+-- Used for addon reload fallback detection in shared WoE P1/P2 zones.
+-------------------------------------------------------------------------------
+local ODYSSEY_INSTANCES = {
+    [1019] = true, [1020] = true,  -- Sheol A
+    [1021] = true, [1022] = true,  -- Sheol B
+    [1023] = true, [1024] = true,  -- Sheol C
+};
+
+--- Odyssey fallback: detect via NPC instance IDs in 0x000E packets.
+--- Only fires when in WoE P1/P2 (279/298) with no content_info set
+--- (addon reload scenario where previous_zone_id is unknown).
+function tracker.handle_npc_update(data)
+    if (tracker.content_info ~= nil) then return; end
+    local zone_id = tracker.current_zone_id;
+    if (zone_id ~= 279 and zone_id ~= 298) then return; end
+    if (#data < 8) then return; end
+
+    local server_id = sunpack('I', data, 0x04 + 1);
+    local instance = bit.band(bit.rshift(server_id, 12), 0xFFF);
+    if (ODYSSEY_INSTANCES[instance]) then
+        tracker.content_info = { type = 'Odyssey' };
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Instance Zone Lookup: Zone ID → content type string.
+-- Dynamis is detected by zone name prefix instead (not in this table).
+-- Odyssey (279/298) uses source-zone disambiguation, not this table.
 -------------------------------------------------------------------------------
 tracker.INSTANCE_ZONES = {
-    -- WIP: Uncomment when instance detection is tested
-    -- [183] = 'Ambuscade',   -- Maquette Abdhaljs-Legion A
-    -- [287] = 'Ambuscade',   -- Maquette Abdhaljs-Legion B
-    -- [292] = 'Omen',        -- Reisenjima Henge
-    -- [274] = 'Sortie',      -- Outer Ra'Kaznar
-    -- [275] = 'Sortie',      -- Outer Ra'Kaznar [U1]
+    [287] = 'Ambuscade',         -- Maquette Abdhaljs-Legion B (currency only, but tagged for categorization)
+    -- Odyssey: zones 279/298 shared with WoE HTBFs, detected via source-zone disambiguation (see check_zone)
+    [292] = 'Omen',           -- Reisenjima Henge
+    [78]  = 'Einherjar',      -- Hazhalm Testing Grounds
+    [77]  = 'Nyzul',          -- Nyzul Isle (Investigation + Uncharted Survey)
+    [73]  = 'Salvage',        -- Zhayolm Remnants (Salvage + Salvage II)
+    [74]  = 'Salvage',        -- Arrapago Remnants (Salvage + Salvage II)
+    [75]  = 'Salvage',        -- Bhaflau Remnants (Salvage + Salvage II)
+    [76]  = 'Salvage',        -- Silver Sea Remnants (Salvage + Salvage II)
+    [37]  = 'Limbus',         -- Temenos
+    [38]  = 'Limbus',         -- Apollyon
+    [133] = 'Sortie',         -- Outer Ra'Kaznar [U2]
+    [275] = 'Vagary',         -- Outer Ra'Kaznar [U1]
+    [183] = 'Legion',         -- Maquette Abdhaljs-Legion A
+    [55]  = 'Assault',        -- Ilrusi Atoll
+    [56]  = 'Assault',        -- Periqia
+    [60]  = 'Assault',        -- The Ashu Talif
+    [63]  = 'Assault',        -- Lebros Cavern
+    [66]  = 'Assault',        -- Mamool Ja Training Grounds
+    [69]  = 'Assault',        -- Leujaoam Sanctum
+    [182] = 'Walk of Echoes', -- Walk of Echoes (original battlefields)
+    [259] = 'Skirmish',       -- Rala Waterways [U] (+ Delve fractures)
+    [264] = 'Skirmish',       -- Yorcia Weald [U] (+ Delve fractures)
+    [271] = 'Skirmish',       -- Cirdas Caverns [U] (+ Delve fractures)
+    [129] = 'Meeble Burrows', -- Ghoyu's Reverie
 };
 
 function tracker.get_content_type()
@@ -359,10 +417,11 @@ end
 -------------------------------------------------------------------------------
 -- Packet: 0x0075 (S2C) - Battlefield entry (content type detection)
 -- Sent on entry + reconnect. Mode 0x0001 = BCNM/HTBF.
--- WIP: Ambuscade/Omen/Sortie disabled — needs more packet research.
+-- Ambuscade disabled — currency only, no item drops to track.
 -------------------------------------------------------------------------------
 local BATTLEFIELD_MODE_MAP = {
     [0x0001] = 'BCNM',
+    [0x030D] = 'Omen',   -- Reisenjima Henge (stable across all 6 captures)
 };
 
 function tracker.handle_battlefield_packet(data)
@@ -372,9 +431,19 @@ function tracker.handle_battlefield_packet(data)
 
     local content_type = BATTLEFIELD_MODE_MAP[mode];
     if (content_type == nil) then
-        -- WIP: 0xFFFF = progress bars (used by Omen, etc.)
-        -- Instance zone disambiguation disabled until tested.
+        -- Unknown mode — don't overwrite a more specific classification.
+        -- WoE HTBFs use non-0x0001 modes (0x0368, 0x036B) but content_info
+        -- is already set to 'BCNM' by pending_htbf_entry restoration.
+        if (tracker.content_info ~= nil) then return; end
         content_type = 'Unknown Battlefield';
+    end
+
+    -- Don't overwrite zone-based classification with a packet-based one.
+    -- INSTANCE_ZONES detection runs on zone change before 0x0075 arrives.
+    -- Without this guard, Assault/Legion/WoE zones could be overwritten to 'BCNM'.
+    if (tracker.content_info ~= nil and tracker.content_info.type ~= content_type) then
+        -- Only overwrite if current type is 'Unknown Battlefield' (upgrading to specific)
+        if (tracker.content_info.type ~= 'Unknown Battlefield') then return; end
     end
 
     -- Skip if already classified with the same type (avoid re-processing duplicates)
@@ -523,6 +592,8 @@ end
 local chat_text_to_difficulty = {
     ['Very difficult'] = 1, ['Difficult'] = 2, ['Normal'] = 3,
     ['Easy'] = 4, ['Very easy'] = 5,
+    -- Title-case variants (WoE HTBF entry text uses "Very Easy" not "Very easy")
+    ['Very Difficult'] = 1, ['Very Easy'] = 5,
 };
 
 -------------------------------------------------------------------------------
@@ -905,6 +976,37 @@ function tracker.handle_battlefield_text(msg)
         return;
     end
 
+    -- 1b. WoE HTBF: "Entering ★[name]: [difficulty]." (no "the battlefield for" prefix)
+    -- Walk of Echoes HTBFs (Odin/Cait Sith/Alexander/Lilith) enter from Selbina and
+    -- zone to WoE P1/P2. The chat fires in Selbina, then check_zone() clears all state.
+    -- Save as pending — check_zone() restores it after the zone change completes.
+    local entering_raw = msg:match('^Entering (.+)%.$');
+    if (entering_raw ~= nil and (entering_raw:byte(1) or 0) > 127) then
+        local clean = entering_raw:gsub('[^ -~]', ''):trim();
+        if (clean ~= '') then
+            -- Parse difficulty from name: "A Stygian Pact: Very Easy" → name, difficulty
+            local name_part, diff_text = clean:match('^(.+):%s*(.+)$');
+            if (name_part == nil) then name_part = clean; end
+
+            local difficulty = DIFFICULTY_UNKNOWN;
+            if (diff_text ~= nil) then
+                difficulty = chat_text_to_difficulty[diff_text] or DIFFICULTY_UNKNOWN;
+            end
+            -- Packet-based difficulty (0x005C num[0]=1) overrides chat text if available
+            if (tracker.pending_woe_difficulty ~= nil) then
+                difficulty = tracker.pending_woe_difficulty;
+                tracker.pending_woe_difficulty = nil;
+            end
+
+            tracker.pending_htbf_entry = {
+                name       = name_part,
+                difficulty = difficulty,
+                timestamp  = os.time(),
+            };
+        end
+        return;
+    end
+
     -- 2. Level restriction: "<name>'s level is currently restricted to <N>."
     local cap = msg:match("level is currently restricted to (%d+)");
     if (cap ~= nil) then
@@ -932,9 +1034,8 @@ function tracker.handle_battlefield_text(msg)
         end
     end
 
-    -- WIP: Ambuscade/Omen/Sortie chat detection disabled.
-    -- "Entering..." messages not confirmed for these content types.
-    -- Will be re-enabled when instance detection is tested.
+    -- Ambuscade chat detection disabled — currency only, no item drops to track.
+    -- Omen and Sortie use INSTANCE_ZONES (zone-based detection), no chat parsing needed.
 
     -- 3. Dynamis (original + Divergence):
     --    Original: "You will now be warped to Dynamis - Windurst."
@@ -1001,6 +1102,12 @@ function tracker.check_battlefield_reconnect()
             tracker.battlefield.zone_id = session.zone_id;
             tracker.battlefield.level_cap = session.level_cap;
             tracker.battlefield.active = true;
+
+            -- Set content_info so 0x0075 'Unknown Battlefield' doesn't overwrite.
+            -- Covers WoE HTBFs on addon reload (0x0075 sends non-0x0001 modes).
+            if (tracker.content_info == nil) then
+                tracker.content_info = { type = 'BCNM' };
+            end
         end
     end
 end
@@ -1277,7 +1384,7 @@ local function detect_container_type(target_index)
     if (px ~= nil and (px ~= 0 or py ~= 0)) then
         local best_dist = 20.0;
         local best_ctype = nil;
-        for i = 1, 2303 do
+        for i = 1, 1023 do
             local name = entity:GetName(i);
             if (name ~= nil and #name > 0) then
                 local lower = name:lower();
@@ -2000,6 +2107,7 @@ function tracker.check_zone()
         cached_player_sid = nil;
     end
 
+    tracker.previous_zone_id = tracker.current_zone_id;
     tracker.current_zone_id = zone_id;
 
     -- Load DAT entity names for the new zone (any zone change, including
@@ -2021,6 +2129,55 @@ function tracker.check_zone()
     -- never sends) or zone ID tables.
     if (tracker.content_info == nil and tracker.current_zone_name:match('^Dynamis')) then
         tracker.content_info = { type = 'Dynamis' };
+    end
+
+    -- Instance zone detection: 12 content types via INSTANCE_ZONES table.
+    -- Runs after Dynamis (zone name takes priority) and before WoE HTBF restoration.
+    if (tracker.content_info == nil) then
+        local instance_type = tracker.INSTANCE_ZONES[zone_id];
+        if (instance_type ~= nil) then
+            tracker.content_info = { type = instance_type };
+        end
+    end
+
+    -- WoE HTBF: restore pending battlefield state from before zone change.
+    -- "Entering ★..." fires in Selbina, zone change to WoE P1/P2 clears all state,
+    -- so we restore from the buffered pending entry here.
+    if (tracker.pending_htbf_entry ~= nil) then
+        local p = tracker.pending_htbf_entry;
+        tracker.pending_htbf_entry = nil;  -- consume (one-shot)
+
+        -- Only restore if pending is recent (5 min guard against stale state)
+        if (os.time() - p.timestamp <= 300) then
+            tracker.battlefield.name = p.name;
+            tracker.battlefield.zone_id = zone_id;
+            tracker.battlefield.active = true;
+            tracker.battlefield.cap_check_pending = true;
+            tracker.battlefield.level_cap = nil;
+            tracker.battlefield.last_kill_id = nil;
+            tracker.battlefield.gil_handled = false;
+            tracker.battlefield.pending_gil = nil;
+
+            if (db ~= nil) then
+                db.record_battlefield_entry(p.name, zone_id, tracker.current_zone_name, os.time());
+            end
+
+            tracker.content_info = { type = 'BCNM' };
+            tracker.htbf_info = {
+                difficulty = p.difficulty,
+                bf_name    = p.name,
+            };
+        end
+    end
+
+    -- Odyssey: entered from Rabao (247) into WoE P1/P2 (279/298).
+    -- Source-zone tracking distinguishes Odyssey from WoE HTBFs in same zones.
+    -- WoE HTBFs are handled by pending_htbf_entry above; if content_info is still
+    -- nil here and we came from Rabao, it's Odyssey.
+    if (tracker.content_info == nil and (zone_id == 279 or zone_id == 298)) then
+        if (tracker.previous_zone_id == 247) then
+            tracker.content_info = { type = 'Odyssey' };
+        end
     end
 end
 
@@ -2217,10 +2374,16 @@ function tracker.check_character()
 
     -- Fallback: if 0x0075 hasn't fired yet but we're in a known zone,
     -- set content_info so kills aren't unclassified on addon reload.
-    -- WIP: Instance zone detection (Ambuscade/Omen/Sortie) disabled until tested.
     if (tracker.content_info == nil and tracker.current_zone_id > 0) then
         if (tracker.current_zone_name:match('^Dynamis')) then
             tracker.content_info = { type = 'Dynamis' };
+        end
+        -- Instance zone detection: fallback for known zone IDs on addon reload
+        if (tracker.content_info == nil) then
+            local instance_type = tracker.INSTANCE_ZONES[tracker.current_zone_id];
+            if (instance_type ~= nil) then
+                tracker.content_info = { type = instance_type };
+            end
         end
     end
 end
@@ -2343,8 +2506,12 @@ function tracker.handle_defeat(data)
     -- against the mob_gil_queue (FIFO) populated by msg_id=6 defeats.  If the queue
     -- is empty, this is FoV/GoV or another source — safely ignored.
     if (message_id == 565) then
-            local now = os.clock();
+        local now = os.clock();
         while (#tracker.mob_gil_queue > 0 and (now - tracker.mob_gil_queue[1].time) > 5.0) do
+            table.remove(tracker.mob_gil_queue, 1);
+        end
+        -- Safety cap: prevent unbounded growth in extreme AoE scenarios
+        while (#tracker.mob_gil_queue > 50) do
             table.remove(tracker.mob_gil_queue, 1);
         end
 
@@ -2410,6 +2577,15 @@ function tracker.handle_defeat(data)
                     local kn = get_entity_name(killer_tidx);
                     if (kn ~= 'Unknown') then killer_name = kn; end
                 end
+                -- Determine content type (may have been missed by 0x00D2 fallback)
+                local ct = tracker.get_content_type();
+                if (ct == '' and has_voidwatcher_buff()) then
+                    ct = 'Voidwatch';
+                elseif (ct == '' and tracker.wildskeeper.active and NAAKUAL_NAMES[mob_name]) then
+                    ct = 'Wildskeeper';
+                elseif (ct == '' and DOMAIN_INVASION_ZONES[tracker.current_zone_id] and has_elvorseal_buff()) then
+                    ct = 'Domain Invasion';
+                end
                 db.patch_kill_on_defeat(existing_kill, {
                     killer_id      = killer_id,
                     killer_name    = killer_name,
@@ -2417,6 +2593,7 @@ function tracker.handle_defeat(data)
                     th_action_type = th_action and th_action.cmd_no or 0,
                     th_action_id   = th_action and th_action.cmd_arg or 0,
                     th_estimated   = tracker.th_estimated[mob_sid] or 0,
+                    content_type   = ct,
                 });
                 tracker.mob_gil_queue[#tracker.mob_gil_queue + 1] = {
                     kill_id  = existing_kill,
@@ -3105,17 +3282,32 @@ end
 -------------------------------------------------------------------------------
 -- Packet: 0x005C - GP_SERV_COMMAND_PENDINGNUM (HTBF entry detection)
 -- 8 x int32 params starting at offset 0x04.
--- When num[0]==2: HTBF entry event.
+-- When num[0]==2: HTBF entry event (standard zones).
 --   num[1] = bit position (battlefield name index within zone)
 --   num[2] = difficulty: 1=VD, 2=D, 3=N, 4=E, 5=VE
 --   num[3] = instance ID (unstable, not stored)
+-- When num[0]==1: Pre-entry event (fires during battlefield application).
+--   For WoE HTBFs: num[2] = difficulty (1-5), num[6] = destination zone.
+--   Difficulty saved for pending_htbf_entry (consumed by chat handler).
 -------------------------------------------------------------------------------
 
 function tracker.handle_pending_num(data)
     if (#data < 36) then return; end  -- need at least 8 uint32s (32 bytes) + 4 header
 
     local num0 = sunpack('I', data, 0x04 + 1);
-    if (num0 ~= 2) then return; end  -- only HTBF entry events
+
+    -- num[0]=1: Pre-entry event. Save difficulty for WoE HTBF pending entry.
+    -- Fires during battlefield application (before "Entering ★..." chat).
+    -- Sortie/Omen also send num[0]=1 but with num[2] outside 1-5 range.
+    if (num0 == 1) then
+        local difficulty = sunpack('I', data, 0x0C + 1);
+        if (difficulty >= 1 and difficulty <= 5) then
+            tracker.pending_woe_difficulty = difficulty;
+        end
+        return;
+    end
+
+    if (num0 ~= 2) then return; end  -- only standard HTBF entry events
 
     local bit_pos    = sunpack('I', data, 0x08 + 1);
     local difficulty = sunpack('I', data, 0x0C + 1);
@@ -3426,6 +3618,9 @@ function tracker.reset()
     tracker.htbf_info = nil;
     tracker.last_interact = nil;
     tracker.content_info = nil;
+    tracker.pending_htbf_entry = nil;
+    tracker.pending_woe_difficulty = nil;
+    tracker.previous_zone_id = 0;
     tracker.voidwatch = { pyxis_active = false, pyxis_sid = nil, items_captured = false, kill_id = nil, offered = {}, last_vw_kill = nil };
     tracker.wildskeeper = { active = false, last_boss_name = nil, last_boss_sid = nil, last_kill_id = nil, last_kill_time = 0 };
 end

@@ -1,6 +1,10 @@
-# SQLite database files
+# SQLite database files (per-character DBs, runtime caches)
+*.db
 *.db-wal
 *.db-shm
+
+# Exception: TH gear profile database ships with the addon
+!data/th_items.db
 
 # Per-character settings
 settings/
@@ -15,3 +19,6 @@ settings/
 
 # Export files
 exports/
+
+# Dev Tracking
+DEV_TRACKING.md

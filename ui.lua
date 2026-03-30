@@ -1,10 +1,10 @@
 --[[
-    LootScope v1.3.1 - UI Module
+    LootScope v1.4.0 - UI Module
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 require 'common';
@@ -65,8 +65,8 @@ local stats_expanded_spawns = {};  -- [mob_key .. '_' .. server_id] = true if sp
 local stats_cache_data = nil;       -- cached filtered+sorted result
 local stats_cache_zone = -1;        -- zone filter when cache was built
 local stats_cache_dirty = true;     -- tracks if db.stats_dirty changed
-local stats_source_filter = 0;      -- 0=Field, 1=Chest/Coffer, 2=BCNM, 3=HTBF, 4=Omen, 5=Ambu, 6=Sortie, 7=Dynamis, 8=AllBF, 9=AllInst, 10=Voidwatch, 11=Domain Invasion, 12=Wildskeeper
-local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Chest/Coffer, 4=Voidwatch, 5=Wildskeeper, 6=Domain Invasion
+local stats_source_filter = 0;      -- 0=Field, 1=Chest, 2=BCNM, 3=HTBF, 4-7=Omen/Ambu/Sortie/Dynamis, 8=AllBF, 9=AllInst, 10-12=VW/DI/WK, 13-23=instances
+local stats_category = 0;           -- 0=Field, 1=Battlefields, 2=Instances, 3=Events (VW/DI/WK), 4=Chest/Coffer
 local stats_cache_source = -1;      -- source filter when cache was built
 local stats_name_filter = nil;       -- name filter for BCNM/Chest-Coffer (nil = all)
 local stats_cache_name = nil;        -- name filter when cache was built
@@ -93,7 +93,7 @@ local ef = {
     show_preview    = { true },
     -- Kill filter widgets
     zone_idx        = { 0 },
-    source_idx      = { 0 },       -- 0=All, 1=Mob, 2=Chest, 3=Coffer, 4=BCNM, 5=HTBF
+    source_idx      = { 0 },       -- 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6+=content types
     mob_buf         = { '' },
     mob_buf_size    = 128,
     th_min          = { 0 },
@@ -143,7 +143,7 @@ local ef = {
 
 -- Slot Analysis tab state — consolidated into one table (upvalue hygiene)
 local an = {
-    category        = 0,       -- same as stats: 0=Field, 1=BF, 2=Inst, 3=Chest
+    category        = 0,       -- 0=Field, 1=Battlefields, 2=Instances
     source_filter   = 0,
     zone_filter     = -1,
     name_filter     = nil,
@@ -163,14 +163,22 @@ local an = {
     filter_combo    = { str = '', entries = nil, src = -1 },
     -- Mob combo cache
     mob_combo       = { str = '', mobs = nil, key = '' },
+    inst_idx        = { 0 },   -- Instance combo index (Slot Analysis tab)
 };
 
 -- Reset confirmation input buffer
 local reset_confirm_buf = { '' };
 local reset_confirm_buf_size = 32;
 
+-- Instance combo: maps combo index → source_filter value for the dropdown
+local INSTANCE_COMBO_STR = 'All Instances\0Dynamis\0Omen\0Einherjar\0Nyzul\0Salvage\0Limbus\0Sortie\0Vagary\0Legion\0Assault\0Walk of Echoes\0Skirmish\0Meeble Burrows\0Odyssey\0\0';
+local INSTANCE_COMBO_SF = { 9, 7, 4, 13, 14, 15, 16, 6, 17, 18, 19, 20, 21, 22, 23 };
+local INSTANCE_SF_TO_IDX = {};
+for i, sf in ipairs(INSTANCE_COMBO_SF) do INSTANCE_SF_TO_IDX[sf] = i - 1; end
+
 -- Reusable widget buffers (avoid per-frame table allocation in render functions)
 local stats_filter_idx = { 0 };
+local stats_inst_idx = { 0 };   -- Instance combo index (Statistics tab)
 local an_mob_sel = { 0 };
 local set_int_buf = { 0 };        -- Settings tab: SliderInt buffer
 local set_float_buf = { 0.0 };    -- Settings tab: SliderFloat buffer
@@ -372,21 +380,21 @@ local feed_col_defs = {
     { key = 'time',       label = 'Time',    flags = FW,      width = 45,  tip = 'Real time the drop/kill occurred' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 48,  tip = 'Drop source: Mob, Chest, Coffer, or content type' },
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'qty',        label = 'Qty',     flags = FW,      width = 30,  tip = 'Quantity of the item dropped' },
-    { key = 'th',         label = 'TH',      flags = FW,      width = 25,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
+    { key = 'th',         label = 'TH',      flags = FW,      width = 25,  tip = 'TH level on mob at kill\n* = estimated' },
     { key = 'status',     label = 'Status',  flags = FW,      width = 35,  tip = 'Won, Lost, or still in pool' },
     { key = 'lot',        label = 'Lot',     flags = FW + DH, width = 30,  tip = 'Winning lot value (0-999)' },
     { key = 'winner',     label = 'Winner',  flags = FS + DH, width = 0,   tip = 'Player who won the item' },
     { key = 'killer',     label = 'Killer',  flags = FW + DH, width = 75,  tip = 'Entity that dealt the killing blow' },
-    { key = 'vana_day',   label = 'Day',     flags = FW + DH, width = 75,  tip = "Vana'diel day of the week at time of kill" },
-    { key = 'vana_hour',  label = 'V.Hour',  flags = FW + DH, width = 42,  tip = "Vana'diel hour (0-23) at time of kill" },
+    { key = 'vana_day',   label = 'Day',     flags = FW + DH, width = 75,  tip = "Vana'diel day of the week" },
+    { key = 'vana_hour',  label = 'V.Hour',  flags = FW + DH, width = 42,  tip = "Vana'diel hour (0-23)" },
     { key = 'moon_phase', label = 'Moon',    flags = FW + DH, width = 90,  tip = 'Moon phase at time of kill' },
-    { key = 'moon_pct',   label = 'Moon%',   flags = FW + DH, width = 42,  tip = 'Moon illumination percentage (0-100)' },
+    { key = 'moon_pct',   label = 'Moon%',  flags = FW + DH, width = 42,  tip = 'Moon illumination (0-100)' },
     { key = 'weather',    label = 'Weather', flags = FW + DH, width = 80,  tip = 'Weather condition at time of kill' },
-    { key = 'kill_id',    label = 'Kill ID', flags = FW + DH, width = 40,  tip = 'Database record ID linking drops to their kill' },
-    { key = 'mob_id',     label = 'Mob ID',  flags = FW + DH, width = 50,  tip = 'Server entity ID of the defeated mob' },
+    { key = 'kill_id',    label = 'Kill ID', flags = FW + DH, width = 40,  tip = 'Database record ID' },
+    { key = 'mob_id',     label = 'Mob ID',  flags = FW + DH, width = 50,  tip = 'Server entity ID of the mob' },
 };
 
 local compact_col_defs = {
@@ -394,20 +402,20 @@ local compact_col_defs = {
     { key = 'item',       label = 'Item',    flags = FS,      width = 0,   tip = 'Item that appeared in the treasure pool' },
     { key = 'mob',        label = 'Mob',     flags = FS,      width = 0,   tip = 'Name of the defeated enemy or container' },
     { key = 'zone',       label = 'Zone',    flags = FS + DH, width = 0,   tip = 'Zone where the kill happened' },
-    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
+    { key = 'source',     label = 'Source',  flags = FW + DH, width = 40,  tip = 'Drop source: Mob, Chest, Coffer, or content type' },
     { key = 'qty',        label = 'Qty',     flags = FW + DH, width = 25,  tip = 'Quantity of the item dropped' },
-    { key = 'th',         label = 'TH',      flags = FW,      width = 22,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
+    { key = 'th',         label = 'TH',      flags = FW,      width = 22,  tip = 'TH level on mob at kill\n* = estimated' },
     { key = 'status',     label = 'Status',  flags = FW + DH, width = 30,  tip = 'Won, Lost, or still in pool' },
     { key = 'lot',        label = 'Lot',     flags = FW + DH, width = 25,  tip = 'Winning lot value (0-999)' },
     { key = 'winner',     label = 'Winner',  flags = FS + DH, width = 0,   tip = 'Player who won the item' },
     { key = 'killer',     label = 'Killer',  flags = FW + DH, width = 60,  tip = 'Entity that dealt the killing blow' },
-    { key = 'vana_day',   label = 'Day',     flags = FW + DH, width = 60,  tip = "Vana'diel day of the week at time of kill" },
-    { key = 'vana_hour',  label = 'V.Hour',  flags = FW + DH, width = 35,  tip = "Vana'diel hour (0-23) at time of kill" },
+    { key = 'vana_day',   label = 'Day',     flags = FW + DH, width = 60,  tip = "Vana'diel day of the week" },
+    { key = 'vana_hour',  label = 'V.Hour',  flags = FW + DH, width = 35,  tip = "Vana'diel hour (0-23)" },
     { key = 'moon_phase', label = 'Moon',    flags = FW + DH, width = 70,  tip = 'Moon phase at time of kill' },
-    { key = 'moon_pct',   label = 'Moon%',   flags = FW + DH, width = 35,  tip = 'Moon illumination percentage (0-100)' },
+    { key = 'moon_pct',   label = 'Moon%',  flags = FW + DH, width = 35,  tip = 'Moon illumination (0-100)' },
     { key = 'weather',    label = 'Weather', flags = FW + DH, width = 70,  tip = 'Weather condition at time of kill' },
-    { key = 'kill_id',    label = 'Kill ID', flags = FW + DH, width = 35,  tip = 'Database record ID linking drops to their kill' },
-    { key = 'mob_id',     label = 'Mob ID',  flags = FW + DH, width = 40,  tip = 'Server entity ID of the defeated mob' },
+    { key = 'kill_id',    label = 'Kill ID', flags = FW + DH, width = 35,  tip = 'Database record ID' },
+    { key = 'mob_id',     label = 'Mob ID',  flags = FW + DH, width = 40,  tip = 'Server entity ID of the mob' },
 };
 
 -- Export preview column definitions (sortable, with user IDs for sort handler)
@@ -419,40 +427,41 @@ local EP_NH  = ImGuiTableColumnFlags_NoHide;
 local EP_DH  = ImGuiTableColumnFlags_DefaultHide;
 
 local export_col_defs = {
-    { label = 'Kill',    flags = EP_FW+EP_DSC+EP_DEF+EP_NH, width = 35,  id = 0,  tip = 'Database record ID linking drops to their kill' },
+    { label = 'Kill',    flags = EP_FW+EP_DSC+EP_DEF+EP_NH, width = 35,  id = 0,  tip = 'Database record ID' },
     { label = 'Time',    flags = EP_FW+EP_DSC,              width = 70,  id = 1,  tip = 'Real date/time the kill occurred' },
     { label = 'Mob',     flags = EP_FW+EP_ASC,              width = 100, id = 2,  tip = 'Name of the defeated enemy or container' },
-    { label = 'Mob SID', flags = EP_FW+EP_DSC+EP_DH,        width = 50,  id = 3,  tip = 'Server entity ID of the defeated mob' },
+    { label = 'Mob SID', flags = EP_FW+EP_DSC+EP_DH,        width = 50,  id = 3,  tip = 'Server entity ID of the mob' },
     { label = 'Zone',    flags = EP_FW+EP_ASC,              width = 90,  id = 4,  tip = 'Zone where the kill happened' },
     { label = 'ZoneID',  flags = EP_FW+EP_ASC+EP_DH,        width = 38,  id = 5,  tip = 'Numeric zone ID' },
-    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source: Mob, Chest, Coffer, BCNM, HTBF, or content-specific' },
-    { label = 'TH',      flags = EP_FW+EP_DSC,              width = 25,  id = 7,  tip = 'Treasure Hunter level on mob at kill. Sources: server procs, gear scan, job traits, augments, kupowers. * = estimated (no server confirmation)' },
+    { label = 'Source',  flags = EP_FW+EP_ASC,              width = 48,  id = 6,  tip = 'Drop source type' },
+    { label = 'TH',      flags = EP_FW+EP_DSC,              width = 25,  id = 7,  tip = 'TH level on mob at kill\n* = estimated' },
     { label = 'Killer',  flags = EP_FW+EP_ASC,              width = 75,  id = 8,  tip = 'Entity that dealt the killing blow' },
-    { label = 'TH Act',  flags = EP_FW+EP_ASC+EP_DH,        width = 55,  id = 9,  tip = 'Action type that last procced TH (melee, ranged, spell, etc.)' },
-    { label = 'Act ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 10, tip = 'Specific ability/spell ID that procced TH' },
-    { label = 'Day',     flags = EP_FW+EP_ASC,              width = 75,  id = 11, tip = "Vana'diel day of the week at time of kill" },
-    { label = 'V.Hour',  flags = EP_FW+EP_ASC,              width = 42,  id = 12, tip = "Vana'diel hour (0-23) at time of kill" },
+    { label = 'TH Act',  flags = EP_FW+EP_ASC+EP_DH,        width = 55,  id = 9,  tip = 'Action type that last procced TH' },
+    { label = 'Act ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 10, tip = 'Ability/spell ID that procced TH' },
+    { label = 'Day',     flags = EP_FW+EP_ASC,              width = 75,  id = 11, tip = "Vana'diel day of the week" },
+    { label = 'V.Hour',  flags = EP_FW+EP_ASC,              width = 42,  id = 12, tip = "Vana'diel hour (0-23)" },
     { label = 'Moon',    flags = EP_FW+EP_ASC,              width = 90,  id = 13, tip = 'Moon phase at time of kill' },
-    { label = 'Moon%',   flags = EP_FW+EP_DSC,              width = 42,  id = 14, tip = 'Moon illumination percentage (0-100)' },
+    { label = 'Moon%',  flags = EP_FW+EP_DSC,              width = 42,  id = 14, tip = 'Moon illumination (0-100)' },
     { label = 'Weather', flags = EP_FW+EP_ASC,              width = 80,  id = 15, tip = 'Weather condition at time of kill' },
     { label = 'BF Name', flags = EP_FW+EP_ASC+EP_DH,        width = 80,  id = 16, tip = 'Battlefield name (HTBF only)' },
     { label = 'Diff',    flags = EP_FW+EP_ASC+EP_DH,        width = 30,  id = 17, tip = 'HTBF difficulty: VD, D, N, E, VE' },
-    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type: BCNM, HTBF, Dynamis, Voidwatch, Domain Invasion, Wildskeeper' },
-    { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 19, tip = 'Item that appeared in the treasure pool' },
-    { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 20, tip = 'Numeric item ID from the game database' },
-    { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 21, tip = 'Quantity of the item dropped' },
+    { label = 'Content', flags = EP_FW+EP_ASC,              width = 70,  id = 18, tip = 'Content type tag' },
+    { label = 'Item',    flags = EP_FW+EP_ASC,              width = 110, id = 19, tip = 'Item from the treasure pool' },
+    { label = 'ItemID',  flags = EP_FW+EP_DSC+EP_DH,        width = 40,  id = 20, tip = 'Numeric item ID' },
+    { label = 'Qty',     flags = EP_FW+EP_DSC,              width = 25,  id = 21, tip = 'Quantity dropped' },
     { label = 'Lot',     flags = EP_FW+EP_DSC,              width = 30,  id = 22, tip = 'Winning lot value (0-999)' },
-    { label = 'Status',  flags = EP_FW+EP_DSC,              width = 40,  id = 23, tip = 'Won, Lost, Inv Full, Zoned, or Pending' },
-    { label = 'Win ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 45,  id = 24, tip = 'Server entity ID of the player who won the item' },
+    { label = 'Status',  flags = EP_FW+EP_DSC,              width = 40,  id = 23, tip = 'Won, Lost, Inv Full, Zoned, Pending' },
+    { label = 'Win ID',  flags = EP_FW+EP_DSC+EP_DH,        width = 45,  id = 24, tip = 'Server ID of the winner' },
     { label = 'Winner',  flags = EP_FW+EP_ASC,              width = 75,  id = 25, tip = 'Player who won the item' },
     { label = 'P.Lot',   flags = EP_FW+EP_DSC+EP_DH,        width = 35,  id = 26, tip = 'Your lot value on this item' },
-    { label = 'P.Act',   flags = EP_FW+EP_DSC+EP_DH,        width = 32,  id = 27, tip = 'Your action: 1=Lotted, 0=Passed' },
-    { label = 'Drop At', flags = EP_FW+EP_DSC,              width = 55,  id = 28, tip = 'Time the drop appeared in the treasure pool' },
-    { label = 'Distant',flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 29, tip = 'Distant kill: drops seen but no defeat message (biased sample)' },
-    { label = 'Lvl Cap',flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 30, tip = 'BCNM level cap (20/40/60/75 or uncapped)' },
+    { label = 'P.Act',   flags = EP_FW+EP_DSC+EP_DH,        width = 32,  id = 27, tip = '1=Lotted, 0=Passed' },
+    { label = 'Drop At', flags = EP_FW+EP_DSC,              width = 55,  id = 28, tip = 'Time the drop appeared in pool' },
+    { label = 'Distant', flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 29, tip = 'Distant kill (biased sample)' },
+    { label = 'Lvl Cap', flags = EP_FW+EP_DSC+EP_DH,        width = 42,  id = 30, tip = 'BCNM level cap' },
 };
 
--- Render header row with tooltips from col_defs[].tip
+-- Custom header row with per-column tooltips (Live Feed, Export Preview, Compact Mode).
+-- Statistics/Slot Analysis/TH tables use imgui.TableHeadersRow() (columns are self-explanatory).
 local function render_header_row(col_defs)
     imgui.TableNextRow(ImGuiTableRowFlags_Headers or 0);
     for i, def in ipairs(col_defs) do
@@ -464,6 +473,8 @@ local function render_header_row(col_defs)
         end
     end
 end
+
+-- Shared helper: combined TH display (used by live feed, export, compact, drop detail)
 
 -- Shared zone combo builder
 local function get_zone_combo()
@@ -627,7 +638,7 @@ local function render_live_feed()
                 if (mph ~= nil and mph >= 0) then
                     phase_label = tracker.get_moon_phase_label(mph);
                 end
-                tip = tip .. '\nMoon: ' .. tostring(math.floor(mp)) .. '% ' .. phase_label;
+                tip = tip .. '\nMoon: ' .. tostring(math.floor(mp)) .. '%% ' .. phase_label;
             end
             local w = tonumber(row.weather);
             if (w ~= nil and w >= 0) then
@@ -722,7 +733,7 @@ local function render_live_feed()
                 imgui.TextColored(source_colors[3], '[' .. bf_label .. '] ');
                 imgui.SameLine(0, 0);
             elseif (ct ~= '') then
-                -- Content type badge (Omen, Sortie, Dynamis, Ambuscade)
+                -- Content type badge (any content_type: Dynamis, Omen, Sortie, Voidwatch, etc.)
                 imgui.TextColored(COLOR_CONTENT, '[' .. ct .. '] ');
                 imgui.SameLine(0, 0);
             end
@@ -1038,7 +1049,7 @@ local function build_stats_filter(source_filter)
         end
         table.sort(entries, function(a, b) return a.label < b.label; end);
     else
-        -- Content types (Dynamis; Omen/Ambuscade/Sortie WIP): unique zones
+        -- Content types (instances + events): unique zones
         for _, row in ipairs(all_stats) do
             if (not seen[row.zone_id]) then
                 seen[row.zone_id] = true;
@@ -1061,7 +1072,7 @@ local function build_stats_filter(source_filter)
 end
 
 local function render_statistics()
-    -- Row 1a: General content categories (Field | Battlefields | Instances | Chest/Coffer)
+    -- Row 1: Content categories (Field | Battlefields | Instances | Events | Chest/Coffer)
     if imgui.RadioButton('Field', stats_category == 0) then
         stats_category = 0;
         reset_stats_filter(0);
@@ -1126,7 +1137,7 @@ local function render_statistics()
     imgui.SameLine();
     if imgui.RadioButton('Instances', stats_category == 2) then
         stats_category = 2;
-        reset_stats_filter(7);  -- default to Dynamis (only supported instance)
+        reset_stats_filter(9);  -- default to All Instances
     end
     imgui.SameLine();
     imgui.TextDisabled('(?)');
@@ -1134,17 +1145,43 @@ local function render_statistics()
         imgui.SetTooltip(
             'Instance Statistics\n'
             .. '------------------------------\n'
-            .. 'Currently supports Dynamis only.\n'
-            .. 'Dynamis detected by zone name prefix.\n\n'
-            .. '  Dynamis — Original (10 zones) + Divergence (4 zones)\n\n'
-            .. 'Ambuscade, Omen, and Sortie are WIP —\n'
-            .. 'more packet research needed.\n\n'
+            .. 'Instanced content with zone-based detection.\n\n'
+            .. '  Dynamis — Original (10) + Divergence (4)\n'
+            .. '  Omen — Reisenjima Henge\n'
+            .. '  Einherjar — Hazhalm Testing Grounds\n'
+            .. '  Nyzul — Investigation + Uncharted Survey\n'
+            .. '  Salvage — 4 Remnants (Salvage + Salvage II)\n'
+            .. '  Limbus — Temenos + Apollyon\n'
+            .. '  Sortie — Outer Ra\'Kaznar [U2]\n'
+            .. '  Vagary — Outer Ra\'Kaznar [U1]\n'
+            .. '  Legion — Maquette Abdhaljs-Legion A\n'
+            .. '  Assault — 6 ToAU zones\n'
+            .. '  WoE — Walk of Echoes (original)\n'
+            .. '  Skirmish — 3 [U] zones (+ Delve fractures)\n'
+            .. '  Burrows — Ghoyu\'s Reverie\n'
+            .. '  Odyssey — WoE P1/P2 (source-zone: Rabao)\n\n'
             .. 'All kills are grouped by mob name per zone.');
     end
 
     imgui.SameLine();
-    if imgui.RadioButton('Chest/Coffer', stats_category == 3) then
+    if imgui.RadioButton('Events', stats_category == 3) then
         stats_category = 3;
+        reset_stats_filter(10);  -- default to Voidwatch
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('(?)');
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(
+            'Event Statistics (Buff-Detected)\n'
+            .. '------------------------------\n'
+            .. 'Open-world event content detected via buffs.\n\n'
+            .. '  Voidwatch — Riftworn Pyxis loot (buff 475)\n'
+            .. '  Domain Inv. — Escha zone kills (Elvorseal buff 603)\n'
+            .. '  Wildskeeper — Naakual boss kills (Reive Mark buff 511)');
+    end
+    imgui.SameLine();
+    if imgui.RadioButton('Chest/Coffer', stats_category == 4) then
+        stats_category = 4;
         reset_stats_filter(1);
     end
     imgui.SameLine();
@@ -1172,62 +1209,7 @@ local function render_statistics()
             .. '  timers (respawn ~3min, illusion 30-60min).');
     end
 
-    -- Row 1b: Buff-based content categories
-    if imgui.RadioButton('Voidwatch', stats_category == 4) then
-        stats_category = 4;
-        reset_stats_filter(10);
-    end
-    imgui.SameLine();
-    imgui.TextDisabled('(?)');
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip(
-            'Voidwatch Statistics\n'
-            .. '------------------------------\n'
-            .. 'Loot from Riftworn Pyxis after VW NM kills.\n\n'
-            .. 'Detection: entity name "Planar Rift" or\n'
-            .. '"Riftworn Pyxis" during NPC interaction.\n\n'
-            .. 'Items recorded from Pyxis event data\n'
-            .. '(bypasses treasure pool - uses 0x034).\n\n'
-            .. 'All offered items are recorded as drops.\n'
-            .. 'Taken = won, relinquished = lost.');
-    end
-    imgui.SameLine();
-    if imgui.RadioButton('Wildskeeper', stats_category == 5) then
-        stats_category = 5;
-        reset_stats_filter(12);
-    end
-    imgui.SameLine();
-    imgui.TextDisabled('(?)');
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip(
-            'Wildskeeper Reive Statistics\n'
-            .. '------------------------------\n'
-            .. 'Loot from Naakual boss kills.\n\n'
-            .. 'Detection: Reive Mark buff (511)\n'
-            .. '+ Naakual boss defeat.\n\n'
-            .. 'Items delivered directly to inventory\n'
-            .. 'via Event 2007 (no treasure pool).\n\n'
-            .. 'All items are auto-obtained (won=1).');
-    end
-    imgui.SameLine();
-    if imgui.RadioButton('Domain Inv.', stats_category == 6) then
-        stats_category = 6;
-        reset_stats_filter(11);
-    end
-    imgui.SameLine();
-    imgui.TextDisabled('(?)');
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip(
-            'Domain Invasion Statistics\n'
-            .. '------------------------------\n'
-            .. 'Kills during Domain Invasion events\n'
-            .. 'in Escha zones.\n\n'
-            .. 'Detection: Elvorseal buff (603)\n'
-            .. 'in Escha Zi\'Tah/Ru\'Aun/Reisenjima.\n\n'
-            .. 'Uses normal treasure pool for drops.');
-    end
-
-    -- Row 2: Sub-filter radio buttons (Battlefields: All/BCNM/HTBF, Instances: Dynamis)
+    -- Row 2: Sub-filter (Battlefields: radio, Instances: combo, Events: radio)
     if (stats_category == 1) then
         -- Battlefields: All | BCNM | HTBF
         if imgui.RadioButton('All##bf', stats_source_filter == 8) then
@@ -1242,12 +1224,41 @@ local function render_statistics()
             reset_stats_filter(3);
         end
     elseif (stats_category == 2) then
-        -- Instances: Dynamis only for now; Ambuscade/Omen/Sortie are WIP
-        if imgui.RadioButton('Dynamis', stats_source_filter == 7) then
-            reset_stats_filter(7);
+        -- Instances: combo dropdown (14 types + All)
+        stats_inst_idx[1] = INSTANCE_SF_TO_IDX[stats_source_filter] or 0;
+        imgui.PushItemWidth(200);
+        if imgui.Combo('##stats_inst', stats_inst_idx, INSTANCE_COMBO_STR) then
+            local sf = INSTANCE_COMBO_SF[stats_inst_idx[1] + 1];
+            if (sf ~= nil) then
+                reset_stats_filter(sf);
+            end
+        end
+        imgui.PopItemWidth();
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Select an instance content type to view statistics.');
+        end
+    elseif (stats_category == 3) then
+        -- Events: Voidwatch | Domain Inv. | Wildskeeper
+        if imgui.RadioButton('Voidwatch', stats_source_filter == 10) then
+            reset_stats_filter(10);
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Riftworn Pyxis loot from VW NM kills.\nDetected via Voidwatcher buff (475).');
         end
         imgui.SameLine();
-        imgui.TextDisabled('Ambuscade / Omen / Sortie (WIP)');
+        if imgui.RadioButton('Domain Inv.', stats_source_filter == 11) then
+            reset_stats_filter(11);
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Kills during Domain Invasion in Escha zones.\nDetected via Elvorseal buff (603).');
+        end
+        imgui.SameLine();
+        if imgui.RadioButton('Wildskeeper', stats_source_filter == 12) then
+            reset_stats_filter(12);
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Naakual boss kills in Wildskeeper Reives.\nDetected via Reive Mark buff (511).');
+        end
     end
 
     -- Row 3: Zone/battlefield filter combo
@@ -1288,6 +1299,9 @@ local function render_statistics()
         stats_cache_dirty = true;
     end
     imgui.PopItemWidth();
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Select a zone or battlefield to view drop statistics.');
+    end
 
     imgui.Separator();
 
@@ -1346,7 +1360,7 @@ local function render_statistics()
 
     -- BCNM view:   Battlefield | Zone | Lv Cap     | Runs  | Unique Items | Avg Drops
     -- HTBF view:   Battlefield | Zone | Difficulty | Runs  | Unique Items | Avg Drops
-    -- All BF view: Battlefield | Zone | Runs       | Unique Items | Avg Drops | (empty)
+    -- All BF view: Battlefield | Zone | Lv Cap | Difficulty | Runs | Unique Items | Avg Drops
     -- Chest view:  Container   | Zone | Opens      | Items | Gil          | Failures
     -- Mob view:    Mob Name    | Zone | Kills      | Unique Items | Spawns | Avg Drops
     local num_cols = is_all_bf and 7 or 6;
@@ -1885,7 +1899,7 @@ local function apply_filters()
         zone_id = apply_zones[ef.zone_idx[1]].zone_id;
     end
 
-    -- Combo: 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6=Dynamis, 7=VW, 8=DI
+    -- Combo: 0=All, 1=Field, 2=Chest/Coffer, 3=AllBF, 4=BCNM, 5=HTBF, 6-22=content types
     -- Filters by content_type so BF mob kills are grouped with their content.
     local source_type = nil;
     local source_type_list = nil;
@@ -1913,6 +1927,34 @@ local function apply_filters()
         content_type = 'Domain Invasion';
     elseif (ef.source_idx[1] == 9) then
         content_type = 'Wildskeeper';
+    elseif (ef.source_idx[1] == 10) then
+        content_type = 'Omen';
+    elseif (ef.source_idx[1] == 11) then
+        content_type = 'Einherjar';
+    elseif (ef.source_idx[1] == 12) then
+        content_type = 'Nyzul';
+    elseif (ef.source_idx[1] == 13) then
+        content_type = 'Salvage';
+    elseif (ef.source_idx[1] == 14) then
+        content_type = 'Limbus';
+    elseif (ef.source_idx[1] == 15) then
+        content_type = 'Sortie';
+    elseif (ef.source_idx[1] == 16) then
+        content_type = 'Vagary';
+    elseif (ef.source_idx[1] == 17) then
+        content_type = 'Legion';
+    elseif (ef.source_idx[1] == 18) then
+        content_type = 'Assault';
+    elseif (ef.source_idx[1] == 19) then
+        content_type = 'Walk of Echoes';
+    elseif (ef.source_idx[1] == 20) then
+        content_type = 'Skirmish';
+    elseif (ef.source_idx[1] == 21) then
+        content_type = 'Meeble Burrows';
+    elseif (ef.source_idx[1] == 22) then
+        content_type = 'Odyssey';
+    elseif (ef.source_idx[1] == 23) then
+        content_type = 'Ambuscade';
     end
 
     local status = af_status_map[ef.status_idx[1]];
@@ -2102,12 +2144,12 @@ local function render_advanced_export_window()
             imgui.Text('Source:');
             imgui.SameLine(col2);
             imgui.PushItemWidth(w2);
-            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0Domain Invasion\0Wildskeeper\0\0') then
+            if imgui.Combo('##exp_source', ef.source_idx, 'All\0Field\0Chest/Coffer\0All BF\0BCNM\0HTBF\0Dynamis\0Voidwatch\0Domain Invasion\0Wildskeeper\0Omen\0Einherjar\0Nyzul\0Salvage\0Limbus\0Sortie\0Vagary\0Legion\0Assault\0Walk of Echoes\0Skirmish\0Meeble Burrows\0Odyssey\0Ambuscade\0\0') then
                 ef.auto_dirty = true;
             end
             imgui.PopItemWidth();
             if imgui.IsItemHovered() then
-                imgui.SetTooltip('Filter by content type.\nField = open-world mobs (no instances).\nAll BF = BCNM + HTBF combined.');
+                imgui.SetTooltip('Filter by content type.\nField = open-world mobs (no instances).\nAll BF = BCNM + HTBF combined.\nOther entries filter by specific content type.');
             end
 
             -- Row 2: Mob + Item
@@ -3453,14 +3495,14 @@ local function render_battlefield_drop_structure(result)
         imgui.TableNextColumn(); imgui.Text('Guaranteed drops:');
         imgui.TableNextColumn(); imgui.TextColored(COLOR_GREEN, tostring(#guaranteed));
         if imgui.IsItemHovered() then
-            imgui.SetTooltip('Items with 95%%%% or higher drop rate.\nThese drop on virtually every run.');
+            imgui.SetTooltip('Items with 95%% or higher drop rate.\nThese drop on virtually every run.');
         end
 
         imgui.TableNextRow();
         imgui.TableNextColumn(); imgui.Text('Variable drops:');
         imgui.TableNextColumn(); imgui.Text(tostring(#variable));
         if imgui.IsItemHovered() then
-            imgui.SetTooltip('Items with less than 95%%%% drop rate.\nThese are contested or low-chance slots.');
+            imgui.SetTooltip('Items with less than 95%% drop rate.\nThese are contested or low-chance slots.');
         end
 
         imgui.TableNextRow();
@@ -3549,7 +3591,7 @@ local function render_inferred_drop_table(result, kills)
             imgui.SameLine();
 
             -- Build inline item list: "ItemA (12.0%) | ItemB (8.0%)"
-            -- %%%% → string_format produces %% → ImGui printf displays %
+            -- %%%% → string_format produces %% → SetTooltip printf displays %
             local parts = {};
             for _, item in ipairs(items) do
                 parts[#parts + 1] = string_format('%s (%.1f%%%%)', item.item_name, item.rate * 100);
@@ -3591,7 +3633,7 @@ local function render_slot_analysis()
 
     -- Lazy init: pass db.conn to analysis once it's available
     if (not an.analysis_inited and db.conn ~= nil) then
-        analysis.init(db.conn);
+        analysis.init(db.conn, db.CONTENT_TYPE_MAP, db.INSTANCE_IN_SQL);
         an.analysis_inited = true;
     end
 
@@ -3608,7 +3650,7 @@ local function render_slot_analysis()
     imgui.SameLine();
     if imgui.RadioButton('Instances##an', an.category == 2) then
         an.category = 2;
-        reset_an_filter(7);  -- default to Dynamis (only supported instance)
+        reset_an_filter(9);  -- default to All Instances
     end
     imgui.SameLine();
     imgui.TextDisabled('(?)');
@@ -3622,13 +3664,13 @@ local function render_slot_analysis()
             .. 'your treasure pool (empty distant kills are invisible).\n\n'
             .. '  Field — Open-world mobs (excludes instance content)\n'
             .. '  Battlefields — BCNM (chest drops) and HTBF (direct drops)\n'
-            .. '  Instances — Dynamis (Omen/Ambuscade/Sortie WIP)\n\n'
-            .. 'Chest/Coffer and Voidwatch are not shown here —\n'
-            .. 'slot analysis requires treasure pool drops.\n'
+            .. '  Instances — 14 types (Dynamis, Omen, Sortie, Einherjar, etc.)\n\n'
+            .. 'Chest/Coffer and Events (VW/DI/WK) are not shown\n'
+            .. 'here — slot analysis requires treasure pool drops.\n'
             .. 'See the Statistics tab for those categories.');
     end
 
-    -- Row 2: Sub-filter radio buttons (Battlefields / Instances)
+    -- Row 2: Sub-filter (Battlefields: radio, Instances: combo)
     if (an.category == 1) then
         imgui.Spacing();
         if imgui.RadioButton('All BF##an', an.source_filter == 8) then reset_an_filter(8); end
@@ -3637,10 +3679,20 @@ local function render_slot_analysis()
         imgui.SameLine();
         if imgui.RadioButton('HTBF##an', an.source_filter == 3) then reset_an_filter(3); end
     elseif (an.category == 2) then
+        -- Instances: combo dropdown (14 types + All)
         imgui.Spacing();
-        if imgui.RadioButton('Dynamis##an', an.source_filter == 7) then reset_an_filter(7); end
-        imgui.SameLine();
-        imgui.TextDisabled('Ambuscade / Omen / Sortie (WIP)');
+        an.inst_idx[1] = INSTANCE_SF_TO_IDX[an.source_filter] or 0;
+        imgui.PushItemWidth(200);
+        if imgui.Combo('##an_inst', an.inst_idx, INSTANCE_COMBO_STR) then
+            local sf = INSTANCE_COMBO_SF[an.inst_idx[1] + 1];
+            if (sf ~= nil) then
+                reset_an_filter(sf);
+            end
+        end
+        imgui.PopItemWidth();
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Select an instance content type for slot analysis.');
+        end
     end
 
     imgui.Spacing();
@@ -3653,7 +3705,7 @@ local function render_slot_analysis()
         if (idx == 0) then
             an.zone_filter = -1;
             an.name_filter = nil;
-            an.mob_filter = nil;
+            an.mob_filter  = nil;
             an.mob_level_cap = nil;
             an.effective_sf = nil;
             an.result = nil;
@@ -3669,6 +3721,9 @@ local function render_slot_analysis()
             an.mob_stats = nil;
         end
         an.cache_dirty = true;
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Select a zone or battlefield to analyze.');
     end
 
     -- BCNM/HTBF/All BF zone combo = battlefield; others need mob combo
@@ -3705,6 +3760,9 @@ local function render_slot_analysis()
                     an.mob_stats = nil;
                 end
                 an.cache_dirty = true;
+            end
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Select a mob to analyze its drop slots.');
             end
         else
             -- BCNM/HTBF: mob_filter is the battlefield name from zone combo
@@ -3762,7 +3820,7 @@ local function render_slot_analysis()
     end
 
     -- Scrollable content area for analysis results
-    imgui.BeginChild('##an_scroll', { 0, 0 });
+    if imgui.BeginChild('##an_scroll', { 0, 0 }) then
 
     local is_bf = an.result.is_battlefield;
     local kw = is_bf and 'runs' or 'kills';
@@ -3914,6 +3972,7 @@ local function render_slot_analysis()
             render_inferred_drop_table(an.result, kills);
         end
     end
+    end -- BeginChild
 
     imgui.EndChild();
 end
@@ -4404,7 +4463,7 @@ local function render_th_advanced_window()
                                 if (item.th_value > 0) then
                                     imgui.Text('+' .. tostring(item.th_value));
                                     if imgui.IsItemHovered() then
-                                        imgui.SetTooltip('Intrinsic TH+%d from this item.', item.th_value);
+                                        imgui.SetTooltip(string_format('Intrinsic TH+%d from this item.', item.th_value));
                                     end
                                 else
                                     imgui.TextDisabled('aug');
@@ -4452,6 +4511,7 @@ end
 local settings_header_color = { 1.0, 0.65, 0.26, 1.0 };
 
 local function render_settings_tab()
+    if (s == nil) then return; end
     imgui.TextColored(settings_header_color, 'Live Feed');
     imgui.Separator();
 
@@ -4716,7 +4776,7 @@ local function render_compact()
                             if (mph ~= nil and mph >= 0) then
                                 phase_label = tracker.get_moon_phase_label(mph);
                             end
-                            tip = tip .. '\nMoon: ' .. tostring(math.floor(mp)) .. '% ' .. phase_label;
+                            tip = tip .. '\nMoon: ' .. tostring(math.floor(mp)) .. '%% ' .. phase_label;
                         end
                         local w = tonumber(drop.weather);
                         if (w ~= nil and w >= 0) then
@@ -4902,6 +4962,9 @@ local function render_compact()
     end
     imgui.End();
     end); -- pcall: ensures PopStyleColor runs even on error
+    if (not compact_ok) then
+        print(chat.header('lootscope'):append(chat.error('Compact render error: ' .. tostring(compact_err))));
+    end
     imgui.PopStyleColor(#compact_style_color_ids);
 end
 
@@ -5101,7 +5164,6 @@ function ui.render()
     db.stats_dirty = false;
     db.kills_dirty = false;
     db.drops_dirty = false;
-    db.chest_events_dirty = false;
 end
 
 -------------------------------------------------------------------------------

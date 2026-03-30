@@ -1,12 +1,14 @@
 --[[
-    LootScope v1.3.1 - Loot Drop Tracker for Ashita v4
+    LootScope v1.4.0 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
 
-    v1.3.1: Wildskeeper Reive loot tracking, find_pet_owner forward-ref fix.
+    v1.4.0: 14 instance content types, Odyssey source-zone tracking, UI refactor.
+    v1.3.3: Walk of Echoes HTBF tracking fix, CSV moon percent rounding.
+    v1.3.2: Wildskeeper Reive loot tracking, find_pet_owner forward-ref fix.
     v1.3.0: TH gear estimation, HTBF fallback detection, Domain Invasion,
     TH Management UI with job trait profiles, code quality improvements.
     v1.2.1: VW bug fixes - consecutive cycle detection, relinquish
@@ -31,12 +33,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.3.1';
+addon.version = '1.4.0';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -149,7 +151,7 @@ local function export_data()
             local source  = tracker.get_source_label(kill.source_type, kill.bf_difficulty);
             local weekday = tracker.get_weekday_label(kill.vana_weekday);
             local vh      = (kill.vana_hour ~= nil and kill.vana_hour >= 0) and string.format('%02d:00', kill.vana_hour) or '';
-            local mp      = (kill.moon_percent ~= nil and kill.moon_percent >= 0) and tostring(kill.moon_percent) or '';
+            local mp      = (kill.moon_percent ~= nil and kill.moon_percent >= 0) and tostring(math.floor(kill.moon_percent)) or '';
             local phase   = (kill.moon_phase ~= nil and kill.moon_phase >= 0) and tracker.get_moon_phase_label(kill.moon_phase) or '';
             local th_act  = tracker.get_action_type_label(kill.th_action_type);
             local weather = (kill.weather ~= nil and kill.weather >= 0) and tracker.get_weather_label(kill.weather) or '';
@@ -192,10 +194,11 @@ local function export_data()
             end
         end);
 
-        -- Append chest events (failures + gil) as separate rows
+        -- Append chest events (failures + gil) as separate section with its own schema
         local chest_events = db.get_recent_chest_events(10000);
         if (#chest_events > 0) then
             f:write('\n');
+            f:write('# --- Chest/Coffer Events (separate schema - 13 columns) ---\n');
             f:write('Chest Event ID,Date,Time,Container,Result,Zone,Zone ID,Gil,');
             f:write('Vana Day,Vana Hour,Moon Phase,Moon %,Weather\n');
             for _, ce in ipairs(chest_events) do
@@ -206,7 +209,7 @@ local function export_data()
                 local result = tracker.get_chest_result_label(ce.result);
                 local weekday = tracker.get_weekday_label(ce.vana_weekday);
                 local vh = (ce.vana_hour ~= nil and ce.vana_hour >= 0) and string.format('%02d:00', ce.vana_hour) or '';
-                local mp = (ce.moon_percent ~= nil and ce.moon_percent >= 0) and tostring(ce.moon_percent) or '';
+                local mp = (ce.moon_percent ~= nil and ce.moon_percent >= 0) and tostring(math.floor(ce.moon_percent)) or '';
                 local phase = (ce.moon_phase ~= nil and ce.moon_phase >= 0) and tracker.get_moon_phase_label(ce.moon_phase) or '';
                 local weather = (ce.weather ~= nil and ce.weather >= 0) and tracker.get_weather_label(ce.weather) or '';
                 local row = {
@@ -276,7 +279,7 @@ local function export_filtered_data()
             local source  = tracker.get_source_label(row.source_type, row.bf_difficulty);
             local weekday = tracker.get_weekday_label(row.vana_weekday);
             local vh      = (row.vana_hour ~= nil and row.vana_hour >= 0) and string.format('%02d:00', row.vana_hour) or '';
-            local mp      = (row.moon_percent ~= nil and row.moon_percent >= 0) and tostring(row.moon_percent) or '';
+            local mp      = (row.moon_percent ~= nil and row.moon_percent >= 0) and tostring(math.floor(row.moon_percent)) or '';
             local phase   = (row.moon_phase ~= nil and row.moon_phase >= 0) and tracker.get_moon_phase_label(row.moon_phase) or '';
             local drop_time = (row.drop_timestamp and row.drop_timestamp > 0) and os.date('%H:%M:%S', row.drop_timestamp) or '';
             local th_act  = tracker.get_action_type_label(row.th_action_type);
@@ -421,8 +424,18 @@ ashita.events.register('load', 'lootscope_load', function()
     if (addon_path ~= '') then
         local th_ok, th_err = pcall(db.init_th_items, addon_path);
         if (not th_ok) then
-            msg_error('TH items DB failed: ' .. tostring(th_err));
+            msg_error('TH items DB failed: ' .. tostring(th_err) .. '. TH gear estimation will be unavailable.');
+        elseif (db._th_init_failed) then
+            msg_error((db._th_init_error or 'TH database init failed') .. '. TH gear estimation will be unavailable.');
         end
+    end
+
+    -- Log optional module degradation (following ZoneLines pattern: message for optional, error for critical)
+    if (not tracker.has_datreader) then
+        msg('DAT reader unavailable - HTBF battlefield names will not be resolved.');
+    end
+    if (not tracker.has_itemdata) then
+        msg('itemdata library unavailable - TH augment parsing will be limited.');
     end
 
     if (not s.show_on_load) then
@@ -671,22 +684,27 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
 
     -- 0x0034: GP_SERV_COMMAND_EVENTNUM (Voidwatch Pyxis loot detection)
     if (e.id == 0x0034) then
-        safe_call(tracker.handle_event_begin, e.data_modified, '0x034');
+        safe_call(tracker.handle_event_begin, e.data_modified, '0x0034');
     end
 
     -- 0x001F: GP_SERV_COMMAND_ITEM_LIST (Voidwatch stackable item delivery)
     if (e.id == 0x001F) then
-        safe_call(tracker.handle_item_assign, e.data_modified, '0x01F');
+        safe_call(tracker.handle_item_assign, e.data_modified, '0x001F');
     end
 
     -- 0x0020: GP_SERV_COMMAND_ITEM_ATTR (Voidwatch equipment/augmented item delivery)
     if (e.id == 0x0020) then
-        safe_call(tracker.handle_item_full_info, e.data_modified, '0x020');
+        safe_call(tracker.handle_item_full_info, e.data_modified, '0x0020');
     end
 
     -- 0x0050: Equipment Change (TH gear estimation — recalculate on gear swap)
     if (e.id == 0x0050) then
-        safe_call(tracker.handle_equipment_change, e.data_modified, '0x050');
+        safe_call(tracker.handle_equipment_change, e.data_modified, '0x0050');
+    end
+
+    -- 0x000E: NPC Entity Update (Odyssey fallback detection via instance IDs)
+    if (e.id == 0x000E) then
+        safe_call(tracker.handle_npc_update, e.data_modified, '0x000E');
     end
 end);
 
@@ -696,12 +714,12 @@ end);
 ashita.events.register('packet_out', 'lootscope_packet_out', function(e)
     -- 0x001A: GP_CLI_COMMAND_ACTION (chest/NPC interaction pre-identification)
     if (e.id == 0x001A) then
-        safe_call(tracker.handle_outgoing_action, e.data_modified, '0x1A out');
+        safe_call(tracker.handle_outgoing_action, e.data_modified, '0x001A out');
     end
 
     -- 0x005B: GP_CLI_COMMAND_EVENTEND (Voidwatch Pyxis close / relinquish all)
     if (e.id == 0x005B) then
-        safe_call(tracker.handle_event_end, e.data_modified, '0x5B out');
+        safe_call(tracker.handle_event_end, e.data_modified, '0x005B out');
     end
 end);
 
@@ -736,8 +754,7 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
 
     if (ui.settings_dirty) then
         ui.settings_dirty = false;
-        safe_frame_call(ui.sync_settings, 'sync_settings');
-        safe_frame_call(settings.save, 'settings_save');
+        safe_frame_call(function() ui.sync_settings(); settings.save(); end, 'sync_and_save');
     end
 
     if (ui.export_requested) then

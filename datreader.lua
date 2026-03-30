@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.1 - Zone Dialog DAT Reader
+    LootScope v1.4.0 - Zone Dialog DAT Reader
     Reads zone dialog DAT files to resolve HTBF battlefield names from
     the "Entering the battlefield for..." template strings.
 
@@ -8,15 +8,15 @@
       - Zones 256+:   zone_id + 85335
 
     The dialog DATs use the d_msg binary format:
-      Header: 8-byte magic (0x64_5F_6D_73_67_00_00_00 = "d_msg\0\0\0")
-      Then: table_offset(uint32), entry_size(uint32), data_size(uint32), entry_count(uint32)
+      Header (32 bytes): 0-7: magic "d_msg\0\0\0", 8-11: flags,
+        12-15: data_size, 16-19: table_size, 20-23: entry_count, 24-31: reserved
       Entries: offset/length pairs pointing into string data block.
       Strings are null-terminated, may contain battlefield name templates like:
         [Name1/Name2/Name3]
       Indexed by bit position from 0x005C packet's num[1].
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 require 'common';
@@ -56,14 +56,15 @@ local function read_dat_file(file_path)
         return nil;
     end
 
-    C.fseek(f, 0, 2);  -- SEEK_END
+    local SEEK_SET, SEEK_END = 0, 2;
+    C.fseek(f, 0, SEEK_END);
     local size = C.ftell(f);
     if (size <= 0) then
         C.fclose(f);
         return nil;
     end
 
-    C.fseek(f, 0, 0);  -- SEEK_SET
+    C.fseek(f, 0, SEEK_SET);
     local buf = ffi.new('uint8_t[?]', size);
     local read = C.fread(buf, 1, size, f);
     C.fclose(f);
@@ -86,13 +87,7 @@ local function read_u32(data, offset)
 end
 
 -------------------------------------------------------------------------------
--- Parse d_msg format zone dialog DAT
---
--- d_msg header (32 bytes):
---   0-7: magic "d_msg\0\0\0", 8-11: flags, 12-15: data_size,
---   16-19: table_size, 20-23: entry_count, 24-31: reserved
--- Entry table: entry_count * 8 bytes (offset + flags per entry)
--- String data: null-terminated, zone dialogs typically unencrypted
+-- Parse d_msg format zone dialog DAT (see file header for format details)
 -------------------------------------------------------------------------------
 
 local function parse_d_msg(data)
@@ -104,8 +99,8 @@ local function parse_d_msg(data)
         return nil;
     end
 
-    local data_size   = read_u32(data, 12);
-    local table_size  = read_u32(data, 16);
+    local data_size   = read_u32(data, 12);  -- read for corruption check
+    local table_size  = read_u32(data, 16);  -- read for corruption check
     local entry_count = read_u32(data, 20);
 
     if (data_size == nil or table_size == nil or entry_count == nil) then
@@ -128,7 +123,7 @@ local function parse_d_msg(data)
     for i = 0, entry_count - 1 do
         local entry_offset = entry_table_start + (i * 8);
         local str_offset = read_u32(data, entry_offset);
-        local str_flags  = read_u32(data, entry_offset + 4);
+        local str_flags  = read_u32(data, entry_offset + 4);  -- read for corruption check
 
         if (str_offset ~= nil and str_flags ~= nil) then
             local abs_offset = string_data_start + str_offset;

@@ -1,5 +1,66 @@
 # LootScope Changelog
 
+## v1.4.0
+
+### Added
+- **Omen content tracking**: Kills in Reisenjima Henge (zone 292) tagged as `content_type='Omen'`. Dual detection: zone ID + 0x0075 mode 0x030D. Available in Instances combo dropdown and Advanced Export filter. Boss equipment drops (Niqmaddu Ring, Iskur Gorget, Regal pieces, etc.) trackable via standard treasure pool.
+- **Einherjar content tracking**: Kills in Hazhalm Testing Grounds (zone 78) tagged as `content_type='Einherjar'`. Zone-ID detection (no 0x0075 fires). Armoury Crate drops (abjurations, Odin gear, synth materials) via treasure pool.
+- **Nyzul Isle content tracking**: Kills in Nyzul Isle (zone 77) tagged as `content_type='Nyzul'`. Covers both Investigation and Uncharted Area Survey. Vigil Weapons and boss armor via treasure pool.
+- **Salvage content tracking**: Kills in all 4 Remnants zones (73-76) tagged as `content_type='Salvage'`. Covers both Salvage (Lv75) and Salvage II (Lv99). Armor components, coin purses, Alexandrite via treasure pool.
+- **Limbus content tracking**: Kills in Temenos/Apollyon (zones 37-38) tagged as `content_type='Limbus'`. Covers original (private servers) and revamped (retail June 2025+). Ancient Beastcoins and appendages via treasure pool on original; unit currency on revamped.
+- **All Instances aggregate**: "All" option in Instances combo shows combined data across all 15 instance content types.
+- **Sortie content tracking**: Kills in Outer Ra'Kaznar [U2] (zone 133) tagged as `content_type='Sortie'`.
+- **Vagary content tracking**: Kills in Outer Ra'Kaznar [U1] (zone 275) tagged as `content_type='Vagary'`.
+- **Legion content tracking**: Kills in Maquette Abdhaljs-Legion A (zone 183) tagged as `content_type='Legion'`. Equipment, abjurations, crafting materials via treasure pool.
+- **Assault content tracking**: Kills in 6 ToAU Assault zones (55/56/60/63/66/69) tagged as `content_type='Assault'`. Ancient Lockbox items via treasure pool.
+- **Walk of Echoes content tracking**: Kills in Walk of Echoes (zone 182, original battlefields) tagged as `content_type='Walk of Echoes'`.
+- **Skirmish content tracking**: Kills in 3 [U] zones (259/264/271) tagged as `content_type='Skirmish'`. Also covers Delve fractures in same zones.
+- **Meeble Burrows content tracking**: Kills in Ghoyu's Reverie (zone 129) tagged as `content_type='Meeble Burrows'`. Level 5 boss drops via treasure pool.
+- **Odyssey content tracking**: Kills in Walk of Echoes P1/P2 (zones 279/298) when entered from Rabao (zone 247) tagged as `content_type='Odyssey'`. Source-zone tracking distinguishes Odyssey from WoE HTBFs sharing the same zones. NPC instance ID scan (IDs 1019-1024) provides addon reload resilience. Lustreless items (Scale/Hide/Wing), Sacred/High Kindred's Crests, fenrite, shadow geodes tracked via standard treasure pool.
+- **Ambuscade zone tagging**: Kills in Maquette Abdhaljs-Legion B (zone 287) tagged as `content_type='Ambuscade'`. Available in Advanced Export filter for categorization. Not shown in Statistics/Slot Analysis (currency content — Hallmarks/Gallantry, no item drops).
+- **Content type backfill migration**: Retroactively tags old kills in 13 instance zone groups recorded before v1.4.0. Runs once on DB open. Only touches kills with empty content_type in known exclusive zone IDs.
+- **Dynamic instance IN clause**: `db.INSTANCE_IN_SQL` pre-builds the SQL IN clause from `db.INSTANCE_CONTENT_TYPES` list (now 15 types). Replaces hardcoded IN clauses across db.lua and analysis.lua.
+
+### Fixed
+- **Distant kill content_type race condition**: When 0x00D2 (treasure pool) arrived before 0x0029 (defeat) for distant kills, the kill record was created without buff-based content_type detection (Voidwatch/Wildskeeper/Domain Invasion). `patch_kill_on_defeat()` now includes the same buff-check priority chain and updates content_type with a CASE WHEN guard (only fills empty, never overwrites existing).
+- **analysis.lua content_type_map scoping bug**: The local `content_type_map` was declared after `analysis.init()`, causing `init()` to write to a global instead of the local upvalue used by `build_kill_where()`. Moved declaration above `init()` for correct upvalue capture. No runtime impact (hardcoded fallback had identical data) but could cause silent divergence if maps ever differed.
+- **analysis.lua stale instance_in_sql fallback**: The hardcoded fallback string had only 8 of 15 instance content types. Updated to match all 15 entries in `db.INSTANCE_CONTENT_TYPES`.
+
+### Changed
+- **Statistics/Slot Analysis UI refactored**: Reduced from 7 top-level categories to 5: Field, Battlefields, Instances, Events, Chest/Coffer. Voidwatch/Domain Invasion/Wildskeeper moved under new "Events" category with radio sub-filter. Instance sub-filter replaced from 15 radio buttons with a combo dropdown (cleaner, scales to any number of types). Slot Analysis mirrors the combo dropdown pattern.
+- **Instances default to "All"**: Statistics and Slot Analysis Instances category now defaults to "All Instances" (sf=9) instead of Dynamis-only.
+- **INSTANCE_ZONES table**: Populated with 24 zone IDs across 15 content types.
+
+## v1.3.3
+
+### Fixed
+- **Walk of Echoes HTBF tracking**: HTBFs entered from Selbina (A Stygian Pact/Odin, Divine Interference/Alexander, Champion of the Dawn/Cait Sith, Maiden of the Dusk/Lilith) were not tracked as battlefields. Three issues: (1) The "Entering" chat uses a different format ("Entering ★X." vs "Entering the battlefield for X!") that the parser didn't match, (2) zone change to WoE P1/P2 cleared all battlefield state before kills could be recorded, (3) 0x0075 fires with non-0x0001 mode values (0x0368, 0x036B) that mapped to 'Unknown Battlefield'. Fix: added "Entering ★X." chat pattern with pending state that survives the zone change, 0x005C num[0]=1 difficulty capture, and 0x0075 guard against overwriting restored classifications. Includes addon reload resilience via `check_battlefield_reconnect()`.
+- **CSV export moon percent floating-point noise**: Moon percent values in all three CSV export paths (full, chest, filtered) used raw `tostring()` which could produce values with excessive decimal places due to Lua double representation. Added `math.floor()` to match the existing UI display paths.
+- **Dynamis Divergence backfill migration**: Added zones 294-297 (Dynamis Divergence) to the content_type backfill migration. Old kills in Dyna-D recorded before zone-name detection was added are now retroactively tagged as 'Dynamis' on DB open.
+
+## v1.3.2
+
+### Fixed
+- **SetTooltip format corrected**: All `SetTooltip` calls use single-arg form. Ashita's `imgui.SetTooltip(text)` takes a single string (`SetTooltipV` is not implemented). The `%` character in tooltip strings is escaped as `%%` since SetTooltip processes printf internally.
+- **Settings tab nil guard**: `render_settings_tab()` accessed the settings table without a nil check, unlike all other tabs. Added early return guard.
+- **Compact mode error swallowed silently**: Errors inside compact mode's pcall wrapper were captured but never logged. Now prints the error message.
+- **`clone_th_profile` transaction safety**: Only transaction site in db.lua without pcall protection. Wrapped in pcall with ROLLBACK safety net on Lua error.
+- **`init_th_items` seed inserts not transactional**: ~35 individual INSERT statements during first-run profile seeding now wrapped in BEGIN/COMMIT for atomicity and performance.
+- **Dead `chest_events_dirty` flag**: Notification flag was set in 3 places and cleared in ui.lua but never read as a condition anywhere. Removed (the actual cache gate is `chest_events_cache_dirty`).
+- **Mob gil queue unbounded growth**: Added 50-entry safety cap on `mob_gil_queue` FIFO for extreme AoE scenarios where timeout cleanup alone may not fire.
+
+### Changed
+- **`content_type_map` deduplicated**: analysis.lua's local copy now initialized from `db.CONTENT_TYPE_MAP` via `analysis.init()` instead of maintaining a separate duplicate table.
+- **Settings sync+save atomic**: `ui.sync_settings()` and `settings.save()` combined into a single pcall so save cannot run with stale data if sync fails.
+- **`get_recent_chest_events` explicit columns**: Replaced `SELECT *` with explicit 12-column list matching the schema, preventing silent breakage on future schema changes.
+- **`find_recent_wildskeeper_kill` query style**: Converted from `step()`/`get_value()` to `nrows()` pattern for consistency with all other read queries.
+- **Redundant Poisson Binomial truncation removed**: Caller's pre-truncation to 30 items removed since `poisson_binomial_pmf()` already handles this internally.
+- **Packet error labels standardized**: All packet handler error labels normalized to 4-digit hex format (`0x0034`, `0x001A`, etc.).
+- **CSV export chest section separator**: Added `# --- Chest/Coffer Events (separate schema - 13 columns) ---` comment line before the chest data section in full exports.
+- **`BeginChild` return value checked**: Slot Analysis scrollable area now checks `BeginChild` return value for consistency with other call sites.
+- **datreader.lua cleanup**: Deduplicated header comment, added named SEEK_SET/SEEK_END constants, clarified corruption-check reads with comments.
+- **Error handling improvements**: TH database open/schema failures now report specific error messages to the user ("TH gear estimation will be unavailable"). Tracker sub-module load failures (datreader, itemdata) now log degradation messages on load. Compact render error message format fixed to match addon-wide conventions (lowercase header, `:append()` chaining).
+
 ## v1.3.1
 
 ### Added

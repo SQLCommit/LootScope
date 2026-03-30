@@ -1,14 +1,15 @@
 --[[
-    LootScope v1.3.1 - Slot Analysis Engine
+    LootScope v1.4.0 - Slot Analysis Engine
     Statistical computation for drop slot probability analysis.
     Provides Wilson score confidence intervals, Poisson Binomial
     distribution, co-occurrence testing, and shared slot detection.
 
-    Accepts db.conn via analysis.init(db_conn), owns all analysis SQL,
+    Accepts db.conn and content_type_map via analysis.init(db_conn, ct_map),
+    owns all analysis SQL,
     and returns pre-computed result tables for ui.lua to render.
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 require 'common';
@@ -34,8 +35,14 @@ analysis.MIN_KILLS_COOCCURRENCE = MIN_KILLS_COOCCURRENCE;
 local conn = nil;
 local cache = {};  -- keyed by composite filter string
 
-function analysis.init(db_conn)
+-- Fallbacks used if analysis.init() is never called. Must match db.lua's maps exactly.
+local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper', [13] = 'Einherjar', [14] = 'Nyzul', [15] = 'Salvage', [16] = 'Limbus', [17] = 'Vagary', [18] = 'Legion', [19] = 'Assault', [20] = 'Walk of Echoes', [21] = 'Skirmish', [22] = 'Meeble Burrows', [23] = 'Odyssey' };
+local instance_in_sql = "('Omen', 'Ambuscade', 'Sortie', 'Dynamis', 'Einherjar', 'Nyzul', 'Salvage', 'Limbus', 'Vagary', 'Legion', 'Assault', 'Walk of Echoes', 'Skirmish', 'Meeble Burrows', 'Odyssey')";
+
+function analysis.init(db_conn, ct_map, inst_sql)
     conn = db_conn;
+    if (ct_map ~= nil) then content_type_map = ct_map; end
+    if (inst_sql ~= nil) then instance_in_sql = inst_sql; end
 end
 
 function analysis.invalidate()
@@ -129,9 +136,8 @@ end
 -- SQL WHERE Clause Builder
 -- Replicates db.lua's filter logic for all source_filter values.
 -- Returns (where_clause, bind_params_array) for kills table alias 'k'.
--- NOTE: must stay in sync with db.CONTENT_TYPE_MAP in db.lua.
+-- content_type_map and instance_in_sql declared above init() for correct upvalue capture.
 -------------------------------------------------------------------------------
-local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper' };
 
 local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
     local parts = {};
@@ -162,7 +168,7 @@ local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
             parts[#parts + 1] = 'k.level_cap IS NULL';
         end
     elseif (content_type_map[source_filter] ~= nil) then
-        -- Content types (Omen/Ambuscade/Sortie/Dynamis/Voidwatch/Domain Invasion)
+        -- Content types (all entries in content_type_map: instances + events)
         local ct = content_type_map[source_filter];
         parts[#parts + 1] = 'k.mob_name = ?';
         params[#params + 1] = mob_name;
@@ -188,7 +194,7 @@ local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
         params[#params + 1] = mob_name;
         parts[#parts + 1] = 'k.zone_id = ?';
         params[#params + 1] = zone_id;
-        parts[#parts + 1] = "COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+        parts[#parts + 1] = "COALESCE(k.content_type, '') IN " .. instance_in_sql;
     elseif (source_filter == 1) then
         -- Chest/Coffer: must match get_all_mob_stats(1) which filters source_type IN (1,2)
         parts[#parts + 1] = 'k.mob_name = ?';
@@ -372,7 +378,7 @@ end
 --- Compute all slot analysis statistics for a given mob.
 -- @param mob_name string mob name (or battlefield name for BCNM/HTBF)
 -- @param zone_id number zone ID
--- @param source_filter number filter index (0-9)
+-- @param source_filter number filter index (0-23)
 -- @param level_cap number|nil level cap or bf_difficulty
 -- @param mob_stats table from db.get_mob_stats() — reused for base counts
 -- @return result table with all computed statistics
@@ -456,20 +462,8 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         rate_sum = rate_sum + item_rates[i];
     end
 
-    -- Truncate to top 30 rates for Poisson Binomial (O(n^2) cap)
+    -- poisson_binomial_pmf() internally truncates to top 30 rates (O(n^2) cap)
     local pmf_rates = item_rates;
-    if (#item_rates > 30) then
-        pmf_rates = {};
-        for i = 1, #item_rates do
-            pmf_rates[i] = item_rates[i];
-        end
-        table.sort(pmf_rates, function(a, b) return a > b; end);
-        local truncated = {};
-        for i = 1, 30 do
-            truncated[i] = pmf_rates[i];
-        end
-        pmf_rates = truncated;
-    end
 
     local empty_expected = expected_empty_rate(pmf_rates);
 
@@ -544,12 +538,9 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
     ---------------------------------------------------------------------------
     local cooccurrence = T{};
     local shared_slot_candidates = T{};
-    local order_raw_cache = nil;
-
     if (kills >= 2) then  -- need at least 2 kills for co-occurrence to be meaningful
         local co_raw = query_cooccurrence(mob_name, zone_id, source_filter, level_cap);
-        order_raw_cache = query_drop_ordering(mob_name, zone_id, source_filter, level_cap);
-        local order_raw = order_raw_cache;
+        local order_raw = query_drop_ordering(mob_name, zone_id, source_filter, level_cap);
 
         -- Build ordering lookup: "itemA_itemB" -> order data
         local order_map = {};

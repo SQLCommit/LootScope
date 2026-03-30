@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.3.1 - SQLite3 Persistence Layer
+    LootScope v1.4.0 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +10,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.3.1
+    Version: 1.4.0
 ]]--
 
 require 'common';
@@ -23,7 +23,47 @@ db.conn = nil;
 db.path = nil;
 
 -- Source filter → content type name mapping (shared across db.lua and analysis.lua)
-db.CONTENT_TYPE_MAP = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper' };
+db.CONTENT_TYPE_MAP = {
+    [4]  = 'Omen',
+    [5]  = 'Ambuscade',       -- WIP: no item drops, detection disabled
+    [6]  = 'Sortie',
+    [7]  = 'Dynamis',
+    [10] = 'Voidwatch',
+    [11] = 'Domain Invasion',
+    [12] = 'Wildskeeper',
+    [13] = 'Einherjar',
+    [14] = 'Nyzul',
+    [15] = 'Salvage',
+    [16] = 'Limbus',
+    [17] = 'Vagary',
+    [18] = 'Legion',
+    [19] = 'Assault',
+    [20] = 'Walk of Echoes',
+    [21] = 'Skirmish',
+    [22] = 'Meeble Burrows',
+    [23] = 'Odyssey',
+};
+
+-- Instance content types for "All Instances" aggregate (source_filter 9).
+-- Includes all zone/packet-detected instanced content.
+-- Excludes buff-detected types: Voidwatch (10), Domain Invasion (11), Wildskeeper (12).
+db.INSTANCE_CONTENT_TYPES = {
+    'Omen', 'Ambuscade', 'Sortie', 'Dynamis',
+    'Einherjar', 'Nyzul', 'Salvage', 'Limbus',
+    'Vagary', 'Legion', 'Assault', 'Walk of Echoes',
+    'Skirmish', 'Meeble Burrows', 'Odyssey',
+};
+
+-- Pre-built SQL IN clause for "All Instances" queries.
+local function build_instance_in_clause()
+    local parts = {};
+    for _, ct in ipairs(db.INSTANCE_CONTENT_TYPES) do
+        parts[#parts + 1] = "'" .. ct .. "'";
+    end
+    return '(' .. table.concat(parts, ', ') .. ')';
+end
+db.INSTANCE_IN_SQL = build_instance_in_clause();
+
 db.char_name = nil;  -- character this DB belongs to
 db._init_failed = false;  -- true if DB open failed (one-shot warning, skip all writes)
 
@@ -66,7 +106,6 @@ db.spawn_item_cache = {};
 
 db.chest_events_cache = nil;
 db.chest_events_limit = 0;
-db.chest_events_dirty = true;
 db.chest_stats_cache = nil;
 
 -------------------------------------------------------------------------------
@@ -240,15 +279,43 @@ function db.init(base_path, char_folder)
             db.conn:exec("UPDATE kills SET content_type = 'Dynamis' WHERE content_type = 'Dynamis [D]';");
         end
         local needs_dyn_backfill = false;
-        for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (39,40,41,42,134,135,185,186,187,188) LIMIT 1") do
+        for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (39,40,41,42,134,135,185,186,187,188,294,295,296,297) LIMIT 1") do
             needs_dyn_backfill = true;
         end
         if (needs_dyn_backfill) then
             db.conn:exec([[
                 UPDATE kills SET content_type = 'Dynamis'
                 WHERE COALESCE(content_type, '') = ''
-                  AND zone_id IN (39, 40, 41, 42, 134, 135, 185, 186, 187, 188);
+                  AND zone_id IN (39, 40, 41, 42, 134, 135, 185, 186, 187, 188, 294, 295, 296, 297);
             ]]);
+        end
+
+        -- Migration: backfill content_type for instance zones added in v1.4.0.
+        -- Only touches kills with empty content_type in known exclusive zone IDs.
+        local instance_backfill = {
+            { 'Omen',           '292' },
+            { 'Einherjar',      '78' },
+            { 'Nyzul',          '77' },
+            { 'Salvage',        '73, 74, 75, 76' },
+            { 'Limbus',         '37, 38' },
+            { 'Sortie',         '133' },
+            { 'Vagary',         '275' },
+            { 'Legion',         '183' },
+            { 'Ambuscade',      '287' },
+            { 'Assault',        '55, 56, 60, 63, 66, 69' },
+            { 'Walk of Echoes', '182' },
+            { 'Skirmish',       '259, 264, 271' },
+            { 'Meeble Burrows', '129' },
+        };
+        for _, entry in ipairs(instance_backfill) do
+            local ct, zones = entry[1], entry[2];
+            local needs = false;
+            for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (" .. zones .. ") LIMIT 1") do
+                needs = true;
+            end
+            if (needs) then
+                db.conn:exec("UPDATE kills SET content_type = '" .. ct .. "' WHERE COALESCE(content_type, '') = '' AND zone_id IN (" .. zones .. ");");
+            end
         end
 
         -- Migration: composite idx_drops_kill_item (subsumes old idx_drops_kill)
@@ -344,7 +411,6 @@ local function invalidate_all()
     db.recent_feed_dirty = true;
     db.mob_stats_dirty = true;
     db.all_mob_stats_dirty = true;
-    db.chest_events_dirty = true;
     db.chest_events_cache_dirty = true;
     db.chest_stats_dirty = true;
     db.htbf_breakdown_dirty = true;
@@ -528,11 +594,20 @@ function db.patch_kill_on_defeat(kill_id, info)
 
     begin_batch();
 
+    -- Update content_type only if the patch provides one and the existing record is empty.
+    -- This handles the race where 0x00D2 created the kill before 0x0029 could detect
+    -- buff-based content types (Voidwatch, Wildskeeper, Domain Invasion).
+    local ct = info.content_type or '';
+    local ct_clause = '';
+    if (ct ~= '') then
+        ct_clause = ", content_type = CASE WHEN COALESCE(content_type, '') = '' THEN '" .. ct .. "' ELSE content_type END";
+    end
+
     local stmt = db.conn:prepare([[
         UPDATE kills SET is_distant = 0,
             killer_id = ?, killer_name = ?,
             th_level = ?, th_action_type = ?, th_action_id = ?,
-            th_estimated = ?
+            th_estimated = ?]] .. ct_clause .. [[
         WHERE id = ? AND is_distant = 1
     ]]);
     if (stmt == nil) then maybe_commit(); return; end
@@ -626,7 +701,7 @@ end
 -------------------------------------------------------------------------------
 -- Kill Content Type Update (retroactive tagging)
 -- Currently unused — VW kills are tagged at defeat time via buff check.
--- Kept for future content types (Omen, Ambuscade, Sortie) that may need retroactive tagging.
+-- Kept for future content types (Ambuscade) that may need retroactive tagging.
 -------------------------------------------------------------------------------
 
 function db.update_kill_content_type(kill_id, content_type)
@@ -659,10 +734,10 @@ function db.find_recent_wildskeeper_kill(zone_id, max_age_seconds)
     );
     if (stmt == nil) then return nil; end
     stmt:bind_values(zone_id, cutoff);
-    local row = stmt:step();
     local result = nil;
-    if (row == sqlite3.ROW) then
-        result = { kill_id = stmt:get_value(0), mob_name = stmt:get_value(1) };
+    for row in stmt:nrows() do
+        result = { kill_id = row.id, mob_name = row.mob_name };
+        break;
     end
     stmt:finalize();
     return result;
@@ -925,7 +1000,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
             ORDER BY times_dropped DESC
         ]];
     elseif (is_all_inst) then
-        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') IN " .. db.INSTANCE_IN_SQL;
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
@@ -934,7 +1009,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                    SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')
+            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ]] .. db.INSTANCE_IN_SQL .. [[
             GROUP BY d.item_id
             ORDER BY times_dropped DESC
         ]];
@@ -1073,7 +1148,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                 gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND ' .. k_bf .. ' = ? AND k.zone_id = ? AND COALESCE(k.level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(k.bf_difficulty, 0) = ' .. tostring(bd);
                 gil_params = { mob_name, zone_id };
             elseif (is_all_inst) then
-                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN " .. db.INSTANCE_IN_SQL;
                 gil_params = { mob_name, zone_id };
             elseif (source_filter == 1) then
                 gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2)';
@@ -1190,7 +1265,7 @@ function db.get_all_mob_stats(source_filter)
     elseif (source_filter == 8) then
         where_clause = ' WHERE (k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0';
     elseif (source_filter == 9) then
-        where_clause = " WHERE COALESCE(k.content_type, '') IN ('Omen', 'Ambuscade', 'Sortie', 'Dynamis')";
+        where_clause = " WHERE COALESCE(k.content_type, '') IN " .. db.INSTANCE_IN_SQL;
     end
 
     -- BCNM/HTBF view: group by battlefield name; gil excluded from drop counts
@@ -2056,7 +2131,6 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
     local rowid = db.conn:last_insert_rowid();
 
     db._chest_event_count = db._chest_event_count + 1;
-    db.chest_events_dirty = true;
     db.chest_events_cache_dirty = true;
     db.chest_stats_dirty = true;
     db.chest_events_cache = nil;
@@ -2089,7 +2163,9 @@ function db.get_recent_chest_events(limit)
 
     local results = T{};
     local stmt = db.conn:prepare([[
-        SELECT * FROM chest_events ORDER BY id DESC LIMIT ?
+        SELECT id, zone_id, zone_name, container_type, result, gil_amount,
+               vana_weekday, vana_hour, moon_phase, moon_percent, weather, timestamp
+        FROM chest_events ORDER BY id DESC LIMIT ?
     ]]);
     if (stmt == nil) then return results; end
     stmt:bind_values(limit);
@@ -2435,6 +2511,7 @@ function db.init_th_items(addon_path)
     end);
     if (not open_ok or db.th_conn == nil) then
         db._th_init_failed = true;
+        db._th_init_error = 'TH database failed to open: ' .. tostring(open_err);
         return false;
     end
 
@@ -2490,6 +2567,7 @@ function db.init_th_items(addon_path)
             count = row.c;
         end
         if (count == 0) then
+            db.th_conn:exec('BEGIN TRANSACTION');
             db.th_conn:exec("INSERT INTO th_profiles (name, created_at) VALUES ('Retail', " .. tostring(os_time()) .. ");");
             local profile_id = db.th_conn:last_insert_rowid();
 
@@ -2512,11 +2590,13 @@ function db.init_th_items(addon_path)
                 trait_stmt:reset();
             end
             trait_stmt:finalize();
+            db.th_conn:exec('COMMIT');
         end
     end);
 
     if (not schema_ok) then
         db._th_init_failed = true;
+        db._th_init_error = 'TH database schema failed: ' .. tostring(schema_err);
         pcall(function() db.th_conn:close(); end);
         db.th_conn = nil;
         return false;
@@ -2563,46 +2643,54 @@ end
 function db.clone_th_profile(source_id, new_name)
     if (db.th_conn == nil) then return nil; end
 
-    db.th_conn:exec('BEGIN TRANSACTION');
+    local ok, result = pcall(function()
+        db.th_conn:exec('BEGIN TRANSACTION');
 
-    local new_id = db.create_th_profile(new_name);
-    if (new_id == nil) then
-        db.th_conn:exec('ROLLBACK');
+        local new_id = db.create_th_profile(new_name);
+        if (new_id == nil) then
+            db.th_conn:exec('ROLLBACK');
+            return nil;
+        end
+
+        -- Clone items
+        local stmt = db.th_conn:prepare([[
+            INSERT INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
+            SELECT ?, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ?
+        ]]);
+        if (stmt ~= nil) then
+            stmt:bind_values(new_id, source_id);
+            local rc = stmt:step();
+            stmt:finalize();
+            if (rc ~= sqlite3.DONE) then
+                db.th_conn:exec('ROLLBACK');
+                return nil;
+            end
+        end
+
+        -- Clone traits
+        local trait_stmt = db.th_conn:prepare([[
+            INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
+            SELECT ?, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ?
+        ]]);
+        if (trait_stmt ~= nil) then
+            trait_stmt:bind_values(new_id, source_id);
+            local rc = trait_stmt:step();
+            trait_stmt:finalize();
+            if (rc ~= sqlite3.DONE) then
+                db.th_conn:exec('ROLLBACK');
+                return nil;
+            end
+        end
+
+        db.th_conn:exec('COMMIT');
+        return new_id;
+    end);
+
+    if (not ok) then
+        pcall(db.th_conn.exec, db.th_conn, 'ROLLBACK');
         return nil;
     end
-
-    -- Clone items
-    local stmt = db.th_conn:prepare([[
-        INSERT INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
-        SELECT ?, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ?
-    ]]);
-    if (stmt ~= nil) then
-        stmt:bind_values(new_id, source_id);
-        local rc = stmt:step();
-        stmt:finalize();
-        if (rc ~= sqlite3.DONE) then
-            db.th_conn:exec('ROLLBACK');
-            return nil;
-        end
-    end
-
-    -- Clone traits
-    local trait_stmt = db.th_conn:prepare([[
-        INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
-        SELECT ?, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ?
-    ]]);
-    if (trait_stmt ~= nil) then
-        trait_stmt:bind_values(new_id, source_id);
-        local rc = trait_stmt:step();
-        trait_stmt:finalize();
-        if (rc ~= sqlite3.DONE) then
-            db.th_conn:exec('ROLLBACK');
-            return nil;
-        end
-    end
-
-    db.th_conn:exec('COMMIT');
-    return new_id;
+    return result;
 end
 
 function db.delete_th_profile(profile_id)
