@@ -1,5 +1,10 @@
 # LootScope Changelog
 
+## v1.4.1
+
+### Fixed
+- **Sortie/Vagary/Legion/Ambuscade shared zone disambiguation**: Community/Packet Captures confirmed Sortie can use ALL three Ra'Kaznar [U] zones (133/275/189), not just U2. Ambuscade uses BOTH Maquette zones (183/287), not just 287. Removed incorrect zone-ID-only mappings from INSTANCE_ZONES. Now uses source-zone tracking (same pattern as Odyssey): Kamihr Drifts (267) → Sortie, Outer Ra'Kaznar (274) → Vagary, Rolanberry Fields (110) → Legion, Mhaura (249) → Ambuscade. Added zone 189 (Ra'Kaznar U3) to the shared set. Removed shared zones from backfill migration (can't retroactively disambiguate).
+
 ## v1.4.0
 
 ### Added

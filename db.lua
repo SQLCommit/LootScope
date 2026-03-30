@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.4.0 - SQLite3 Persistence Layer
+    LootScope v1.4.1 - SQLite3 Persistence Layer
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +10,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.4.0
+    Version: 1.4.1
 ]]--
 
 require 'common';
@@ -298,10 +298,8 @@ function db.init(base_path, char_folder)
             { 'Nyzul',          '77' },
             { 'Salvage',        '73, 74, 75, 76' },
             { 'Limbus',         '37, 38' },
-            { 'Sortie',         '133' },
-            { 'Vagary',         '275' },
-            { 'Legion',         '183' },
-            { 'Ambuscade',      '287' },
+            -- Sortie (133/275/189), Vagary (133/275/189), Legion (183), Ambuscade (183/287)
+            -- excluded from backfill — shared zones can't be disambiguated retroactively.
             { 'Assault',        '55, 56, 60, 63, 66, 69' },
             { 'Walk of Echoes', '182' },
             { 'Skirmish',       '259, 264, 271' },

@@ -1,10 +1,10 @@
 --[[
-    LootScope v1.4.0 - UI Module
+    LootScope v1.4.1 - UI Module
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.4.0
+    Version: 1.4.1
 ]]--
 
 require 'common';
@@ -1152,9 +1152,9 @@ local function render_statistics()
             .. '  Nyzul — Investigation + Uncharted Survey\n'
             .. '  Salvage — 4 Remnants (Salvage + Salvage II)\n'
             .. '  Limbus — Temenos + Apollyon\n'
-            .. '  Sortie — Outer Ra\'Kaznar [U2]\n'
-            .. '  Vagary — Outer Ra\'Kaznar [U1]\n'
-            .. '  Legion — Maquette Abdhaljs-Legion A\n'
+            .. '  Sortie — Ra\'Kaznar [U] (from Kamihr Drifts)\n'
+            .. '  Vagary — Ra\'Kaznar [U] (from Ra\'Kaznar overworld)\n'
+            .. '  Legion — Maquette Abdhaljs (from Rolanberry Fields)\n'
             .. '  Assault — 6 ToAU zones\n'
             .. '  WoE — Walk of Echoes (original)\n'
             .. '  Skirmish — 3 [U] zones (+ Delve fractures)\n'

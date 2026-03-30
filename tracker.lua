@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.4.0 - Packet Tracker
+    LootScope v1.4.1 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
     0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
@@ -7,7 +7,7 @@
     procs, content type, HTBF difficulty, and Voidwatch Pyxis loot.
 
     Author: SQLCommit
-    Version: 1.4.0
+    Version: 1.4.1
 ]]--
 
 require 'common';
@@ -380,7 +380,7 @@ end
 -- Odyssey (279/298) uses source-zone disambiguation, not this table.
 -------------------------------------------------------------------------------
 tracker.INSTANCE_ZONES = {
-    [287] = 'Ambuscade',         -- Maquette Abdhaljs-Legion B (currency only, but tagged for categorization)
+    -- [287] = 'Ambuscade' -- shared with Legion, uses source-zone disambiguation (v1.4.1)
     -- Odyssey: zones 279/298 shared with WoE HTBFs, detected via source-zone disambiguation (see check_zone)
     [292] = 'Omen',           -- Reisenjima Henge
     [78]  = 'Einherjar',      -- Hazhalm Testing Grounds
@@ -391,9 +391,9 @@ tracker.INSTANCE_ZONES = {
     [76]  = 'Salvage',        -- Silver Sea Remnants (Salvage + Salvage II)
     [37]  = 'Limbus',         -- Temenos
     [38]  = 'Limbus',         -- Apollyon
-    [133] = 'Sortie',         -- Outer Ra'Kaznar [U2]
-    [275] = 'Vagary',         -- Outer Ra'Kaznar [U1]
-    [183] = 'Legion',         -- Maquette Abdhaljs-Legion A
+    -- Sortie/Vagary (zones 133/275/189) and Legion/Ambuscade (zones 183/287)
+    -- use source-zone disambiguation in check_zone(), not INSTANCE_ZONES.
+    -- See v1.4.1 shared-zone tracking.
     [55]  = 'Assault',        -- Ilrusi Atoll
     [56]  = 'Assault',        -- Periqia
     [60]  = 'Assault',        -- The Ashu Talif
@@ -2172,11 +2172,33 @@ function tracker.check_zone()
 
     -- Odyssey: entered from Rabao (247) into WoE P1/P2 (279/298).
     -- Source-zone tracking distinguishes Odyssey from WoE HTBFs in same zones.
-    -- WoE HTBFs are handled by pending_htbf_entry above; if content_info is still
-    -- nil here and we came from Rabao, it's Odyssey.
-    if (tracker.content_info == nil and (zone_id == 279 or zone_id == 298)) then
-        if (tracker.previous_zone_id == 247) then
-            tracker.content_info = { type = 'Odyssey' };
+    -- Shared-zone disambiguation via source-zone tracking (same pattern as Odyssey).
+    -- These zones host multiple content types; previous_zone_id determines which.
+    if (tracker.content_info == nil) then
+        local prev = tracker.previous_zone_id;
+
+        -- Odyssey / WoE HTBF: Walk of Echoes P1/P2 (279/298)
+        -- WoE HTBFs handled by pending_htbf_entry above.
+        if (zone_id == 279 or zone_id == 298) then
+            if (prev == 247) then  -- Rabao
+                tracker.content_info = { type = 'Odyssey' };
+            end
+
+        -- Sortie / Vagary: Outer Ra'Kaznar U1/U2/U3 (275/133/189)
+        elseif (zone_id == 133 or zone_id == 275 or zone_id == 189) then
+            if (prev == 267) then  -- Kamihr Drifts
+                tracker.content_info = { type = 'Sortie' };
+            elseif (prev == 274) then  -- Outer Ra'Kaznar (overworld)
+                tracker.content_info = { type = 'Vagary' };
+            end
+
+        -- Legion / Ambuscade: Maquette Abdhaljs LegionA/B (183/287)
+        elseif (zone_id == 183 or zone_id == 287) then
+            if (prev == 110) then  -- Rolanberry Fields
+                tracker.content_info = { type = 'Legion' };
+            elseif (prev == 249) then  -- Mhaura
+                tracker.content_info = { type = 'Ambuscade' };
+            end
         end
     end
 end

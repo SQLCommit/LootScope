@@ -1,11 +1,12 @@
 --[[
-    LootScope v1.4.0 - Loot Drop Tracker for Ashita v4
+    LootScope v1.4.1 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
 
+    v1.4.1: Shared-zone disambiguation for Sortie/Vagary/Legion/Ambuscade.
     v1.4.0: 14 instance content types, Odyssey source-zone tracking, UI refactor.
     v1.3.3: Walk of Echoes HTBF tracking fix, CSV moon percent rounding.
     v1.3.2: Wildskeeper Reive loot tracking, find_pet_owner forward-ref fix.
@@ -33,12 +34,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.4.0
+    Version: 1.4.1
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.4.0';
+addon.version = '1.4.1';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 

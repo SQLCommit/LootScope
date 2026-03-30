@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.4.0 - Slot Analysis Engine
+    LootScope v1.4.1 - Slot Analysis Engine
     Statistical computation for drop slot probability analysis.
     Provides Wilson score confidence intervals, Poisson Binomial
     distribution, co-occurrence testing, and shared slot detection.
@@ -9,7 +9,7 @@
     and returns pre-computed result tables for ui.lua to render.
 
     Author: SQLCommit
-    Version: 1.4.0
+    Version: 1.4.1
 ]]--
 
 require 'common';
