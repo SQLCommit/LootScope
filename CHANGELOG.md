@@ -1,5 +1,18 @@
 # LootScope Changelog
 
+## v1.4.2
+
+### Fixed
+- **Wildskeeper Reive boss loot loss**: On AoE/rapid Naakual kills where the treasure pool (0x00D2) arrived before the defeat (0x0029), the kill was left untagged and the Reive loot (0x034) failed to link — silently dropping the boss drop from the DB. The drop-before-defeat recovery path now resolves the mob name correctly (it was reading an out-of-scope `mob_name` that was always nil) and wires the Reive loot-attribution state, so the drop is recorded.
+- **Slot Analysis percentages showing `%%`**: Six values in the Slot Analysis tab rendered a doubled percent sign (e.g. `2.3%% deviation`, `95.0%%`) because tooltip-style `%` escaping was applied to `imgui.Text`/`TextColored`/`BulletText` calls (which treat `%` literally). Now display a single `%`.
+- **"Open window when addon loads" setting ignored**: The window always opened regardless of the checkbox, because Ashita's settings library hasn't resolved the character at addon-load time, so the check read the default. The setting is now applied once, after the character/DB is ready.
+- **Augment-based Treasure Hunter / `/loot thaugs` not working**: The `itemdata` library never loaded due to a wrong require path (`libs/ffxi/itemdata`, which resolves to a non-existent `libs/libs/...`). Fixed to `ffxi.itemdata`, so augment TH (augment 147 on gear) is parsed again.
+- **Old kills mis-tagged "Unknown Battlefield"**: The content-type backfill now re-tags the `Unknown Battlefield` placeholder to the correct content type in single-content zones (Omen, Limbus, etc.) — previously it only filled blank tags, so kills recorded before a zone's support was added stayed mislabeled. Shared zones are excluded (can't be disambiguated retroactively).
+- **Compact-view crash safety**: A render error in compact mode can no longer leave ImGui's window stack unbalanced (`Begin` without a matching `End`).
+
+### Changed
+- + Other small performance and UI changes/fixes.
+
 ## v1.4.1
 
 ### Fixed

@@ -1,5 +1,5 @@
 --[[
-    LootScope v1.4.1 - Packet Tracker
+    LootScope v1.4.2 - Packet Tracker
     Parses 0x0028 (action), 0x0029 (defeat), 0x00D2 (treasure pool),
     0x00D3 (lot result), 0x0075 (battlefield entry), 0x005C (HTBF entry),
     0x034 (event/Voidwatch Pyxis), and outgoing 0x1A (NPC interaction)
@@ -7,7 +7,7 @@
     procs, content type, HTBF difficulty, and Voidwatch Pyxis loot.
 
     Author: SQLCommit
-    Version: 1.4.1
+    Version: 1.4.2
 ]]--
 
 require 'common';
@@ -19,11 +19,12 @@ local vana_time = require 'ffxi.time';
 local dats = require 'ffxi.dats';
 local ok_dat, datreader = pcall(require, 'datreader');
 if (not ok_dat) then datreader = nil; end
-local ok_itemdata, itemdata_lib = pcall(require, 'libs/ffxi/itemdata');
+local ok_itemdata, itemdata_lib = pcall(require, 'ffxi.itemdata');   -- NOT 'libs/ffxi/...': addons\libs is already on the path
 if (not ok_itemdata) then itemdata_lib = nil; end
 local tracker = {};
 tracker.has_datreader = ok_dat;
 tracker.has_itemdata = ok_itemdata;
+tracker.pending_warnings = {};   -- one-shot warnings (e.g. sig failures) drained+printed once by the entry script
 
 -------------------------------------------------------------------------------
 -- In-Memory State (cleared on zone change)
@@ -172,6 +173,8 @@ local function get_blu_mem_offset()
         'C1E1032BC8B0018D????????????B9????????F3A55F5E5B', 10, 0);
     if (not ok or ptr == nil or ptr == 0) then
         blu_mem_offset = false;
+        tracker.pending_warnings[#tracker.pending_warnings + 1] =
+            'BLU set-spell signature not found - TH-trait detection disabled (likely a client update).';
         return false;
     end
     blu_mem_offset = ffi.cast('uint32_t*', ptr);
@@ -640,6 +643,8 @@ local function init_weather_pointer()
         tracker.weather_ptr = result;
     else
         tracker.weather_ptr = false;  -- failed, no retry
+        tracker.pending_warnings[#tracker.pending_warnings + 1] =
+            'Weather signature not found - weather stats disabled (likely a client update).';
     end
 end
 
@@ -2259,8 +2264,6 @@ local function get_pool_item_info(slot)
         count               = pool_item.Count or 1,
         lot                 = pool_item.Lot or 0,
         winning_lot         = pool_item.WinningLot or 0,
-        winning_entity_sid  = pool_item.WinningEntityServerId or 0,
-        winning_entity_name = pool_item.WinningEntityName or '',
     };
 end
 
@@ -2603,7 +2606,7 @@ function tracker.handle_defeat(data)
                 local ct = tracker.get_content_type();
                 if (ct == '' and has_voidwatcher_buff()) then
                     ct = 'Voidwatch';
-                elseif (ct == '' and tracker.wildskeeper.active and NAAKUAL_NAMES[mob_name]) then
+                elseif (ct == '' and tracker.wildskeeper.active and NAAKUAL_NAMES[tracker.mob_names[mob_sid] or get_entity_name(mob_tidx)]) then
                     ct = 'Wildskeeper';
                 elseif (ct == '' and DOMAIN_INVASION_ZONES[tracker.current_zone_id] and has_elvorseal_buff()) then
                     ct = 'Domain Invasion';
@@ -2622,6 +2625,13 @@ function tracker.handle_defeat(data)
                     time     = os.clock(),
                     mob_name = tracker.mob_names[mob_sid] or get_entity_name(mob_tidx),
                 };
+                -- Wire Reive loot attribution for the drop-before-defeat race (mirror the main path)
+                if (ct == 'Wildskeeper') then
+                    tracker.wildskeeper.last_boss_name = tracker.mob_names[mob_sid] or get_entity_name(mob_tidx);
+                    tracker.wildskeeper.last_boss_sid = mob_sid;
+                    tracker.wildskeeper.last_kill_id = existing_kill;
+                    tracker.wildskeeper.last_kill_time = os.clock();
+                end
             end
             return;
         end
@@ -3039,6 +3049,7 @@ function tracker.handle_lot_result(data)
     local entry_raw   = sunpack('H', data, 0x10 + 1);  -- EntryActIndex:15 + EntryFlg:1
     local entry_point = sunpack('h', data, 0x12 + 1);  -- current lotter's lot value
     local pool_slot   = sunpack('B', data, 0x14 + 1);
+    if (pool_slot > tracker.POOL_MAX_SLOT) then return; end
     local judge_flag  = sunpack('B', data, 0x15 + 1);
     local entry_flg   = bit.rshift(entry_raw, 15);     -- bit 15 = EntryFlg
 
@@ -3050,14 +3061,6 @@ function tracker.handle_lot_result(data)
         loot_name_bytes[#loot_name_bytes + 1] = string.char(b);
     end
     local loot_name = table.concat(loot_name_bytes);
-
-    local entry_name_bytes = {};
-    for i = 0, 15 do
-        local b = sunpack('B', data, 0x26 + i + 1);
-        if (b == 0) then break; end
-        entry_name_bytes[#entry_name_bytes + 1] = string.char(b);
-    end
-    local entry_name = table.concat(entry_name_bytes);
 
     -- judge_flag == 0 is a "someone lotted/passed" notification (no final result).
     -- Track highest lot and our own lot value.

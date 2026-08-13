@@ -1,17 +1,27 @@
 --[[
-    LootScope v1.4.1 - UI Module
+    LootScope v1.4.2 - UI Module
+
     ImGui dashboard with Live Feed, Statistics, Slot Analysis, Export,
     and Settings tabs. Includes compact mode for minimal overlay.
 
     Author: SQLCommit
-    Version: 1.4.1
+    Version: 1.4.2
 ]]--
 
 require 'common';
 
 local imgui = require 'imgui';
+local chat  = require 'chat';
 
 local ui = {};
+
+local _compact_err_logged = false;   -- throttle the compact-render error print (once per session)
+
+-- Distant kills (mob defeated far from you) can't resolve a name -> the client returns 'none'.
+local function display_mob_name(n)
+    if (n == 'none') then return '(distant - unknown)'; end
+    return n or '';
+end
 
 -------------------------------------------------------------------------------
 -- Cached References
@@ -737,7 +747,7 @@ local function render_live_feed()
                 imgui.TextColored(COLOR_CONTENT, '[' .. ct .. '] ');
                 imgui.SameLine(0, 0);
             end
-            imgui.Text(row.mob_name or '');
+            imgui.Text(display_mob_name(row.mob_name));
             -- HTBF difficulty badge (inline after mob name)
             if (bf_diff ~= nil and bf_diff > 0) then
                 imgui.SameLine(0, 4);
@@ -745,7 +755,7 @@ local function render_live_feed()
                 imgui.TextColored(dc, '[' .. tracker.get_difficulty_label(bf_diff) .. ']');
             end
             if imgui.IsItemHovered() then
-                local tip = row.mob_name or '';
+                local tip = display_mob_name(row.mob_name);
                 if (row.mob_server_id ~= nil and row.mob_server_id > 0) then
                     tip = tip .. string_format('\nMob ID: %.0f', tonumber(row.mob_server_id));
                 end
@@ -1438,7 +1448,7 @@ local function render_statistics()
         -- Column 1: Mob Name / Battlefield Name
         imgui.TableNextColumn();
         local arrow = is_expanded and 'v ' or '> ';
-        if imgui.Selectable(arrow .. row.mob_name .. '##' .. row_key, is_expanded, ImGuiSelectableFlags_SpanAllColumns) then
+        if imgui.Selectable(arrow .. display_mob_name(row.mob_name) .. '##' .. row_key, is_expanded, ImGuiSelectableFlags_SpanAllColumns) then
             if is_expanded then
                 stats_expanded_mob = nil;
             else
@@ -2567,7 +2577,7 @@ local function render_advanced_export_window()
                         end
 
                         imgui.TableNextColumn();
-                        imgui.Text(row.mob_name or '');
+                        imgui.Text(display_mob_name(row.mob_name));
 
                         imgui.TableNextColumn();
                         if ((row.mob_server_id or 0) > 0) then
@@ -3143,7 +3153,7 @@ local function render_slot_section(result)
         else
             fit_label = 'Poor'; fit_color = COLOR_RED;
         end
-        imgui.TextColored(fit_color, string_format('%s (%.1f%%%% deviation)', fit_label, dev * 100));
+        imgui.TextColored(fit_color, string_format('%s (%.1f%% deviation)', fit_label, dev * 100));
         if imgui.IsItemHovered() then
             imgui.SetTooltip('Compares observed vs predicted empty kill rate.\nGood = independent slot model fits well.\nPoor = slots may not be independent (shared slots?).');
         end
@@ -3528,7 +3538,7 @@ local function render_battlefield_drop_structure(result)
     if (#guaranteed > 0) then
         imgui.TextColored(COLOR_GREEN, 'Guaranteed:');
         for _, item in ipairs(guaranteed) do
-            imgui.BulletText(string_format('%s  %.1f%%%%  [%d/%d]',
+            imgui.BulletText(string_format('%s  %.1f%%  [%d/%d]',
                 item.item_name, item.rate * 100, item.drops, item.kills));
         end
         imgui.Spacing();
@@ -3538,7 +3548,7 @@ local function render_battlefield_drop_structure(result)
     if (#variable > 0) then
         imgui.TextColored(COLOR_WARN, 'Variable:');
         for _, item in ipairs(variable) do
-            imgui.BulletText(string_format('%s  %.1f%%%%  [%d/%d]',
+            imgui.BulletText(string_format('%s  %.1f%%  [%d/%d]',
                 item.item_name, item.rate * 100, item.drops, item.kills));
         end
     end
@@ -3573,7 +3583,7 @@ local function render_inferred_drop_table(result, kills)
         if (#items == 1) then
             -- Single-item slot
             local item = items[1];
-            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%%%):',
+            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%):',
                 slot_idx, slot.total_rate * 100));
             imgui.SameLine();
             imgui.Text(item.item_name);
@@ -3586,15 +3596,14 @@ local function render_inferred_drop_table(result, kills)
             end
         else
             -- Multi-item (shared) slot
-            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%%%):',
+            imgui.TextColored(label_color, string_format('Slot %d (%.1f%%):',
                 slot_idx, slot.total_rate * 100));
             imgui.SameLine();
 
             -- Build inline item list: "ItemA (12.0%) | ItemB (8.0%)"
-            -- %%%% → string_format produces %% → SetTooltip printf displays %
             local parts = {};
             for _, item in ipairs(items) do
-                parts[#parts + 1] = string_format('%s (%.1f%%%%)', item.item_name, item.rate * 100);
+                parts[#parts + 1] = string_format('%s (%.1f%%)', item.item_name, item.rate * 100);
             end
             imgui.Text(table.concat(parts, ' | '));
             if imgui.IsItemHovered() then
@@ -4037,11 +4046,6 @@ local function get_th_slot_combo()
         TH_SLOT_COMBO = table.concat(TH_SLOT_LABELS, '\0') .. '\0';
     end
     return TH_SLOT_COMBO;
-end
-
-local function slot_id_to_combo_idx(slot_id)
-    if (slot_id == nil or slot_id < 0 or slot_id > 15) then return 0; end
-    return slot_id;
 end
 
 -- Convert IItem.Slots bitmask to first matching slot index (0-15)
@@ -4515,7 +4519,7 @@ local function render_settings_tab()
     imgui.TextColored(settings_header_color, 'Live Feed');
     imgui.Separator();
 
-    local slider_w = math_min((imgui.GetContentRegionAvail()), 250);
+    local slider_w = 250;   -- fixed so settings widgets don't resize with the window
 
     set_int_buf[1] = s.feed_max_entries;
     imgui.PushItemWidth(slider_w);
@@ -4617,7 +4621,7 @@ local function render_settings_tab()
         end
         local combo_str = table.concat(profile_names, '\0') .. '\0';
         set_int_buf[1] = current_idx;
-        imgui.PushItemWidth(math_min((imgui.GetContentRegionAvail()), 200));
+        imgui.PushItemWidth(200);   -- fixed width (no resize with window)
         if imgui.Combo('Active Profile', set_int_buf, combo_str) then
             local new_name = profile_names[set_int_buf[1] + 1];
             if (new_name ~= nil and new_name ~= s.th_profile) then
@@ -4719,8 +4723,9 @@ local function render_compact()
         win_flags = win_flags + ImGuiWindowFlags_NoTitleBar;
     end
 
+    local shown = imgui.Begin('LootScope', is_open, win_flags);
+    if shown then
     local compact_ok, compact_err = pcall(function()
-    if imgui.Begin('LootScope', is_open, win_flags) then
         local limit = (s ~= nil) and math_min(s.feed_max_entries, 20) or 20;
         local raw_drops = db.get_recent_drops(limit);
         local show_gil_c = (s == nil) or (s.show_gil_drops ~= false);
@@ -4959,12 +4964,13 @@ local function render_compact()
         if imgui.IsItemHovered() then
             imgui.SetTooltip('Expand to full view');
         end
-    end
-    imgui.End();
-    end); -- pcall: ensures PopStyleColor runs even on error
-    if (not compact_ok) then
+    end); -- pcall wraps the BODY only, so Begin/End + PopStyleColor stay balanced even on a render error
+    if (not compact_ok and not _compact_err_logged) then
+        _compact_err_logged = true;
         print(chat.header('lootscope'):append(chat.error('Compact render error: ' .. tostring(compact_err))));
     end
+    end -- if shown
+    imgui.End();
     imgui.PopStyleColor(#compact_style_color_ids);
 end
 

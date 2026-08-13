@@ -1,5 +1,6 @@
 --[[
-    LootScope v1.4.1 - SQLite3 Persistence Layer
+    LootScope v1.4.2 - SQLite3 Persistence Layer
+    
     Five-table schema: kills, drops, missed_kills, battlefield_sessions,
     chest_events.
     Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
@@ -10,7 +11,7 @@
     and keeps data separated across characters/servers.
 
     Author: SQLCommit
-    Version: 1.4.1
+    Version: 1.4.2
 ]]--
 
 require 'common';
@@ -164,6 +165,7 @@ function db.init(base_path, char_folder)
     -- WAL mode + busy_timeout for safety; pcall so a corrupt DB degrades gracefully
     local schema_ok, schema_err = pcall(function()
         db.conn:exec('PRAGMA journal_mode=WAL;');
+        db.conn:exec('PRAGMA synchronous=NORMAL;');   -- WAL+NORMAL: corruption-safe, fewer fsyncs (loses <1s only on power loss)
         db.conn:exec('PRAGMA foreign_keys=ON;');
         db.conn:exec('PRAGMA busy_timeout=3000;');
 
@@ -199,7 +201,6 @@ function db.init(base_path, char_folder)
             CREATE INDEX IF NOT EXISTS idx_kills_ts ON kills(timestamp);
             CREATE INDEX IF NOT EXISTS idx_kills_sid ON kills(mob_server_id);
             CREATE INDEX IF NOT EXISTS idx_kills_src ON kills(source_type);
-            CREATE INDEX IF NOT EXISTS idx_kills_content ON kills(content_type, zone_id);
             CREATE INDEX IF NOT EXISTS idx_drops_item ON drops(item_id);
             CREATE INDEX IF NOT EXISTS idx_drops_kill_item ON drops(kill_id, item_id);
         ]]);
@@ -248,6 +249,10 @@ function db.init(base_path, char_folder)
         if (not kills_has.content_type) then
             db.conn:exec("ALTER TABLE kills ADD COLUMN content_type TEXT DEFAULT '';");
         end
+        -- Build the content_type index HERE, after the column is guaranteed to exist. On a fresh DB the
+        -- column is added by the ALTER above; putting this in the initial CREATE block aborts that
+        -- multi-statement exec ("no such column") and skips the indexes after it until the next open.
+        db.conn:exec("CREATE INDEX IF NOT EXISTS idx_kills_content ON kills(content_type, zone_id);");
 
         if (not kills_has.th_estimated) then
             db.conn:exec('ALTER TABLE kills ADD COLUMN th_estimated INTEGER DEFAULT 0;');
@@ -270,6 +275,14 @@ function db.init(base_path, char_folder)
             db.conn:exec("ALTER TABLE drops ADD COLUMN drop_order INTEGER DEFAULT -1;");
         end
 
+        -- One-time DATA backfills, gated by PRAGMA user_version so they stop re-probing every open.
+        -- (The schema CREATE/ALTER above stays ungated - it is idempotent and self-healing.)
+        -- A FUTURE backfill must use its OWN gate ("if data_ver < 2 then ...; user_version=2"); adding it
+        -- inside this (< 1) block would never run for users already stamped version 1.
+        local data_ver = 0;
+        for row in db.conn:nrows('PRAGMA user_version') do data_ver = row.user_version; end
+        if (data_ver < 1) then
+
         -- Migration: unify Dynamis + Dynamis [D] into single 'Dynamis' content_type
         local needs_dyn_rename = false;
         for row in db.conn:nrows("SELECT 1 FROM kills WHERE content_type = 'Dynamis [D]' LIMIT 1") do
@@ -291,7 +304,10 @@ function db.init(base_path, char_folder)
         end
 
         -- Migration: backfill content_type for instance zones added in v1.4.0.
-        -- Only touches kills with empty content_type in known exclusive zone IDs.
+        -- Fills empty content_type AND re-tags the 'Unknown Battlefield' placeholder in these
+        -- SINGLE-CONTENT zones: kills recorded before a zone's support was added got stamped
+        -- 'Unknown Battlefield' by 0x0075 (mode not yet recognised). Never touches a SPECIFIC
+        -- tag; shared zones are excluded (see the note in the table) so they keep the placeholder.
         local instance_backfill = {
             { 'Omen',           '292' },
             { 'Einherjar',      '78' },
@@ -308,13 +324,16 @@ function db.init(base_path, char_folder)
         for _, entry in ipairs(instance_backfill) do
             local ct, zones = entry[1], entry[2];
             local needs = false;
-            for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (" .. zones .. ") LIMIT 1") do
+            for row in db.conn:nrows("SELECT 1 FROM kills WHERE (COALESCE(content_type, '') = '' OR content_type = 'Unknown Battlefield') AND zone_id IN (" .. zones .. ") LIMIT 1") do
                 needs = true;
             end
             if (needs) then
-                db.conn:exec("UPDATE kills SET content_type = '" .. ct .. "' WHERE COALESCE(content_type, '') = '' AND zone_id IN (" .. zones .. ");");
+                db.conn:exec("UPDATE kills SET content_type = '" .. ct .. "' WHERE (COALESCE(content_type, '') = '' OR content_type = 'Unknown Battlefield') AND zone_id IN (" .. zones .. ");");
             end
         end
+
+        db.conn:exec('PRAGMA user_version = 1;');   -- backfills complete; skip the probes next open
+        end  -- (data_ver < 1) gate
 
         -- Migration: composite idx_drops_kill_item (subsumes old idx_drops_kill)
         db.conn:exec("DROP INDEX IF EXISTS idx_drops_kill;");
@@ -517,6 +536,16 @@ local function maybe_commit()
     end
 end
 
+-- One-shot warning when a write fails (prepare/step): a persistent DB write problem (disk full,
+-- permissions, corruption) would otherwise lose records silently. Printed once per session.
+local function warn_write_failure(what)
+    if (db._write_warned) then return; end
+    db._write_warned = true;
+    local chat = require 'chat';
+    print(chat.header('lootscope'):append(chat.error(
+        'DB write failed (' .. what .. ') - some records may not be saved. Check disk space / permissions.')));
+end
+
 -- Force-flush any open transaction immediately (used before scan_pool on reload)
 function db.flush_pending()
     if (not db._in_transaction) then return; end
@@ -557,7 +586,7 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
                            bf_name, bf_difficulty, content_type, th_estimated)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ]]);
-    if (stmt == nil) then maybe_commit(); return nil; end
+    if (stmt == nil) then warn_write_failure('kill'); maybe_commit(); return nil; end
     stmt:bind_values(
         mob_name, mob_server_id, zone_id, zone_name,
         th_level or 0, source_type or 0,
@@ -575,7 +604,7 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
     );
     local rc = stmt:step();
     stmt:finalize();
-    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    if (rc ~= sqlite3.DONE) then warn_write_failure('kill'); maybe_commit(); return nil; end
     local rowid = db.conn:last_insert_rowid();
 
     db._kill_count = db._kill_count + 1;
@@ -589,6 +618,7 @@ end
 -- Clears is_distant flag and adds killer/TH metadata that the fallback path lacks.
 function db.patch_kill_on_defeat(kill_id, info)
     if (db.conn == nil or kill_id == nil) then return; end
+    info = info or {};   -- harden like record_kill's kill_info-or-{} idiom (caller passes a table today)
 
     begin_batch();
 
@@ -598,7 +628,7 @@ function db.patch_kill_on_defeat(kill_id, info)
     local ct = info.content_type or '';
     local ct_clause = '';
     if (ct ~= '') then
-        ct_clause = ", content_type = CASE WHEN COALESCE(content_type, '') = '' THEN '" .. ct .. "' ELSE content_type END";
+        ct_clause = ", content_type = CASE WHEN COALESCE(content_type, '') = '' THEN ? ELSE content_type END";
     end
 
     local stmt = db.conn:prepare([[
@@ -609,12 +639,22 @@ function db.patch_kill_on_defeat(kill_id, info)
         WHERE id = ? AND is_distant = 1
     ]]);
     if (stmt == nil) then maybe_commit(); return; end
-    stmt:bind_values(
-        info.killer_id or 0, info.killer_name or '',
-        info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
-        info.th_estimated or 0,
-        kill_id
-    );
+    if (ct ~= '') then
+        stmt:bind_values(
+            info.killer_id or 0, info.killer_name or '',
+            info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
+            info.th_estimated or 0,
+            ct,
+            kill_id
+        );
+    else
+        stmt:bind_values(
+            info.killer_id or 0, info.killer_name or '',
+            info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
+            info.th_estimated or 0,
+            kill_id
+        );
+    end
     stmt:step();
     stmt:finalize();
 
@@ -639,11 +679,11 @@ function db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, won, d
         INSERT INTO drops (kill_id, pool_slot, item_id, item_name, quantity, won, lot_value, drop_order, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
     ]]);
-    if (stmt == nil) then maybe_commit(); return nil; end
+    if (stmt == nil) then warn_write_failure('drop'); maybe_commit(); return nil; end
     stmt:bind_values(kill_id, pool_slot, item_id, item_name, quantity or 1, won or 0, drop_order or -1, now);
     local rc = stmt:step();
     stmt:finalize();
-    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    if (rc ~= sqlite3.DONE) then warn_write_failure('drop'); maybe_commit(); return nil; end
     local rowid = db.conn:last_insert_rowid();
 
     db._drop_count = db._drop_count + 1;
@@ -1475,11 +1515,11 @@ function db.record_missed_kill(zone_id, zone_name)
     begin_batch();
 
     local stmt = db.conn:prepare('INSERT INTO missed_kills (zone_id, zone_name, timestamp) VALUES (?, ?, ?)');
-    if (stmt == nil) then maybe_commit(); return; end
+    if (stmt == nil) then warn_write_failure('missed kill'); maybe_commit(); return; end
     stmt:bind_values(zone_id, zone_name, os_time());
     local rc = stmt:step();
     stmt:finalize();
-    if (rc ~= sqlite3.DONE) then maybe_commit(); return; end
+    if (rc ~= sqlite3.DONE) then warn_write_failure('missed kill'); maybe_commit(); return; end
 
     db._missed_kill_count = db._missed_kill_count + 1;
     
@@ -2115,7 +2155,7 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
                                   timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ]]);
-    if (stmt == nil) then maybe_commit(); return nil; end
+    if (stmt == nil) then warn_write_failure('chest'); maybe_commit(); return nil; end
     stmt:bind_values(
         zone_id, zone_name, container_type, result, gil_amount or 0,
         vi.weekday or -1, vi.hour or -1,
@@ -2125,7 +2165,7 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
     );
     local rc = stmt:step();
     stmt:finalize();
-    if (rc ~= sqlite3.DONE) then maybe_commit(); return nil; end
+    if (rc ~= sqlite3.DONE) then warn_write_failure('chest'); maybe_commit(); return nil; end
     local rowid = db.conn:last_insert_rowid();
 
     db._chest_event_count = db._chest_event_count + 1;
@@ -2515,6 +2555,7 @@ function db.init_th_items(addon_path)
 
     local schema_ok, schema_err = pcall(function()
         db.th_conn:exec('PRAGMA journal_mode=WAL;');
+        db.th_conn:exec('PRAGMA synchronous=NORMAL;');
         db.th_conn:exec('PRAGMA foreign_keys=ON;');
         db.th_conn:exec('PRAGMA busy_timeout=3000;');
 

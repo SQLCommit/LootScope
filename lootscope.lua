@@ -1,27 +1,10 @@
 --[[
-    LootScope v1.4.1 - Loot Drop Tracker for Ashita v4
+    LootScope v1.4.2 - Loot Drop Tracker for Ashita v4
 
     Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
     levels. Stores data in SQLite for statistical analysis. Provides
     a dashboard UI with live feed, statistics, slot analysis, export,
     and compact mode.
-
-    v1.4.1: Shared-zone disambiguation for Sortie/Vagary/Legion/Ambuscade.
-    v1.4.0: 14 instance content types, Odyssey source-zone tracking, UI refactor.
-    v1.3.3: Walk of Echoes HTBF tracking fix, CSV moon percent rounding.
-    v1.3.2: Wildskeeper Reive loot tracking, find_pet_owner forward-ref fix.
-    v1.3.0: TH gear estimation, HTBF fallback detection, Domain Invasion,
-    TH Management UI with job trait profiles, code quality improvements.
-    v1.2.1: VW bug fixes - consecutive cycle detection, relinquish
-    tracking via 0x05B EventEnd, buff-based kill tagging (ID 475),
-    three-layer finalization redundancy.
-    v1.2.0: Voidwatch loot tracking (Riftworn Pyxis via 0x034),
-    Voidwatch statistics category, content type tagging.
-    v1.1.1: Slot Analysis tab, content type detection (0x0075),
-    grouped statistics filters, battlefield mode, advanced export
-    content-type filtering, dead code cleanup.
-    v1.1.0: HTBF difficulty tracking (via 0x005C), chest interaction
-    pre-identification (via outgoing 0x1A).
 
     Commands:
         /loot or /lootscope    - Toggle the LootScope window
@@ -34,12 +17,12 @@
         /loot help             - Show commands
 
     Author: SQLCommit
-    Version: 1.4.1
+    Version: 1.4.2
 ]]--
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.4.1';
+addon.version = '1.4.2';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -47,6 +30,10 @@ require 'common';
 
 local chat     = require 'chat';
 local settings = require 'settings';
+
+for _, m in ipairs({ 'db', 'tracker', 'ui', 'analysis', 'datreader' }) do
+    package.loaded[m] = nil;
+end
 
 local ok_db, db = pcall(require, 'db');
 local ok_tr, tracker = pcall(require, 'tracker');
@@ -91,6 +78,7 @@ local default_settings = T{
 -- State
 -------------------------------------------------------------------------------
 local s = nil;
+local startup_open_applied = false;   -- apply show_on_load ONCE, after the character's settings resolve
 
 -------------------------------------------------------------------------------
 -- Helper: Print with addon header
@@ -439,10 +427,6 @@ ashita.events.register('load', 'lootscope_load', function()
         msg('itemdata library unavailable - TH augment parsing will be limited.');
     end
 
-    if (not s.show_on_load) then
-        ui.hide();
-    end
-
     print(chat.header(addon.name):append(chat.message('v' .. addon.version .. ' loaded. Use ')):append(chat.success('/loot')):append(chat.message(' to toggle window.')));
 end);
 
@@ -450,9 +434,6 @@ end);
 -- Event: Unload
 -------------------------------------------------------------------------------
 ashita.events.register('unload', 'lootscope_unload', function()
-    -- Don't mark pool items as Zoned here — they may still be in the pool
-    -- on addon reload. scan_pool() reconnects with existing DB records on load.
-    -- Actual zone changes are handled by check_zone().
 
     pcall(ui.sync_settings);
     pcall(settings.save);
@@ -537,7 +518,7 @@ ashita.events.register('command', 'lootscope_command', function(e)
 
     elseif (cmd == 'thaugs') then
         -- Debug: dump augment data from all equipped gear to chat
-        local ok_id, id_lib = pcall(require, 'libs/ffxi/itemdata');
+        local ok_id, id_lib = pcall(require, 'ffxi.itemdata');
         if (not ok_id or id_lib == nil) then
             msg_error('itemdata library not available.');
             return;
@@ -624,7 +605,11 @@ end
 local function safe_call(fn, data, label)
     local ok, err = pcall(fn, data);
     if (not ok) then
-        msg_error(label .. ': ' .. tostring(err));
+        local key = label .. tostring(err);
+        if (not _frame_errors[key]) then
+            _frame_errors[key] = true;
+            msg_error(label .. ': ' .. tostring(err));
+        end
     end
 end
 
@@ -730,6 +715,16 @@ end);
 ashita.events.register('d3d_present', 'lootscope_present', function()
     -- Deferred DB init: detect character name once logged in
     safe_frame_call(tracker.check_character, 'check_character');
+
+    if (not startup_open_applied and db.conn ~= nil) then
+        startup_open_applied = true;
+        if (not s.show_on_load) then ui.hide(); end
+    end
+
+    if (#tracker.pending_warnings > 0) then
+        for _, w in ipairs(tracker.pending_warnings) do msg(w); end
+        tracker.pending_warnings = {};
+    end
 
     safe_frame_call(tracker.check_zone, 'check_zone');
     safe_frame_call(tracker.check_battlefield_level_cap, 'check_bf_cap');
