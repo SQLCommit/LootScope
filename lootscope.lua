@@ -1,28 +1,8 @@
---[[
-    LootScope v1.4.2 - Loot Drop Tracker for Ashita v4
-
-    Tracks treasure pool drops, lot/win outcomes, and Treasure Hunter
-    levels. Stores data in SQLite for statistical analysis. Provides
-    a dashboard UI with live feed, statistics, slot analysis, export,
-    and compact mode.
-
-    Commands:
-        /loot or /lootscope    - Toggle the LootScope window
-        /loot show | hide      - Show or hide the window
-        /loot compact          - Toggle compact mode
-        /loot resetui          - Reset window size and position
-        /loot stats [mob]      - Print drop stats to chat
-        /loot thaugs           - Dump augment IDs from equipped gear
-        /loot bluspells        - Check BLU TH trait spell status
-        /loot help             - Show commands
-
-    Author: SQLCommit
-    Version: 1.4.2
-]]--
+-- LootScope: loot history, lot outcomes and Treasure Hunter tracking.
 
 addon.name    = 'lootscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.4.2';
+addon.version = '1.5.0';
 addon.desc    = 'Loot drop tracker with statistics and Treasure Hunter monitoring.';
 addon.link    = 'https://github.com/SQLCommit/lootscope';
 
@@ -31,16 +11,19 @@ require 'common';
 local chat     = require 'chat';
 local settings = require 'settings';
 
-for _, m in ipairs({ 'db', 'tracker', 'ui', 'analysis', 'datreader' }) do
+for _, m in ipairs({ 'db', 'db_schema', 'db_backfill', 'classify', 'battlefield', 'content', 'containers', 'gil', 'th', 'tracker', 'ui', 'ui_state', 'ui_widgets', 'ui_th', 'ui_live_feed', 'ui_statistics', 'ui_settings', 'ui_slot_analysis', 'ui_export', 'analysis', 'datreader' }) do
     package.loaded[m] = nil;
 end
 
 local ok_db, db = pcall(require, 'db');
 local ok_tr, tracker = pcall(require, 'tracker');
+local ok_ct, containers = pcall(require, 'containers');   -- chest / coffer / Limbus chest handlers
+local ok_gl, gil = pcall(require, 'gil');                    -- mob gil, both carriers
+local ok_th, th = pcall(require, 'th');                      -- Treasure Hunter estimation
 local ok_ui, ui = pcall(require, 'ui');
 local ok_an, analysis = pcall(require, 'analysis');
 
-if (not ok_db or not ok_tr or not ok_ui) then
+if (not ok_db or not ok_tr or not ok_ct or not ok_gl or not ok_th or not ok_ui) then
     print(chat.header('lootscope'):append(chat.error(
         'Failed to load modules: '
         .. (not ok_db and 'db(' .. tostring(db) .. ') ' or '')
@@ -57,9 +40,7 @@ if (not ok_an) then
     analysis = nil;
 end
 
--------------------------------------------------------------------------------
 -- Default Settings
--------------------------------------------------------------------------------
 local default_settings = T{
     feed_max_entries       = 100,
     compact_mode           = false,
@@ -74,15 +55,11 @@ local default_settings = T{
     th_zone_effects        = true,
 };
 
--------------------------------------------------------------------------------
 -- State
--------------------------------------------------------------------------------
 local s = nil;
 local startup_open_applied = false;   -- apply show_on_load ONCE, after the character's settings resolve
 
--------------------------------------------------------------------------------
 -- Helper: Print with addon header
--------------------------------------------------------------------------------
 local function msg(text)
     print(chat.header(addon.name):append(chat.message(text)));
 end
@@ -95,9 +72,7 @@ local function msg_error(text)
     print(chat.header(addon.name):append(chat.error(text)));
 end
 
--------------------------------------------------------------------------------
 -- Export to CSV
--------------------------------------------------------------------------------
 
 local function csv_escape(val)
     local str = tostring(val or '');
@@ -120,7 +95,9 @@ local function export_data()
     ashita.fs.create_directory(base_dir);
 
     local timestamp = os.date('%Y%m%d_%H%M%S');
-    local char_name = tracker.char_name or 'unknown';
+    -- Use the DB identity (<Name>_<ServerId>) so exports from two same-named characters on
+    -- different servers cannot collide or be confused after the fact.
+    local char_name = tracker.char_folder or tracker.char_name or 'unknown';
     local file_path = base_dir .. '\\lootscope_' .. char_name .. '_' .. timestamp .. '.csv';
 
     local f, err = io.open(file_path, 'w');
@@ -194,8 +171,8 @@ local function export_data()
                 local ts = ce.timestamp or 0;
                 local date_s = os.date('%Y-%m-%d', ts);
                 local time_s = os.date('%H:%M:%S', ts);
-                local container = tracker.get_container_label(ce.container_type);
-                local result = tracker.get_chest_result_label(ce.result);
+                local container = containers.get_container_label(ce.container_type);
+                local result = containers.get_chest_result_label(ce.result);
                 local weekday = tracker.get_weekday_label(ce.vana_weekday);
                 local vh = (ce.vana_hour ~= nil and ce.vana_hour >= 0) and string.format('%02d:00', ce.vana_hour) or '';
                 local mp = (ce.moon_percent ~= nil and ce.moon_percent >= 0) and tostring(math.floor(ce.moon_percent)) or '';
@@ -226,9 +203,7 @@ local function export_data()
     msg_success('Exported to exports\\lootscope_' .. char_name .. '_' .. timestamp .. '.csv');
 end
 
--------------------------------------------------------------------------------
 -- Export Filtered Data to CSV
--------------------------------------------------------------------------------
 
 local function export_filtered_data()
     local filters = ui.get_export_filters();
@@ -247,7 +222,9 @@ local function export_filtered_data()
     ashita.fs.create_directory(base_dir);
 
     local timestamp = os.date('%Y%m%d_%H%M%S');
-    local char_name = tracker.char_name or 'unknown';
+    -- Use the DB identity (<Name>_<ServerId>) so exports from two same-named characters on
+    -- different servers cannot collide or be confused after the fact.
+    local char_name = tracker.char_folder or tracker.char_name or 'unknown';
     local file_path = base_dir .. '\\lootscope_' .. char_name .. '_filtered_' .. timestamp .. '.csv';
 
     local f, err = io.open(file_path, 'w');
@@ -313,9 +290,7 @@ local function export_filtered_data()
     msg_success('Exported ' .. tostring(row_count) .. ' filtered rows to exports\\lootscope_' .. char_name .. '_filtered_' .. timestamp .. '.csv');
 end
 
--------------------------------------------------------------------------------
 -- Help
--------------------------------------------------------------------------------
 local function print_help()
     print(chat.header(addon.name):append(chat.message('Available commands:')));
     local cmds = T{
@@ -323,7 +298,6 @@ local function print_help()
         { '/loot show / hide',  'Show or hide the window.' },
         { '/loot compact',      'Toggle compact mode.' },
         { '/loot resetui',      'Reset window size and position.' },
-        { '/loot stats [mob]',  'Print mob drop stats to chat.' },
         { '/loot thaugs',       'Dump augment IDs from equipped gear (debug).' },
         { '/loot bluspells',    'Check BLU TH trait spell status (debug).' },
         { '/loot help',         'Show this help message.' },
@@ -333,69 +307,7 @@ local function print_help()
     end);
 end
 
--------------------------------------------------------------------------------
--- Print Stats to Chat
--------------------------------------------------------------------------------
-local function print_stats(mob_name)
-    if (mob_name == nil or mob_name == '') then
-        local kc, dc, mc, cc = db.get_counts();
-        local summary = 'Session totals: ' .. tostring(kc) .. ' kills, ' .. tostring(dc) .. ' drops';
-        if (mc > 0) then
-            summary = summary .. ', ' .. tostring(mc) .. ' missed (mob ID unknown)';
-        end
-        if (cc > 0) then
-            summary = summary .. ', ' .. tostring(cc) .. ' chest events';
-        end
-        msg(summary);
-        return;
-    end
-
-    local all = db.get_all_mob_stats();
-    local found = false;
-    for _, row in ipairs(all) do
-        if (row.mob_name ~= nil and row.mob_name:lower() == mob_name:lower()) then
-            found = true;
-            local mob_distant = row.distant_kills or 0;
-            local nearby = row.kill_count - mob_distant;
-            local header;
-            if (mob_distant > 0) then
-                header = row.mob_name .. ' (' .. row.zone_name .. '): ' ..
-                    tostring(nearby) .. ' nearby + ' .. tostring(mob_distant) .. ' distant = ' ..
-                    tostring(row.kill_count) .. ' kills, ' ..
-                    tostring(row.drop_count) .. ' drops (' ..
-                    tostring(row.unique_items) .. ' unique)';
-            else
-                header = row.mob_name .. ' (' .. row.zone_name .. '): ' ..
-                    tostring(row.kill_count) .. ' kills, ' ..
-                    tostring(row.drop_count) .. ' drops (' ..
-                    tostring(row.unique_items) .. ' unique)';
-            end
-            msg(header);
-
-            local stats = db.get_mob_stats(row.mob_name, row.zone_id);
-            if (stats ~= nil and stats.items ~= nil) then
-                for _, item in ipairs(stats.items) do
-                    local rate_str = string.format('%.1f%%', item.drop_rate);
-                    if (mob_distant > 0 and (item.combined_rate or -1) >= 0) then
-                        rate_str = rate_str .. string.format(' | combined: %.1f%%', item.combined_rate);
-                    end
-                    print(chat.header(addon.name):append(chat.message(
-                        '  ' .. item.item_name .. ': ' ..
-                        tostring(item.times_dropped) .. 'x (' .. rate_str .. ')'
-                    )));
-                end
-            end
-        end
-    end
-
-    if (not found) then
-        msg_error('No data found for mob: ' .. mob_name);
-    end
-end
-
--------------------------------------------------------------------------------
 -- Event: Load
--------------------------------------------------------------------------------
 ashita.events.register('load', 'lootscope_load', function()
     s = settings.load(default_settings);
 
@@ -405,7 +317,7 @@ ashita.events.register('load', 'lootscope_load', function()
 
     -- DB init is deferred until character name is detected (tracker.check_character)
     tracker.init(db, config_path);
-    tracker.set_settings(s);
+    th.set_settings(s);
     ui.init(db, tracker, s, analysis);
 
     -- Init shared TH items database (addon-local, not per-character)
@@ -430,27 +342,30 @@ ashita.events.register('load', 'lootscope_load', function()
     print(chat.header(addon.name):append(chat.message('v' .. addon.version .. ' loaded. Use ')):append(chat.success('/loot')):append(chat.message(' to toggle window.')));
 end);
 
--------------------------------------------------------------------------------
 -- Event: Unload
--------------------------------------------------------------------------------
 ashita.events.register('unload', 'lootscope_unload', function()
+    -- Held gil is gil the player already has; an unload/reload must not drop it.
+    pcall(gil.flush_mob_gil, true);
 
     pcall(ui.sync_settings);
     pcall(settings.save);
     pcall(db.close);
 end);
 
--------------------------------------------------------------------------------
 -- Event: Text In (mob name resolution from chat when entity is out of range)
 -- Parses "X defeats MobName." and "You find ... on MobName." messages.
--------------------------------------------------------------------------------
 ashita.events.register('text_in', 'lootscope_text_in', function(e)
     local text = e.message_modified;
     if (text == nil or text == '') then return; end
 
     local ok, err = pcall(function()
         -- Chest failure detection via text patterns (gil is handled by 0x001E packet)
-        tracker.handle_chest_text(text);
+        containers.handle_chest_text(text);
+        -- Limbus chest reward line ("Obtained: <item>.") -- second signal beside the 0x002A packet
+        containers.handle_limbus_text(text);
+        containers.handle_woe_coffer_text(text);   -- Walk of Echoes coffer, same line
+        tracker.handle_reive_text(text);            -- which Reive (Colonization / Lair / Wildskeeper)
+        containers.handle_reive_text(text);         -- Reive end spoils echoes + the victory line (after the kind is read)
 
         -- Battlefield entry detection (fires before mob name resolution check)
         tracker.handle_battlefield_text(text);
@@ -480,9 +395,7 @@ ashita.events.register('text_in', 'lootscope_text_in', function(e)
     -- text_in errors are silently dropped (never print from text_in — stack overflow)
 end);
 
--------------------------------------------------------------------------------
 -- Event: Command
--------------------------------------------------------------------------------
 ashita.events.register('command', 'lootscope_command', function(e)
     local args = e.command:args();
     if (#args == 0 or not args[1]:any('/loot', '/lootscope')) then
@@ -508,13 +421,6 @@ ashita.events.register('command', 'lootscope_command', function(e)
     elseif (cmd == 'resetui') then
         ui.reset_ui();
         msg_success('Window size and position reset.');
-
-    elseif (cmd == 'stats') then
-        local mob_name = nil;
-        if (#args >= 3) then
-            mob_name = args:concat(' ', 3);
-        end
-        print_stats(mob_name);
 
     elseif (cmd == 'thaugs') then
         -- Debug: dump augment data from all equipped gear to chat
@@ -572,7 +478,7 @@ ashita.events.register('command', 'lootscope_command', function(e)
         local is_main = (main_job == 16);
         print(chat.header(addon.name):append(chat.message(
             'BLU ' .. (is_main and 'main' or 'sub') .. ' - set spells:')));
-        local th_active = tracker.check_blu_th_spells(is_main);
+        local th_active = th.check_blu_th_spells(is_main);
         print(chat.message('  TH trait spells set: ' .. (th_active and 'YES' or 'NO')));
 
     elseif (cmd == 'help') then
@@ -583,9 +489,7 @@ ashita.events.register('command', 'lootscope_command', function(e)
     end
 end);
 
--------------------------------------------------------------------------------
 -- Helper: Throttled pcall for per-frame functions (logs each unique error once)
--------------------------------------------------------------------------------
 local _frame_errors = {};
 
 local function safe_frame_call(fn, label)
@@ -599,9 +503,7 @@ local function safe_frame_call(fn, label)
     end
 end
 
--------------------------------------------------------------------------------
 -- Helper: Error-capturing pcall (logs errors instead of silently eating them)
--------------------------------------------------------------------------------
 local function safe_call(fn, data, label)
     local ok, err = pcall(fn, data);
     if (not ok) then
@@ -613,9 +515,7 @@ local function safe_call(fn, data, label)
     end
 end
 
--------------------------------------------------------------------------------
 -- Event: Incoming Packet
--------------------------------------------------------------------------------
 ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
     -- 0x0028: Action (TH proc detection)
     if (e.id == 0x0028) then
@@ -643,7 +543,10 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
 
     -- 0x002A: messageSpecial / TALKNUMWORK (chest unlock + failure detection)
     if (e.id == 0x002A) then
-        safe_call(tracker.handle_chest_message, e.data_modified, '0x002A');
+        safe_call(containers.handle_chest_message, e.data_modified, '0x002A');
+        safe_call(containers.handle_limbus_reward, e.data_modified, '0x002A');   -- Limbus chest items
+        safe_call(containers.handle_woe_coffer_obtained, e.data_modified, '0x002A');   -- Walk of Echoes coffer takes
+        safe_call(containers.handle_reive_reward, e.data_modified, '0x002A');   -- Colonization / Lair Reive end spoils
         return;
     end
 
@@ -670,6 +573,7 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
 
     -- 0x0034: GP_SERV_COMMAND_EVENTNUM (Voidwatch Pyxis loot detection)
     if (e.id == 0x0034) then
+        safe_call(containers.handle_woe_coffer_event, e.data_modified, '0x0034');   -- Walk of Echoes coffer offer
         safe_call(tracker.handle_event_begin, e.data_modified, '0x0034');
     end
 
@@ -685,7 +589,7 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
 
     -- 0x0050: Equipment Change (TH gear estimation — recalculate on gear swap)
     if (e.id == 0x0050) then
-        safe_call(tracker.handle_equipment_change, e.data_modified, '0x0050');
+        safe_call(th.handle_equipment_change, e.data_modified, '0x0050');
     end
 
     -- 0x000E: NPC Entity Update (Odyssey fallback detection via instance IDs)
@@ -694,29 +598,32 @@ ashita.events.register('packet_in', 'lootscope_packet_in', function(e)
     end
 end);
 
--------------------------------------------------------------------------------
 -- Event: Outgoing Packet
--------------------------------------------------------------------------------
 ashita.events.register('packet_out', 'lootscope_packet_out', function(e)
     -- 0x001A: GP_CLI_COMMAND_ACTION (chest/NPC interaction pre-identification)
     if (e.id == 0x001A) then
         safe_call(tracker.handle_outgoing_action, e.data_modified, '0x001A out');
     end
 
+    -- 0x0036: GP_CLI_COMMAND_ITEM_TRANSFER (trading a key to a chest/coffer)
+    if (e.id == 0x0036) then
+        safe_call(containers.handle_outgoing_trade, e.data_modified, '0x0036 out');
+    end
+
     -- 0x005B: GP_CLI_COMMAND_EVENTEND (Voidwatch Pyxis close / relinquish all)
     if (e.id == 0x005B) then
+        safe_call(containers.handle_woe_menu_option, e.data_modified, '0x005B out');   -- Walk of Echoes: conflux entry / coffer choice
         safe_call(tracker.handle_event_end, e.data_modified, '0x005B out');
     end
 end);
 
--------------------------------------------------------------------------------
 -- Event: d3d_present (every frame)
--------------------------------------------------------------------------------
 ashita.events.register('d3d_present', 'lootscope_present', function()
     -- Deferred DB init: detect character name once logged in
     safe_frame_call(tracker.check_character, 'check_character');
 
-    if (not startup_open_applied and db.conn ~= nil) then
+    -- Wait for settings before latching startup visibility; otherwise show_on_load is lost.
+    if (not startup_open_applied and db.conn ~= nil and s ~= nil) then
         startup_open_applied = true;
         if (not s.show_on_load) then ui.hide(); end
     end
@@ -727,6 +634,7 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
     end
 
     safe_frame_call(tracker.check_zone, 'check_zone');
+    safe_frame_call(gil.flush_mob_gil, 'flush_mob_gil');
     safe_frame_call(tracker.check_battlefield_level_cap, 'check_bf_cap');
     safe_frame_call(tracker.check_voidwatch_buff, 'check_vw_buff');
     safe_frame_call(tracker.check_reive_buff, 'check_reive_buff');
@@ -744,7 +652,8 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
     safe_frame_call(tracker.cleanup_stale_resolves, 'stale_resolves');
 
     -- Check chest unlock timeout (pending gil detection)
-    safe_frame_call(tracker.check_chest_timeout, 'chest_timeout');
+    safe_frame_call(containers.check_chest_timeout, 'chest_timeout');
+    safe_frame_call(containers.check_reive_timeout, 'reive_timeout');
 
     safe_frame_call(db.flush_writes_if_due, 'db_flush');
 
@@ -784,13 +693,11 @@ ashita.events.register('d3d_present', 'lootscope_present', function()
     safe_frame_call(ui.render, 'render');
 end);
 
--------------------------------------------------------------------------------
 -- Event: Settings changed externally
--------------------------------------------------------------------------------
 settings.register('settings', 'lootscope_settings_update', function(new_s)
     if (new_s ~= nil) then
         s = new_s;
         ui.apply_settings(s);
-        tracker.set_settings(s);
+        th.set_settings(s);
     end
 end);

@@ -3,8 +3,8 @@
 *.db-wal
 *.db-shm
 
-# Exception: TH gear profile database ships with the addon
-!data/th_items.db
+# Shipped TH catalog; user profiles remain ignored
+!/data/th_items.default.db
 
 # Per-character settings
 settings/
@@ -15,10 +15,32 @@ settings/
 # Screenshots and temp files
 *.png
 *.jpg
+*.jpeg
 *.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
 
 # Export files
 exports/
 
-# Dev Tracking
-DEV_TRACKING.md
+# Local development notes, tools, and packet captures
+/DEV_TRACKING.md
+/DISCORD_POST.md
+/tools/
+/tracker.spans.json
+/Packet Tests/
+/*Packet Testing/
+
+# Local configuration and generated files
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+/dist/

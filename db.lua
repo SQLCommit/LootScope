@@ -1,22 +1,16 @@
---[[
-    LootScope v1.4.2 - SQLite3 Persistence Layer
-    
-    Five-table schema: kills, drops, missed_kills, battlefield_sessions,
-    chest_events.
-    Uses Ashita v4.30's built-in LuaSQLite3 with dirty-flag caching.
-
-    Per-character databases: each character gets their own DB file under
-    config/addons/lootscope/<CharName>_<ServerId>/lootscope.db matching
-    Ashita's settings folder convention. Avoids multi-box write contention
-    and keeps data separated across characters/servers.
-
-    Author: SQLCommit
-    Version: 1.4.2
-]]--
+-- LootScope per-character SQLite persistence and query caches.
 
 require 'common';
 
 local sqlite3 = require 'sqlite3';
+-- Read SQLite result codes from the binding; nil is also accepted for exec success.
+local SQLITE_OK, SQLITE_DONE = 0, 101;
+do
+    local okl, lib = pcall(require, 'lsqlite3');
+    if (okl and type(lib) == 'table') then SQLITE_OK = lib.OK or SQLITE_OK; SQLITE_DONE = lib.DONE or SQLITE_DONE; end
+end
+local schema   = require 'db_schema';
+local backfill = require 'db_backfill';
 local os_time = os.time;
 
 local db = {};
@@ -26,7 +20,7 @@ db.path = nil;
 -- Source filter → content type name mapping (shared across db.lua and analysis.lua)
 db.CONTENT_TYPE_MAP = {
     [4]  = 'Omen',
-    [5]  = 'Ambuscade',       -- WIP: no item drops, detection disabled
+    [5]  = 'Ambuscade',       -- source-zone (prev == 249 Mhaura) DOES set this; 57 rows exist
     [6]  = 'Sortie',
     [7]  = 'Dynamis',
     [10] = 'Voidwatch',
@@ -43,15 +37,19 @@ db.CONTENT_TYPE_MAP = {
     [21] = 'Skirmish',
     [22] = 'Meeble Burrows',
     [23] = 'Odyssey',
+    [25] = 'Colonization Reive',
+    [26] = 'Lair Reive',
 };
 
--- Instance content types for "All Instances" aggregate (source_filter 9).
--- Includes all zone/packet-detected instanced content.
--- Excludes buff-detected types: Voidwatch (10), Domain Invasion (11), Wildskeeper (12).
+-- Reive filters: 24 combines all kinds, 25/26 count end-spoil runs, and 12 counts Naakual kills.
+db.REIVE_CONTENT_SQL = "('Wildskeeper', 'Colonization Reive', 'Lair Reive', 'Reive')";
+
+-- Feed-only contents are excluded from instance statistics. Reive end spoils are listed under
+-- Open World; Legion is a battlefield. Keep analysis.lua's fallback in sync.
 db.INSTANCE_CONTENT_TYPES = {
-    'Omen', 'Ambuscade', 'Sortie', 'Dynamis',
-    'Einherjar', 'Nyzul', 'Salvage', 'Limbus',
-    'Vagary', 'Legion', 'Assault', 'Walk of Echoes',
+    'Omen', 'Sortie', 'Dynamis',
+    'Einherjar', 'Nyzul', 'Salvage',
+    'Vagary', 'Assault', 'Walk of Echoes',
     'Skirmish', 'Meeble Burrows', 'Odyssey',
 };
 
@@ -65,7 +63,14 @@ local function build_instance_in_clause()
 end
 db.INSTANCE_IN_SQL = build_instance_in_clause();
 
-db.char_name = nil;  -- character this DB belongs to
+-- For container-only content such as Walk of Echoes, hide mob kills from analysis lists
+-- while retaining them in storage and the live feed.
+-- Reive mobs and obstacles drop nothing either: their content's rows are the end-spoils rows.
+db.CONTAINER_ONLY_CONTENT_SQL = "('Walk of Echoes', 'Colonization Reive', 'Lair Reive', 'Reive')";
+local CONTAINER_ONLY_MOBS_OUT = " AND NOT (COALESCE(k.content_type, '') IN " .. db.CONTAINER_ONLY_CONTENT_SQL .. " AND k.source_type = 0)";
+-- A BCNM row is untagged or tagged 'BCNM'; a crate inside another content belongs to that content.
+local BCNM_CONTENT_GUARD = " AND COALESCE(k.content_type, '') IN ('', 'BCNM')";
+db.BCNM_CONTENT_GUARD = BCNM_CONTENT_GUARD;
 db._init_failed = false;  -- true if DB open failed (one-shot warning, skip all writes)
 
 -- Running counters (O(1) counts instead of COUNT(*) scans)
@@ -82,8 +87,6 @@ local FLUSH_INTERVAL = 1.0;   -- seconds between forced commits
 local FLUSH_THRESHOLD = 20;   -- ops before forced commit
 
 -- Per-cache dirty flags (each consumer only clears its own flag)
-db.kills_dirty = true;          -- legacy: consumed by UI to detect any kill mutation
-db.drops_dirty = true;          -- legacy: consumed by UI to detect any drop mutation
 db.stats_dirty = true;          -- consumed by UI + analysis to detect stat mutations
 db.recent_drops_dirty = true;   -- get_recent_drops
 db.recent_feed_dirty = true;    -- get_recent_feed
@@ -91,7 +94,6 @@ db.mob_stats_dirty = true;      -- get_mob_stats
 db.all_mob_stats_dirty = true;  -- get_all_mob_stats
 db.chest_stats_dirty = true;    -- get_chest_stats
 db.chest_events_cache_dirty = true;  -- get_recent_chest_events
-db.htbf_breakdown_dirty = true;      -- get_htbf_breakdown
 
 -- In-memory caches
 db.recent_drops_cache = nil;
@@ -108,17 +110,16 @@ db.spawn_item_cache = {};
 db.chest_events_cache = nil;
 db.chest_events_limit = 0;
 db.chest_stats_cache = nil;
+db.content_counts_cache = nil;
+db.content_counts_dirty = true;   -- get_content_counts
 
--------------------------------------------------------------------------------
 -- Initialization (deferred — called once character name is known)
--------------------------------------------------------------------------------
 
 function db.init(base_path, char_folder)
     if (db.conn ~= nil) then return true; end  -- already initialized
     if (db._init_failed) then return false; end
 
     -- Per-character subdirectory matching Ashita's settings folder convention
-    db.char_name = char_folder;
     local char_dir = base_path .. '\\' .. char_folder;
     ashita.fs.create_directory(char_dir);
 
@@ -169,221 +170,23 @@ function db.init(base_path, char_folder)
         db.conn:exec('PRAGMA foreign_keys=ON;');
         db.conn:exec('PRAGMA busy_timeout=3000;');
 
-        db.conn:exec([[
-            CREATE TABLE IF NOT EXISTS kills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mob_name TEXT NOT NULL COLLATE NOCASE,
-                mob_server_id INTEGER NOT NULL,
-                zone_id INTEGER NOT NULL,
-                zone_name TEXT NOT NULL,
-                th_level INTEGER DEFAULT 0,
-                source_type INTEGER DEFAULT 0,
-                vana_weekday INTEGER DEFAULT -1,
-                vana_hour INTEGER DEFAULT -1,
-                moon_phase INTEGER DEFAULT -1,
-                moon_percent INTEGER DEFAULT -1,
-                timestamp INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS drops (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kill_id INTEGER NOT NULL REFERENCES kills(id) ON DELETE CASCADE,
-                pool_slot INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                item_name TEXT NOT NULL,
-                quantity INTEGER DEFAULT 1,
-                won INTEGER DEFAULT 0,
-                lot_value INTEGER DEFAULT 0,
-                timestamp INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_kills_mob ON kills(mob_name, zone_id);
-            CREATE INDEX IF NOT EXISTS idx_kills_ts ON kills(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_kills_sid ON kills(mob_server_id);
-            CREATE INDEX IF NOT EXISTS idx_kills_src ON kills(source_type);
-            CREATE INDEX IF NOT EXISTS idx_drops_item ON drops(item_id);
-            CREATE INDEX IF NOT EXISTS idx_drops_kill_item ON drops(kill_id, item_id);
-        ]]);
-
-        -- Migration: check existing kills columns in a single pass
-        local kills_has = {};
-        for row in db.conn:nrows('PRAGMA table_info(kills)') do
-            kills_has[row.name] = true;
-        end
-
-        if (not kills_has.vana_weekday) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN vana_weekday INTEGER DEFAULT -1;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN vana_hour INTEGER DEFAULT -1;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN moon_phase INTEGER DEFAULT -1;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN moon_percent INTEGER DEFAULT -1;');
-        end
-
-        if (not kills_has.killer_id) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN killer_id INTEGER DEFAULT 0;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN th_action_type INTEGER DEFAULT 0;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN th_action_id INTEGER DEFAULT 0;');
-        end
-
-        if (not kills_has.weather) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN weather INTEGER DEFAULT -1;');
-        end
-
-        if (not kills_has.battlefield) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN battlefield TEXT DEFAULT NULL;');
-            db.conn:exec('ALTER TABLE kills ADD COLUMN level_cap INTEGER DEFAULT NULL;');
-        end
-
-        if (not kills_has.killer_name) then
-            db.conn:exec("ALTER TABLE kills ADD COLUMN killer_name TEXT DEFAULT '';");
-        end
-
-        if (not kills_has.is_distant) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN is_distant INTEGER DEFAULT 0;');
-        end
-
-        if (not kills_has.bf_name) then
-            db.conn:exec("ALTER TABLE kills ADD COLUMN bf_name TEXT DEFAULT '';");
-            db.conn:exec('ALTER TABLE kills ADD COLUMN bf_difficulty INTEGER DEFAULT 0;');
-        end
-
-        if (not kills_has.content_type) then
-            db.conn:exec("ALTER TABLE kills ADD COLUMN content_type TEXT DEFAULT '';");
-        end
-        -- Build the content_type index HERE, after the column is guaranteed to exist. On a fresh DB the
-        -- column is added by the ALTER above; putting this in the initial CREATE block aborts that
-        -- multi-statement exec ("no such column") and skips the indexes after it until the next open.
-        db.conn:exec("CREATE INDEX IF NOT EXISTS idx_kills_content ON kills(content_type, zone_id);");
-
-        if (not kills_has.th_estimated) then
-            db.conn:exec('ALTER TABLE kills ADD COLUMN th_estimated INTEGER DEFAULT 0;');
-        end
-
-        -- Migration: check existing drops columns in a single pass
-        local drops_has = {};
-        for row in db.conn:nrows('PRAGMA table_info(drops)') do
-            drops_has[row.name] = true;
-        end
-
-        if (not drops_has.winner_id) then
-            db.conn:exec("ALTER TABLE drops ADD COLUMN winner_id INTEGER DEFAULT 0;");
-            db.conn:exec("ALTER TABLE drops ADD COLUMN winner_name TEXT DEFAULT '';");
-            db.conn:exec("ALTER TABLE drops ADD COLUMN player_lot INTEGER DEFAULT 0;");
-            db.conn:exec("ALTER TABLE drops ADD COLUMN player_action INTEGER DEFAULT 0;");
-        end
-
-        if (not drops_has.drop_order) then
-            db.conn:exec("ALTER TABLE drops ADD COLUMN drop_order INTEGER DEFAULT -1;");
-        end
-
-        -- One-time DATA backfills, gated by PRAGMA user_version so they stop re-probing every open.
-        -- (The schema CREATE/ALTER above stays ungated - it is idempotent and self-healing.)
-        -- A FUTURE backfill must use its OWN gate ("if data_ver < 2 then ...; user_version=2"); adding it
-        -- inside this (< 1) block would never run for users already stamped version 1.
-        local data_ver = 0;
-        for row in db.conn:nrows('PRAGMA user_version') do data_ver = row.user_version; end
-        if (data_ver < 1) then
-
-        -- Migration: unify Dynamis + Dynamis [D] into single 'Dynamis' content_type
-        local needs_dyn_rename = false;
-        for row in db.conn:nrows("SELECT 1 FROM kills WHERE content_type = 'Dynamis [D]' LIMIT 1") do
-            needs_dyn_rename = true;
-        end
-        if (needs_dyn_rename) then
-            db.conn:exec("UPDATE kills SET content_type = 'Dynamis' WHERE content_type = 'Dynamis [D]';");
-        end
-        local needs_dyn_backfill = false;
-        for row in db.conn:nrows("SELECT 1 FROM kills WHERE COALESCE(content_type, '') = '' AND zone_id IN (39,40,41,42,134,135,185,186,187,188,294,295,296,297) LIMIT 1") do
-            needs_dyn_backfill = true;
-        end
-        if (needs_dyn_backfill) then
-            db.conn:exec([[
-                UPDATE kills SET content_type = 'Dynamis'
-                WHERE COALESCE(content_type, '') = ''
-                  AND zone_id IN (39, 40, 41, 42, 134, 135, 185, 186, 187, 188, 294, 295, 296, 297);
-            ]]);
-        end
-
-        -- Migration: backfill content_type for instance zones added in v1.4.0.
-        -- Fills empty content_type AND re-tags the 'Unknown Battlefield' placeholder in these
-        -- SINGLE-CONTENT zones: kills recorded before a zone's support was added got stamped
-        -- 'Unknown Battlefield' by 0x0075 (mode not yet recognised). Never touches a SPECIFIC
-        -- tag; shared zones are excluded (see the note in the table) so they keep the placeholder.
-        local instance_backfill = {
-            { 'Omen',           '292' },
-            { 'Einherjar',      '78' },
-            { 'Nyzul',          '77' },
-            { 'Salvage',        '73, 74, 75, 76' },
-            { 'Limbus',         '37, 38' },
-            -- Sortie (133/275/189), Vagary (133/275/189), Legion (183), Ambuscade (183/287)
-            -- excluded from backfill — shared zones can't be disambiguated retroactively.
-            { 'Assault',        '55, 56, 60, 63, 66, 69' },
-            { 'Walk of Echoes', '182' },
-            { 'Skirmish',       '259, 264, 271' },
-            { 'Meeble Burrows', '129' },
-        };
-        for _, entry in ipairs(instance_backfill) do
-            local ct, zones = entry[1], entry[2];
-            local needs = false;
-            for row in db.conn:nrows("SELECT 1 FROM kills WHERE (COALESCE(content_type, '') = '' OR content_type = 'Unknown Battlefield') AND zone_id IN (" .. zones .. ") LIMIT 1") do
-                needs = true;
-            end
-            if (needs) then
-                db.conn:exec("UPDATE kills SET content_type = '" .. ct .. "' WHERE (COALESCE(content_type, '') = '' OR content_type = 'Unknown Battlefield') AND zone_id IN (" .. zones .. ");");
-            end
-        end
-
-        db.conn:exec('PRAGMA user_version = 1;');   -- backfills complete; skip the probes next open
-        end  -- (data_ver < 1) gate
-
-        -- Migration: composite idx_drops_kill_item (subsumes old idx_drops_kill)
-        db.conn:exec("DROP INDEX IF EXISTS idx_drops_kill;");
-        db.conn:exec("CREATE INDEX IF NOT EXISTS idx_drops_kill_item ON drops(kill_id, item_id);");
-
-        -- Migration: missed_kills table (distant party kills with no mob identity)
-        db.conn:exec([[
-            CREATE TABLE IF NOT EXISTS missed_kills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                zone_id INTEGER NOT NULL,
-                zone_name TEXT NOT NULL,
-                timestamp INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_missed_zone ON missed_kills(zone_id);
-        ]]);
-
-        -- Migration: battlefield_sessions table for BCNM tracking
-        db.conn:exec([[
-            CREATE TABLE IF NOT EXISTS battlefield_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                battlefield_name TEXT,
-                zone_id INTEGER NOT NULL,
-                zone_name TEXT,
-                level_cap INTEGER,
-                entered_at INTEGER NOT NULL,
-                exited_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_bf_zone ON battlefield_sessions(zone_id);
-        ]]);
-
-        -- Migration: chest_events table for tracking chest/coffer failures and gil
-        db.conn:exec([[
-            CREATE TABLE IF NOT EXISTS chest_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                zone_id INTEGER NOT NULL,
-                zone_name TEXT NOT NULL,
-                container_type INTEGER NOT NULL,
-                result INTEGER NOT NULL,
-                gil_amount INTEGER DEFAULT 0,
-                vana_weekday INTEGER DEFAULT -1,
-                vana_hour INTEGER DEFAULT -1,
-                moon_phase INTEGER DEFAULT -1,
-                moon_percent INTEGER DEFAULT -1,
-                weather INTEGER DEFAULT -1,
-                timestamp INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_chest_zone ON chest_events(zone_id);
-            CREATE INDEX IF NOT EXISTS idx_chest_zone_ctype ON chest_events(zone_id, container_type);
-            CREATE INDEX IF NOT EXISTS idx_chest_ts ON chest_events(timestamp);
-        ]]);
+        -- Apply base tables, additive columns, data backfills, index changes, then auxiliary tables.
+        -- Only backfill routines rewrite existing rows.
+        schema.create_tables(db.conn);
+        schema.migrate_columns(db.conn);
+        backfill.apply(db.conn);
+        backfill.apply_v2(db.conn);        -- own gate (data_ver < 2)
+        backfill.apply_v3(db.conn);        -- own gate (data_ver < 3): classification corrections
+        backfill.apply_v4(db.conn);        -- own gate (data_ver < 4): Escha Domain Invasion recovery
+        schema.migrate_indexes(db.conn);
+        schema.create_aux_tables(db.conn);
+        -- Generation 5 requires battlefield_sessions; create auxiliary tables first.
+        backfill.apply_v5(db.conn);        -- own gate (data_ver < 5): name a battlefield kill from its session
+        backfill.apply_v6(db.conn);        -- own gate (data_ver < 6): remove fabricated zone-name battlefields
+        backfill.apply_v7(db.conn);        -- own gate (data_ver < 7): name WoE HTMB boss kills (item display)
+        backfill.apply_v8(db.conn);        -- own gate (data_ver < 8): mark those HTMB bosses HTBF (tier unknown)
+        backfill.apply_v9(db.conn);        -- own gate (data_ver < 9): strip ★ from bf_name; battlefield kills are not distant
+        backfill.apply_v10(db.conn);       -- own gate (data_ver < 10): a tier with no battlefield behind it is cleared
 
         -- Initialize running counters from existing data
         for row in db.conn:nrows('SELECT COUNT(*) as c FROM kills') do db._kill_count = row.c; end
@@ -391,14 +194,7 @@ function db.init(base_path, char_folder)
         for row in db.conn:nrows('SELECT COUNT(*) as c FROM missed_kills') do db._missed_kill_count = row.c; end
         for row in db.conn:nrows('SELECT COUNT(*) as c FROM chest_events') do db._chest_event_count = row.c; end
 
-        -- Close stale battlefield sessions (orphaned by crash/reload, older than 4h)
-        local stale_cutoff = os_time() - (4 * 60 * 60);
-        local stale_stmt = db.conn:prepare('UPDATE battlefield_sessions SET exited_at = entered_at WHERE exited_at IS NULL AND entered_at < ?');
-        if (stale_stmt ~= nil) then
-            stale_stmt:bind_values(stale_cutoff);
-            stale_stmt:step();
-            stale_stmt:finalize();
-        end
+        backfill.maintenance(db.conn);
     end);
 
     if (not schema_ok) then
@@ -412,25 +208,26 @@ function db.init(base_path, char_folder)
         return false;
     end
 
+    -- Connection is healthy again: re-arm the one-shot warnings so a LATER failure is not
+    -- swallowed.
+    db._noconn_warned = false;
+    db._write_warned  = false;
+
     return true;
 end
 
--------------------------------------------------------------------------------
 -- Helpers: Cache Invalidation
--------------------------------------------------------------------------------
 
 -- Full invalidation — only used by clear_data()
 local function invalidate_all()
-    db.kills_dirty = true;
-    db.drops_dirty = true;
     db.stats_dirty = true;
     db.recent_drops_dirty = true;
     db.recent_feed_dirty = true;
     db.mob_stats_dirty = true;
     db.all_mob_stats_dirty = true;
+    db.content_counts_dirty = true;
     db.chest_events_cache_dirty = true;
     db.chest_stats_dirty = true;
-    db.htbf_breakdown_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.mob_stats_cache = {};
@@ -442,17 +239,15 @@ local function invalidate_all()
     
     db.chest_events_cache = nil;
     db.chest_stats_cache = nil;
-    db.htbf_breakdown_cache = {};
 end
 
 -- Kill recorded: invalidates kill-related caches + stats
 local function invalidate_kills()
-    db.kills_dirty = true;
     db.stats_dirty = true;
     db.recent_feed_dirty = true;
     db.mob_stats_dirty = true;
     db.all_mob_stats_dirty = true;
-    db.htbf_breakdown_dirty = true;
+    db.content_counts_dirty = true;
     db.recent_feed_cache = nil;
     db.all_mob_stats_cache = nil;
     db.all_mob_stats_cache_key = nil;
@@ -460,18 +255,16 @@ local function invalidate_kills()
     db.spawn_stats_cache = {};
     db.spawn_item_cache = {};
     db.zone_list_cache = nil;
-    db.htbf_breakdown_cache = {};
 end
 
 -- Drop recorded: invalidates drop-related caches + stats
 local function invalidate_drops()
-    db.drops_dirty = true;
     db.stats_dirty = true;
     db.recent_drops_dirty = true;
     db.recent_feed_dirty = true;
     db.mob_stats_dirty = true;
     db.all_mob_stats_dirty = true;
-    db.htbf_breakdown_dirty = true;
+    db.content_counts_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.all_mob_stats_cache = nil;
@@ -482,13 +275,12 @@ end
 
 -- Lot result updated: invalidates feed/drop display and stats (won status affects computed stats)
 local function invalidate_drop_status()
-    db.drops_dirty = true;
     db.stats_dirty = true;
     db.recent_drops_dirty = true;
     db.recent_feed_dirty = true;
     db.mob_stats_dirty = true;
     db.all_mob_stats_dirty = true;
-    db.htbf_breakdown_dirty = true;
+    db.content_counts_dirty = true;
     db.recent_drops_cache = nil;
     db.recent_feed_cache = nil;
     db.mob_stats_cache = {};
@@ -497,9 +289,7 @@ local function invalidate_drop_status()
     db.all_mob_stats_cache_key = nil;
 end
 
--------------------------------------------------------------------------------
 -- Helpers: Transaction Batching
--------------------------------------------------------------------------------
 
 local function begin_batch()
     if (db.conn == nil) then return; end
@@ -546,6 +336,14 @@ local function warn_write_failure(what)
         'DB write failed (' .. what .. ') - some records may not be saved. Check disk space / permissions.')));
 end
 
+local function warn_no_connection(what)
+    if (db._noconn_warned) then return; end
+    db._noconn_warned = true;
+    local chat = require 'chat';
+    print(chat.header('lootscope'):append(chat.error(
+        'not connected to the database - ' .. what .. ' are NOT being recorded. Reload the addon (/addon reload lootscope).')));
+end
+
 -- Force-flush any open transaction immediately (used before scan_pool on reload)
 function db.flush_pending()
     if (not db._in_transaction) then return; end
@@ -566,12 +364,10 @@ function db.flush_writes_if_due()
     end
 end
 
--------------------------------------------------------------------------------
 -- Kill Recording
--------------------------------------------------------------------------------
 
 function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, source_type, vana_info, kill_info)
-    if (db.conn == nil) then return nil; end
+    if (db.conn == nil) then warn_no_connection('kills'); return nil; end
 
     begin_batch();
 
@@ -583,8 +379,10 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
                            vana_weekday, vana_hour, moon_phase, moon_percent, timestamp,
                            killer_id, killer_name, th_action_type, th_action_id, weather,
                            battlefield, level_cap, is_distant,
-                           bf_name, bf_difficulty, content_type, th_estimated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           bf_name, bf_difficulty, content_type, th_estimated,
+                           app_version, bf_source,
+                           previous_zone_id, entry_zone_id, content_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ]]);
     if (stmt == nil) then warn_write_failure('kill'); maybe_commit(); return nil; end
     stmt:bind_values(
@@ -600,7 +398,14 @@ function db.record_kill(mob_name, mob_server_id, zone_id, zone_name, th_level, s
         ki.is_distant or 0,
         ki.bf_name or '', ki.bf_difficulty or 0,
         ki.content_type or '',
-        ki.th_estimated or 0
+        ki.th_estimated or 0,
+        -- Provenance: which build wrote this row, and how its battlefield class was decided.
+        (_G.addon ~= nil and _G.addon.version) or '',
+        ki.bf_source or '',
+        -- previous_zone_id records the last transition; entry_zone_id survives transitions within
+        -- classify.SHARED_ZONE_GROUP.
+        ki.previous_zone_id or 0, ki.entry_zone_id or 0,
+        ki.content_source or ''
     );
     local rc = stmt:step();
     stmt:finalize();
@@ -622,19 +427,22 @@ function db.patch_kill_on_defeat(kill_id, info)
 
     begin_batch();
 
-    -- Update content_type only if the patch provides one and the existing record is empty.
-    -- This handles the race where 0x00D2 created the kill before 0x0029 could detect
-    -- buff-based content types (Voidwatch, Wildskeeper, Domain Invasion).
     local ct = info.content_type or '';
     local ct_clause = '';
-    if (ct ~= '') then
-        ct_clause = ", content_type = CASE WHEN COALESCE(content_type, '') = '' THEN ? ELSE content_type END";
+    if (ct ~= '' and ct ~= 'Unknown Battlefield') then
+        ct_clause = ", content_type = CASE WHEN COALESCE(content_type, '') IN ('', 'Unknown Battlefield') THEN ? ELSE content_type END"
+                 .. ", content_source = CASE WHEN COALESCE(content_type, '') IN ('', 'Unknown Battlefield') THEN ? ELSE content_source END";
     end
 
+    -- Never replace stored TH with a lower value: a pool-first kill may have consumed the proc already.
+    -- Each SET expression reads the pre-update row, so all three comparisons use the same old level.
+    local th = info.th_level or 0;
     local stmt = db.conn:prepare([[
         UPDATE kills SET is_distant = 0,
             killer_id = ?, killer_name = ?,
-            th_level = ?, th_action_type = ?, th_action_id = ?,
+            th_level       = CASE WHEN ? > COALESCE(th_level, 0) THEN ? ELSE COALESCE(th_level, 0) END,
+            th_action_type = CASE WHEN ? > COALESCE(th_level, 0) THEN ? ELSE th_action_type END,
+            th_action_id   = CASE WHEN ? > COALESCE(th_level, 0) THEN ? ELSE th_action_id END,
             th_estimated = ?]] .. ct_clause .. [[
         WHERE id = ? AND is_distant = 1
     ]]);
@@ -642,15 +450,15 @@ function db.patch_kill_on_defeat(kill_id, info)
     if (ct ~= '') then
         stmt:bind_values(
             info.killer_id or 0, info.killer_name or '',
-            info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
+            th, th, th, info.th_action_type or 0, th, info.th_action_id or 0,
             info.th_estimated or 0,
-            ct,
+            ct, info.content_source or '',
             kill_id
         );
     else
         stmt:bind_values(
             info.killer_id or 0, info.killer_name or '',
-            info.th_level or 0, info.th_action_type or 0, info.th_action_id or 0,
+            th, th, th, info.th_action_type or 0, th, info.th_action_id or 0,
             info.th_estimated or 0,
             kill_id
         );
@@ -665,12 +473,26 @@ function db.patch_kill_on_defeat(kill_id, info)
     maybe_commit();
 end
 
--------------------------------------------------------------------------------
 -- Drop Recording
--------------------------------------------------------------------------------
+
+-- Rename a kill row the tracker created moments ago (a Limbus chest learns its bonus/normal tier
+-- from a message that may land after the first item). Live-row write, not a backfill.
+function db.set_kill_name(kill_id, name)
+    if (db.conn == nil) then warn_no_connection('kills'); return false; end
+    if (kill_id == nil or name == nil or name == '') then return false; end
+    local stmt = db.conn:prepare('UPDATE kills SET mob_name = ? WHERE id = ?');
+    if (stmt == nil) then return false; end
+    stmt:bind_values(name, kill_id);
+    local rc = stmt:step(); stmt:finalize();
+    db.recent_feed_dirty = true;
+    return (rc == nil) or (rc == SQLITE_DONE) or (rc == SQLITE_OK);
+end
 
 function db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, won, drop_order)
-    if (db.conn == nil or kill_id == nil) then return nil; end
+    -- Split deliberately: a nil kill_id is a legitimate skip and stays silent; a nil connection is
+    -- silent DATA LOSS and must not be.
+    if (db.conn == nil) then warn_no_connection('drops'); return nil; end
+    if (kill_id == nil) then return nil; end
 
     begin_batch();
 
@@ -693,21 +515,22 @@ function db.record_drop(kill_id, pool_slot, item_id, item_name, quantity, won, d
     return rowid;
 end
 
--------------------------------------------------------------------------------
 -- Find Pending Drop (reconnect pool items after addon reload)
--------------------------------------------------------------------------------
 
-function db.find_pending_drop(pool_slot, item_id)
+--- max_age_seconds bounds how far back a reconnect may reach.
+function db.find_pending_drop(pool_slot, item_id, max_age_seconds)
     if (db.conn == nil) then return nil; end
+
+    local cutoff = os_time() - (max_age_seconds or 900);   -- 15 min: 5 min pool + reconnect margin
 
     local stmt = db.conn:prepare([[
         SELECT d.id, d.kill_id, d.item_name, d.quantity, d.won
         FROM drops d
-        WHERE d.pool_slot = ? AND d.item_id = ? AND d.won IN (0, -2)
+        WHERE d.pool_slot = ? AND d.item_id = ? AND d.won IN (0, -2) AND d.timestamp >= ?
         ORDER BY d.timestamp DESC LIMIT 1
     ]]);
     if (stmt == nil) then return nil; end
-    stmt:bind_values(pool_slot, item_id);
+    stmt:bind_values(pool_slot, item_id, cutoff);
 
     local result = nil;
     for row in stmt:nrows() do
@@ -736,30 +559,7 @@ function db.find_pending_drop(pool_slot, item_id)
     return result;
 end
 
--------------------------------------------------------------------------------
--- Kill Content Type Update (retroactive tagging)
--- Currently unused — VW kills are tagged at defeat time via buff check.
--- Kept for future content types (Ambuscade) that may need retroactive tagging.
--------------------------------------------------------------------------------
-
-function db.update_kill_content_type(kill_id, content_type)
-    if (db.conn == nil or kill_id == nil) then return; end
-
-    begin_batch();
-
-    local stmt = db.conn:prepare('UPDATE kills SET content_type = ? WHERE id = ?');
-    if (stmt == nil) then maybe_commit(); return; end
-    stmt:bind_values(content_type, kill_id);
-    stmt:step();
-    stmt:finalize();
-
-    invalidate_kills();
-    maybe_commit();
-end
-
--------------------------------------------------------------------------------
 -- Find most recent Wildskeeper kill in zone (for addon reload recovery)
--------------------------------------------------------------------------------
 
 function db.find_recent_wildskeeper_kill(zone_id, max_age_seconds)
     if (db.conn == nil or zone_id == nil) then return nil; end
@@ -781,9 +581,7 @@ function db.find_recent_wildskeeper_kill(zone_id, max_age_seconds)
     return result;
 end
 
--------------------------------------------------------------------------------
 -- Kill Name Update (retroactive mob name from chat when entity was out of range)
--------------------------------------------------------------------------------
 
 function db.update_kill_mob_name(kill_id, mob_name)
     if (db.conn == nil or kill_id == nil or mob_name == nil) then return; end
@@ -800,34 +598,50 @@ function db.update_kill_mob_name(kill_id, mob_name)
 
     invalidate_kills();
     -- Also invalidate drops (JOINs kills for mob_name)
-    db.drops_dirty = true;
     db.recent_drops_dirty = true;
     db.recent_drops_cache = nil;
     maybe_commit();
 end
 
--------------------------------------------------------------------------------
 -- Drop Update (lot result)
--------------------------------------------------------------------------------
 
-function db.update_drop_won(kill_id, pool_slot, won, lot_value, lot_info)
+--- drop_id targets ONE row and is strongly preferred.
+function db.update_drop_won(kill_id, pool_slot, won, lot_value, lot_info, drop_id)
     if (db.conn == nil) then return; end
 
     begin_batch();
 
     local li = lot_info or {};
-    local stmt = db.conn:prepare([[
-        UPDATE drops SET won = ?, lot_value = ?, winner_id = ?, winner_name = ?,
-                         player_lot = ?, player_action = ?
-        WHERE kill_id = ? AND pool_slot = ?
-    ]]);
+    local stmt;
+    if (drop_id ~= nil) then
+        stmt = db.conn:prepare([[
+            UPDATE drops SET won = ?, lot_value = ?, winner_id = ?, winner_name = ?,
+                             player_lot = ?, player_action = ?
+            WHERE id = ?
+        ]]);
+    else
+        stmt = db.conn:prepare([[
+            UPDATE drops SET won = ?, lot_value = ?, winner_id = ?, winner_name = ?,
+                             player_lot = ?, player_action = ?
+            WHERE kill_id = ? AND pool_slot = ?
+        ]]);
+    end
     if (stmt == nil) then maybe_commit(); return; end
-    stmt:bind_values(
-        won, lot_value or 0,
-        li.winner_id or 0, li.winner_name or '',
-        li.player_lot or 0, li.player_action or 0,
-        kill_id, pool_slot
-    );
+    if (drop_id ~= nil) then
+        stmt:bind_values(
+            won, lot_value or 0,
+            li.winner_id or 0, li.winner_name or '',
+            li.player_lot or 0, li.player_action or 0,
+            drop_id
+        );
+    else
+        stmt:bind_values(
+            won, lot_value or 0,
+            li.winner_id or 0, li.winner_name or '',
+            li.player_lot or 0, li.player_action or 0,
+            kill_id, pool_slot
+        );
+    end
     stmt:step();
     stmt:finalize();
 
@@ -835,9 +649,7 @@ function db.update_drop_won(kill_id, pool_slot, won, lot_value, lot_info)
     maybe_commit();
 end
 
--------------------------------------------------------------------------------
 -- Queries (cached)
--------------------------------------------------------------------------------
 
 function db.get_recent_drops(limit)
     if (db.conn == nil) then return T{}; end
@@ -850,7 +662,7 @@ function db.get_recent_drops(limit)
     local results = T{};
     local stmt = db.conn:prepare([[
         SELECT d.*,
-               CASE WHEN k.source_type = 3 THEN COALESCE(k.battlefield, k.mob_name) ELSE k.mob_name END AS mob_name,
+               CASE WHEN k.source_type IN (2,3) AND COALESCE(k.content_type,'') IN ('', 'BCNM') THEN COALESCE(NULLIF(k.battlefield,''), NULLIF(k.bf_name,''), k.mob_name) ELSE k.mob_name END AS mob_name,
                k.zone_name, k.zone_id, k.th_level, k.source_type,
                k.timestamp as kill_ts,
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
@@ -888,10 +700,16 @@ function db.get_recent_feed(limit)
     local results = T{};
     local stmt = db.conn:prepare([[
         SELECT 'drop' as feed_type, d.timestamp as ts,
-               CASE WHEN k.source_type = 3 THEN COALESCE(k.battlefield, k.mob_name) ELSE k.mob_name END as mob_name,
+               -- 🚨 A named battlefield shows ITS name as the source, for boss/mob drops the
+               -- same as for its crate/coffer -- so an HTBF's items read the HTBF name, not
+               -- the boss mob's. Falls to mob_name in the open world (battlefield/bf_name empty).
+               -- Battlefield CONTENT only: a Walk of Echoes row carries "Walk #3" there and keeps its name.
+               CASE WHEN COALESCE(k.content_type,'') IN ('', 'BCNM')
+                    THEN COALESCE(NULLIF(k.battlefield,''), NULLIF(k.bf_name,''), k.mob_name)
+                    ELSE k.mob_name END as mob_name,
                k.zone_name, k.zone_id, k.th_level, k.source_type,
                d.item_name, d.item_id, d.quantity, d.won, d.pool_slot, d.kill_id,
-               d.lot_value, d.winner_name,
+               d.lot_value, d.winner_name, d.player_action,
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
                k.weather, k.killer_name,
                0 as container_type, 0 as chest_result, 0 as gil_amount,
@@ -903,10 +721,16 @@ function db.get_recent_feed(limit)
         JOIN kills k ON d.kill_id = k.id
         UNION ALL
         SELECT 'kill' as feed_type, k.timestamp as ts,
-               k.mob_name,
+               -- 🚨 A KILL row names the MOB. Only a container (chest/coffer/crate) takes the
+               -- battlefield name -- it is not a mob. Applying the battlefield rule to mob kills
+               -- (2026-08-31) made every scorpion in a BCNM read as the BCNM (reported 2026-09-02).
+               -- The item rule above is unchanged: a battlefield's DROPS still read its name.
+               CASE WHEN k.source_type IN (1, 2, 3) AND COALESCE(k.content_type,'') IN ('', 'BCNM')
+                    THEN COALESCE(NULLIF(k.battlefield,''), NULLIF(k.bf_name,''), k.mob_name)
+                    ELSE k.mob_name END as mob_name,
                k.zone_name, k.zone_id, k.th_level, k.source_type,
                NULL, 0, 0, 0, -1, k.id,
-               0, '',
+               0, '', 0,
                k.mob_server_id, k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,
                k.weather, k.killer_name,
                0, 0, 0,
@@ -920,7 +744,7 @@ function db.get_recent_feed(limit)
         SELECT 'chest' as feed_type, ce.timestamp as ts,
                '' as mob_name, ce.zone_name, ce.zone_id, 0 as th_level, ce.container_type as source_type,
                NULL, 0, 0, 0, -1, 0,
-               0, '',
+               0, '', 0,
                0, ce.vana_weekday, ce.vana_hour, ce.moon_phase, ce.moon_percent,
                ce.weather, '' as killer_name,
                ce.container_type, ce.result, ce.gil_amount,
@@ -962,6 +786,7 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     local is_content = (db.CONTENT_TYPE_MAP[source_filter] ~= nil);
     local is_all_bf = (source_filter == 8);
     local is_all_inst = (source_filter == 9);
+    local is_all_reive = (source_filter == 24);
     local kill_query, item_query;
 
     if (is_htbf) then
@@ -974,24 +799,43 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
             WHERE ]] .. k_bf_name_expr .. [[ = ? AND k.zone_id = ? AND k.bf_difficulty = ?
             GROUP BY d.item_id ORDER BY times_dropped DESC
         ]];
     elseif (is_bcnm) then
-        -- BCNM: must match get_all_mob_stats(2) which filters source_type=3 AND bf_difficulty=0
-        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE COALESCE(battlefield, \'Unknown BCNM\') = ? AND zone_id = ? AND source_type = 3 AND bf_difficulty = 0';
+        -- BCNM: must match get_all_mob_stats(2) -- either source_type=3 or content_type='BCNM'
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant, SUM(CASE WHEN source_type IN (2, 3) THEN 1 ELSE 0 END) as runs, SUM(CASE WHEN source_type IN (2, 3) AND is_distant = 1 THEN 1 ELSE 0 END) as runs_distant FROM kills WHERE COALESCE(NULLIF(battlefield, \'\'), NULLIF(bf_name, \'\'), \'Unknown BCNM\') = ? AND zone_id = ? AND (source_type = 3 OR COALESCE(content_type, \'\') = \'BCNM\' AND (COALESCE(battlefield, \'\') <> \'\' OR COALESCE(bf_name, \'\') <> \'\')) AND COALESCE(bf_difficulty, 0) = 0 AND COALESCE(content_type, \'\') IN (\'\', \'BCNM\')';
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3 AND k.bf_difficulty = 0
+            WHERE COALESCE(NULLIF(k.battlefield, ''), NULLIF(k.bf_name, ''), 'Unknown BCNM') = ? AND k.zone_id = ? AND (k.source_type = 3 OR (COALESCE(k.content_type, '') = 'BCNM' AND (COALESCE(k.battlefield, '') <> '' OR COALESCE(k.bf_name, '') <> ''))) AND COALESCE(k.bf_difficulty, 0) = 0]] .. BCNM_CONTENT_GUARD .. [[
+
         ]];
         -- Add level_cap filter if present
         if (level_cap ~= nil) then
@@ -1010,7 +854,16 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
             WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') = ']] .. ct .. [['
@@ -1023,13 +876,23 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
         local k_bf_expr = "COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name))";
         local lc = level_cap or 0;
         local bd = bf_difficulty or 0;
-        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE ' .. bf_expr .. ' = ? AND zone_id = ? AND COALESCE(level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(bf_difficulty, 0) = ' .. tostring(bd);
+        -- BCNM trials use chest opens; HTBF trials retain kill counts.
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant, SUM(CASE WHEN source_type IN (2, 3) THEN 1 ELSE 0 END) as runs, SUM(CASE WHEN source_type IN (2, 3) AND is_distant = 1 THEN 1 ELSE 0 END) as runs_distant FROM kills WHERE ' .. bf_expr .. ' = ? AND zone_id = ? AND COALESCE(level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(bf_difficulty, 0) = ' .. tostring(bd);
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
             WHERE ]] .. k_bf_expr .. [[ = ? AND k.zone_id = ? AND COALESCE(k.level_cap, 0) = ]] .. tostring(lc) .. [[ AND COALESCE(k.bf_difficulty, 0) = ]] .. tostring(bd) .. [[
@@ -1037,32 +900,51 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
             GROUP BY d.item_id
             ORDER BY times_dropped DESC
         ]];
-    elseif (is_all_inst) then
-        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') IN " .. db.INSTANCE_IN_SQL;
+    elseif (is_all_inst or is_all_reive) then
+        local in_sql = is_all_reive and db.REIVE_CONTENT_SQL or db.INSTANCE_IN_SQL;
+        kill_query = "SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND COALESCE(content_type, '') IN " .. in_sql;
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ]] .. db.INSTANCE_IN_SQL .. [[
+            WHERE k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN ]] .. in_sql .. [[
             GROUP BY d.item_id
             ORDER BY times_dropped DESC
         ]];
     elseif (source_filter == 1) then
         -- Chest/Coffer: must match get_all_mob_stats(1) which filters source_type IN (1,2)
-        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND source_type IN (1, 2)';
+        kill_query = 'SELECT COUNT(*) as c, SUM(CASE WHEN is_distant = 1 THEN 1 ELSE 0 END) as distant FROM kills WHERE mob_name = ? AND zone_id = ? AND source_type IN (1, 2) AND COALESCE(content_type, \'\') = \'\'';
         item_query = [[
             SELECT d.item_id, d.item_name,
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
-            WHERE k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2)
+            WHERE k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2) AND COALESCE(k.content_type, '') = ''
             GROUP BY d.item_id
             ORDER BY times_dropped DESC
         ]];
@@ -1075,7 +957,16 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                    COUNT(*) as times_dropped,
                    SUM(d.quantity) as total_qty,
                    SUM(CASE WHEN d.won = 1 THEN 1 ELSE 0 END) as times_won,
-                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped
+                   SUM(CASE WHEN d.won = -1 THEN 1 ELSE 0 END) as times_left,
+                   SUM(CASE WHEN d.won IN (0, -2) THEN 1 ELSE 0 END) as times_pending,
+                   SUM(CASE WHEN k.is_distant = 0 THEN 1 ELSE 0 END) as nearby_times_dropped,
+                   -- Number of KILLS that yielded this item, not the number of drop ROWS.
+                   -- times_dropped/nearby_times_dropped count rows and are correct for display
+                   -- ("3x", average stack size), but a mob dropping 3 of an item on one kill makes
+                   -- them exceed the kill count. Probability maths (rate, Wilson CI, expected-empty)
+                   -- needs successes-out-of-trials, so it must use this instead.
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 0 THEN d.kill_id END) as nearby_kills_with_drop,
+                   COUNT(DISTINCT d.kill_id) as kills_with_drop
             FROM drops d
             JOIN kills k ON d.kill_id = k.id
             WHERE k.mob_name = ? AND k.zone_id = ? AND k.source_type = 0 AND COALESCE(k.content_type, '') = ''
@@ -1097,6 +988,13 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     for row in stmt:nrows() do
         result.kills = row.c;
         result.distant_kills = row.distant or 0;
+        -- Use chest opens as the BCNM denominator, falling back to matched kills if no crate was recorded.
+        -- HTBF rows retain the kill denominator.
+        local bcnm_denominator = is_bcnm or (is_all_bf and (bf_difficulty or 0) == 0);
+        if (bcnm_denominator and row.runs ~= nil and row.runs > 0) then
+            result.kills = row.runs;
+            result.distant_kills = row.runs_distant or 0;
+        end
     end
     stmt:finalize();
 
@@ -1136,11 +1034,14 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     end
     local nearby_kills = result.kills - result.distant_kills;
     for row in stmt2:nrows() do
-        local nearby_dropped = row.nearby_times_dropped or row.times_dropped;
+        -- Probability uses kills yielding an item, not drop-row count; retain row counts for quantity
+        -- display.
+        local nearby_hits = row.nearby_kills_with_drop or row.nearby_times_dropped or row.times_dropped;
+        local hits = row.kills_with_drop or row.times_dropped;
         -- Primary rate: nearby kills only (unbiased)
-        row.drop_rate = (nearby_kills > 0) and (nearby_dropped / nearby_kills) * 100 or 0;
+        row.drop_rate = (nearby_kills > 0) and (nearby_hits / nearby_kills) * 100 or 0;
         -- Combined rate: includes distant kills (biased — distant kills always have drops)
-        row.combined_rate = (result.kills > 0) and (row.times_dropped / result.kills) * 100 or -1;
+        row.combined_rate = (result.kills > 0) and (hits / result.kills) * 100 or -1;
         -- Gil (65535): shown in breakdown but excluded from aggregate counts
         if (row.item_id == 65535) then
             row.is_gil_drop = true;
@@ -1166,7 +1067,8 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                 gil_q = [[
                     SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil
                     FROM drops d JOIN kills k ON d.kill_id = k.id
-                    WHERE d.item_id = 65535 AND COALESCE(k.battlefield, 'Unknown BCNM') = ? AND k.zone_id = ? AND k.source_type = 3 AND k.bf_difficulty = 0
+                    WHERE d.item_id = 65535 AND COALESCE(NULLIF(k.battlefield, ''), NULLIF(k.bf_name, ''), 'Unknown BCNM') = ? AND k.zone_id = ? AND (k.source_type = 3 OR (COALESCE(k.content_type, '') = 'BCNM' AND (COALESCE(k.battlefield, '') <> '' OR COALESCE(k.bf_name, '') <> ''))) AND COALESCE(k.bf_difficulty, 0) = 0]] .. BCNM_CONTENT_GUARD .. [[
+
                 ]];
                 if (level_cap ~= nil) then
                     gil_q = gil_q .. ' AND k.level_cap = ?';
@@ -1185,11 +1087,11 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
                 local bd = bf_difficulty or 0;
                 gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND ' .. k_bf .. ' = ? AND k.zone_id = ? AND COALESCE(k.level_cap, 0) = ' .. tostring(lc) .. ' AND COALESCE(k.bf_difficulty, 0) = ' .. tostring(bd);
                 gil_params = { mob_name, zone_id };
-            elseif (is_all_inst) then
-                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN " .. db.INSTANCE_IN_SQL;
+            elseif (is_all_inst or is_all_reive) then
+                gil_q = "SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND COALESCE(k.content_type, '') IN " .. (is_all_reive and db.REIVE_CONTENT_SQL or db.INSTANCE_IN_SQL);
                 gil_params = { mob_name, zone_id };
             elseif (source_filter == 1) then
-                gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2)';
+                gil_q = 'SELECT MIN(d.quantity) as min_gil, MAX(d.quantity) as max_gil FROM drops d JOIN kills k ON d.kill_id = k.id WHERE d.item_id = 65535 AND k.mob_name = ? AND k.zone_id = ? AND k.source_type IN (1, 2) AND COALESCE(k.content_type, \'\') = \'\'';
                 gil_params = { mob_name, zone_id };
             else
                 -- Field: exclude content-tagged kills
@@ -1277,6 +1179,21 @@ function db.get_mob_stats(mob_name, zone_id, source_filter, level_cap, bf_diffic
     return result;
 end
 
+-- The five aggregate columns every get_all_mob_stats variant selects.
+local STATS_AGG_COLS = [[
+                   COUNT(DISTINCT k.id) as kill_count,
+                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
+                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
+                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
+                   COUNT(DISTINCT k.mob_server_id) as unique_spawns]];
+
+local function finalise_stats_row(row)
+    local has_runs = (row.run_count ~= nil and row.run_count > 0);
+    local denom    = has_runs and row.run_count or row.kill_count;
+    row.runs       = has_runs and row.run_count or nil;
+    row.avg_drops  = denom > 0 and (row.drop_count / denom) or 0;
+end
+
 function db.get_all_mob_stats(source_filter)
     if (db.conn == nil) then return T{}; end
 
@@ -1293,34 +1210,49 @@ function db.get_all_mob_stats(source_filter)
     if (source_filter == 0) then
         where_clause = " WHERE k.source_type = 0 AND COALESCE(k.content_type, '') = ''";
     elseif (source_filter == 1) then
-        where_clause = ' WHERE k.source_type IN (1, 2)';
+        -- Chest/Coffer means OPEN-WORLD treasure chests and coffers.
+        where_clause = " WHERE k.source_type IN (1, 2) AND COALESCE(k.content_type, '') = ''";
     elseif (source_filter == 2) then
-        where_clause = ' WHERE k.source_type = 3 AND k.bf_difficulty = 0';
+        -- Exclude instance crates, such as Einherjar's Armoury Crate, from BCNM results.
+        where_clause = " WHERE (k.source_type = 3 OR (COALESCE(k.content_type, '') = 'BCNM'"
+                    .. " AND (COALESCE(k.battlefield, '') <> '' OR COALESCE(k.bf_name, '') <> '')))"
+                    .. " AND COALESCE(k.bf_difficulty, 0) = 0" .. BCNM_CONTENT_GUARD;
     elseif (source_filter == 3) then
         where_clause = ' WHERE k.bf_difficulty > 0';
     elseif (db.CONTENT_TYPE_MAP[source_filter] ~= nil) then
-        where_clause = " WHERE COALESCE(k.content_type, '') = '" .. db.CONTENT_TYPE_MAP[source_filter] .. "'";
+        where_clause = " WHERE COALESCE(k.content_type, '') = '" .. db.CONTENT_TYPE_MAP[source_filter] .. "'" .. CONTAINER_ONLY_MOBS_OUT;
     elseif (source_filter == 8) then
-        where_clause = ' WHERE (k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0';
+        -- All Battlefields requires a BCNM name or an HTBF difficulty; do not group unnamed field mobs
+        -- here.
+        where_clause = " WHERE ((k.source_type = 3 OR (COALESCE(k.content_type, '') = 'BCNM'"
+                    .. " AND (COALESCE(k.battlefield, '') <> '' OR COALESCE(k.bf_name, '') <> '')))"
+                    .. " AND COALESCE(k.bf_difficulty, 0) = 0" .. BCNM_CONTENT_GUARD .. ") OR k.bf_difficulty > 0";
     elseif (source_filter == 9) then
-        where_clause = " WHERE COALESCE(k.content_type, '') IN " .. db.INSTANCE_IN_SQL;
+        where_clause = " WHERE COALESCE(k.content_type, '') IN " .. db.INSTANCE_IN_SQL .. CONTAINER_ONLY_MOBS_OUT;
+    elseif (source_filter == 24) then
+        where_clause = " WHERE COALESCE(k.content_type, '') IN " .. db.REIVE_CONTENT_SQL .. CONTAINER_ONLY_MOBS_OUT;
     end
 
     -- BCNM/HTBF view: group by battlefield name; gil excluded from drop counts
     local query;
     if (source_filter == 2) then
         query = [[
-            SELECT COALESCE(k.battlefield, 'Unknown BCNM') as mob_name,
+            SELECT COALESCE(NULLIF(k.battlefield, ''), NULLIF(k.bf_name, ''), 'Unknown BCNM') as mob_name,
                    k.zone_name, k.zone_id, k.level_cap,
-                   COUNT(DISTINCT k.id) as kill_count,
-                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
-                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
-                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
-                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+                   COUNT(DISTINCT CASE WHEN k.source_type IN (2, 3) THEN k.id END) as run_count,
+]] .. STATS_AGG_COLS .. [[
+
             FROM kills k
             LEFT JOIN drops d ON d.kill_id = k.id
         ]] .. where_clause .. [[
-            GROUP BY COALESCE(k.battlefield, 'Unknown BCNM'), k.zone_id, k.level_cap
+            GROUP BY COALESCE(NULLIF(k.battlefield, ''), NULLIF(k.bf_name, ''), 'Unknown BCNM'), k.zone_id, k.level_cap
+            -- This is a LOOT tracker: Stats/Slot model drop odds, so the population must be things
+            -- that CAN drop. Mission BCNMs (Shadow Lord, Rank 2/5, Save the Children, ...) have no
+            -- chest and no loot table -- measured: 6 of 12 rows here were pure noise. A run where you
+            -- wiped without opening the chest is likewise not a trial. Keep a battlefield only if it
+            -- has ever opened a container or ever produced a drop.
+            HAVING COUNT(DISTINCT CASE WHEN k.source_type IN (2, 3) THEN k.id END) > 0
+                OR COUNT(CASE WHEN d.item_id != 65535 THEN d.id END) > 0
             ORDER BY kill_count DESC
         ]];
     elseif (source_filter == 3) then
@@ -1328,11 +1260,8 @@ function db.get_all_mob_stats(source_filter)
         query = [[
             SELECT COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF')) as mob_name,
                    k.zone_name, k.zone_id, k.bf_difficulty,
-                   COUNT(DISTINCT k.id) as kill_count,
-                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
-                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
-                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
-                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+]] .. STATS_AGG_COLS .. [[
+
             FROM kills k
             LEFT JOIN drops d ON d.kill_id = k.id
         ]] .. where_clause .. [[
@@ -1345,25 +1274,33 @@ function db.get_all_mob_stats(source_filter)
         query = [[
             SELECT COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name)) as mob_name,
                    k.zone_name, k.zone_id, k.level_cap, k.bf_difficulty,
-                   COUNT(DISTINCT k.id) as kill_count,
-                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
-                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
-                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
-                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+                   COUNT(DISTINCT CASE WHEN k.source_type IN (2, 3) THEN k.id END) as run_count,
+]] .. STATS_AGG_COLS .. [[
+
             FROM kills k
             LEFT JOIN drops d ON d.kill_id = k.id
         ]] .. where_clause .. [[
             GROUP BY COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, k.mob_name)), k.zone_id, k.level_cap, k.bf_difficulty
             ORDER BY kill_count DESC
         ]];
+    elseif (source_filter == 9 or source_filter == 24) then
+        -- Aggregates over several contents: a mob name shared by two contents in one zone (275 hosts
+        -- Vagary and Skirmish) must not merge, and the row has to say which content it is.
+        query = [[
+            SELECT k.mob_name, k.zone_name, k.zone_id, COALESCE(k.content_type, '') as content_type,
+]] .. STATS_AGG_COLS .. [[
+
+            FROM kills k
+            LEFT JOIN drops d ON d.kill_id = k.id
+        ]] .. where_clause .. [[
+            GROUP BY k.mob_name, k.zone_id, COALESCE(k.content_type, '')
+            ORDER BY kill_count DESC
+        ]];
     else
         query = [[
             SELECT k.mob_name, k.zone_name, k.zone_id,
-                   COUNT(DISTINCT k.id) as kill_count,
-                   COUNT(DISTINCT CASE WHEN k.is_distant = 1 THEN k.id ELSE NULL END) as distant_kills,
-                   COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
-                   COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items,
-                   COUNT(DISTINCT k.mob_server_id) as unique_spawns
+]] .. STATS_AGG_COLS .. [[
+
             FROM kills k
             LEFT JOIN drops d ON d.kill_id = k.id
         ]] .. where_clause .. [[
@@ -1375,7 +1312,7 @@ function db.get_all_mob_stats(source_filter)
     local stmt = db.conn:prepare(query);
     if (stmt == nil) then return results; end
     for row in stmt:nrows() do
-        row.avg_drops = row.kill_count > 0 and (row.drop_count / row.kill_count) or 0;
+        finalise_stats_row(row);
         results:append(row);
     end
     stmt:finalize();
@@ -1455,59 +1392,14 @@ function db.get_all_mob_stats(source_filter)
     return results;
 end
 
--------------------------------------------------------------------------------
--- HTBF Difficulty Breakdown (per mob/zone, grouped by difficulty)
--------------------------------------------------------------------------------
-
--- Cache for HTBF breakdown data
-db.htbf_breakdown_cache = {};
-
-function db.get_htbf_breakdown(mob_name, zone_id)
-    if (db.conn == nil) then return nil; end
-
-    local key = (mob_name or '') .. '_' .. tostring(zone_id or 0);
-    if (not db.htbf_breakdown_dirty and db.htbf_breakdown_cache[key] ~= nil) then
-        return db.htbf_breakdown_cache[key];
-    end
-
-    local results = T{};
-    local stmt = db.conn:prepare([[
-        SELECT k.bf_difficulty, k.bf_name,
-               COUNT(DISTINCT k.id) as kill_count,
-               COUNT(CASE WHEN d.item_id != 65535 THEN d.id ELSE NULL END) as drop_count,
-               COUNT(DISTINCT CASE WHEN d.item_id != 65535 THEN d.item_id ELSE NULL END) as unique_items
-        FROM kills k
-        LEFT JOIN drops d ON d.kill_id = k.id
-        WHERE COALESCE(NULLIF(k.bf_name, ''), COALESCE(k.battlefield, 'Unknown HTBF')) = ? AND k.zone_id = ? AND k.source_type = 3
-              AND k.bf_difficulty > 0
-        GROUP BY k.bf_difficulty
-        ORDER BY k.bf_difficulty ASC
-    ]]);
-    if (stmt == nil) then return results; end
-    stmt:bind_values(mob_name, zone_id);
-    for row in stmt:nrows() do
-        row.avg_drops = row.kill_count > 0 and (row.drop_count / row.kill_count) or 0;
-        results:append(row);
-    end
-    stmt:finalize();
-
-    db.htbf_breakdown_cache[key] = results;
-    db.htbf_breakdown_dirty = false;
-    return results;
-end
-
--------------------------------------------------------------------------------
 -- Counts (O(1) via running counters)
--------------------------------------------------------------------------------
 
 function db.get_counts()
     if (db.conn == nil) then return 0, 0, 0, 0; end
     return db._kill_count, db._drop_count, db._missed_kill_count, db._chest_event_count;
 end
 
--------------------------------------------------------------------------------
 -- Missed Kills (distant party kills with no mob identity)
--------------------------------------------------------------------------------
 
 function db.record_missed_kill(zone_id, zone_name)
     if (db.conn == nil) then return; end
@@ -1528,9 +1420,7 @@ function db.record_missed_kill(zone_id, zone_name)
     maybe_commit();
 end
 
--------------------------------------------------------------------------------
 -- Zone List (for filter dropdowns)
--------------------------------------------------------------------------------
 
 function db.get_zone_list()
     if (db.conn == nil) then return T{}; end
@@ -1551,9 +1441,7 @@ function db.get_zone_list()
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Per-Spawn Stats (by mob_server_id)
--------------------------------------------------------------------------------
 
 function db.get_spawn_stats(mob_name, zone_id)
     if (db.conn == nil) then return T{}; end
@@ -1579,7 +1467,7 @@ function db.get_spawn_stats(mob_name, zone_id)
     if (stmt == nil) then return results; end
     stmt:bind_values(mob_name, zone_id);
     for row in stmt:nrows() do
-        row.avg_drops = row.kill_count > 0 and (row.drop_count / row.kill_count) or 0;
+        finalise_stats_row(row);
         results:append(row);
     end
     stmt:finalize();
@@ -1588,9 +1476,7 @@ function db.get_spawn_stats(mob_name, zone_id)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Per-Spawn Item Breakdown
--------------------------------------------------------------------------------
 
 function db.get_spawn_item_stats(mob_name, zone_id, mob_server_id)
     if (db.conn == nil) then return T{}; end
@@ -1663,9 +1549,23 @@ function db.get_spawn_item_stats(mob_name, zone_id, mob_server_id)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Filtered Export: Shared filter builder
--------------------------------------------------------------------------------
+
+-- The export SELECT column list.
+local function export_base_query(join_type)
+    return 'SELECT k.id AS kill_id, k.timestamp, COALESCE(k.battlefield, k.mob_name) AS mob_name, k.mob_server_id,'
+        .. ' k.zone_name, k.zone_id, k.th_level, k.source_type,'
+        .. ' k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,'
+        .. ' k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,'
+        .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
+        .. " COALESCE(k.content_type, '') AS content_type,"
+        .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
+        .. ' COALESCE(k.th_estimated, 0) AS th_estimated,'
+        .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
+        .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
+        .. ' d.timestamp AS drop_timestamp'
+        .. ' FROM kills k ' .. join_type .. ' JOIN drops d ON d.kill_id = k.id';
+end
 
 local function build_export_filters(filters)
     local f = filters or {};
@@ -1819,9 +1719,7 @@ local function build_export_filters(filters)
     return conditions, params, has_drop_filter, join_type;
 end
 
--------------------------------------------------------------------------------
 -- Chest Event UNION Builder (for filtered export)
--------------------------------------------------------------------------------
 
 local function build_chest_event_union(filters)
     local f = filters or {};
@@ -1901,7 +1799,6 @@ local function build_chest_event_union(filters)
     end
 
     -- Item search: filter chest events by their computed item_name
-    -- (e.g. "Gil", "Lockpick Failed", "Trapped!", "Mimic!", "Illusion")
     if (f.item_search ~= nil and f.item_search ~= '') then
         conditions[#conditions + 1] = "(CASE ce.result"
             .. " WHEN 0 THEN 'Gil'"
@@ -1959,27 +1856,14 @@ local function build_chest_event_union(filters)
     return query, params;
 end
 
--------------------------------------------------------------------------------
 -- Filtered Export Query (for Export tab)
--------------------------------------------------------------------------------
 
 function db.get_filtered_export(filters, limit)
     if (db.conn == nil) then return T{}, 0; end
 
     local conditions, params, _, join_type = build_export_filters(filters);
 
-    local query = 'SELECT k.id AS kill_id, k.timestamp, COALESCE(k.battlefield, k.mob_name) AS mob_name, k.mob_server_id,'
-        .. ' k.zone_name, k.zone_id, k.th_level, k.source_type,'
-        .. ' k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,'
-        .. ' k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,'
-        .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
-        .. " COALESCE(k.content_type, '') AS content_type,"
-        .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
-        .. ' COALESCE(k.th_estimated, 0) AS th_estimated,'
-        .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
-        .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
-        .. ' d.timestamp AS drop_timestamp'
-        .. ' FROM kills k ' .. join_type .. ' JOIN drops d ON d.kill_id = k.id';
+    local query = export_base_query(join_type);
 
     if (#conditions > 0) then
         query = query .. ' WHERE ' .. table.concat(conditions, ' AND ');
@@ -2014,9 +1898,7 @@ function db.get_filtered_export(filters, limit)
     return results, #results;
 end
 
--------------------------------------------------------------------------------
 -- Filtered Export Count
--------------------------------------------------------------------------------
 
 function db.get_filtered_export_count(filters)
     if (db.conn == nil) then return 0; end
@@ -2061,9 +1943,7 @@ function db.get_filtered_export_count(filters)
     return count;
 end
 
--------------------------------------------------------------------------------
 -- Battlefield Sessions (BCNM tracking)
--------------------------------------------------------------------------------
 
 function db.record_battlefield_entry(name, zone_id, zone_name, timestamp)
     if (db.conn == nil) then return; end
@@ -2138,9 +2018,7 @@ function db.get_active_battlefield(zone_id)
     return result;
 end
 
--------------------------------------------------------------------------------
 -- Chest Event Recording
--------------------------------------------------------------------------------
 
 function db.record_chest_event(zone_id, zone_name, container_type, result, gil_amount, vana_info)
     if (db.conn == nil) then return nil; end
@@ -2176,9 +2054,9 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
     -- Also invalidate feed + stats (chest events appear in both)
     db.recent_feed_dirty = true;
     db.recent_feed_cache = nil;
-    db.kills_dirty = true;
     db.stats_dirty = true;
     db.all_mob_stats_dirty = true;
+    db.content_counts_dirty = true;
     db.mob_stats_dirty = true;
     db.mob_stats_cache = {};
 
@@ -2187,9 +2065,7 @@ function db.record_chest_event(zone_id, zone_name, container_type, result, gil_a
     return rowid;
 end
 
--------------------------------------------------------------------------------
 -- Chest Event Queries (cached)
--------------------------------------------------------------------------------
 
 function db.get_recent_chest_events(limit)
     if (db.conn == nil) then return T{}; end
@@ -2216,6 +2092,24 @@ function db.get_recent_chest_events(limit)
     db.chest_events_limit = limit;
     db.chest_events_cache_dirty = false;
     return results;
+end
+
+-- Kill-row counts per content for the Instances combo: contents with data, with their counts.
+-- Container-only contents count their coffer rows (the mobs are hidden from the lists too).
+function db.get_content_counts()
+    if (db.conn == nil) then return {}; end
+    if (db.content_counts_cache ~= nil and not db.stats_dirty and not db.content_counts_dirty) then
+        return db.content_counts_cache;
+    end
+    local counts = {};
+    local stmt = db.conn:prepare("SELECT COALESCE(k.content_type, '') as ct, COUNT(*) as c FROM kills k WHERE COALESCE(k.content_type, '') <> ''"
+        .. CONTAINER_ONLY_MOBS_OUT .. " GROUP BY COALESCE(k.content_type, '')");
+    if (stmt == nil) then return counts; end
+    for row in stmt:nrows() do counts[row.ct] = row.c; end
+    stmt:finalize();
+    db.content_counts_cache = counts;
+    db.content_counts_dirty = false;
+    return counts;
 end
 
 function db.get_chest_stats()
@@ -2256,9 +2150,7 @@ function db.get_chest_stats()
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Clear Data
--------------------------------------------------------------------------------
 
 function db.clear_data()
     if (db.conn == nil) then return; end
@@ -2292,9 +2184,7 @@ function db.clear_data()
     invalidate_all();
 end
 
--------------------------------------------------------------------------------
 -- Export: Streaming (constant memory instead of loading entire DB)
--------------------------------------------------------------------------------
 
 function db.stream_export_all(write_row)
     if (db.conn == nil) then return; end
@@ -2389,18 +2279,7 @@ function db.stream_filtered_export(filters, write_row)
 
     local conditions, params, _, join_type = build_export_filters(filters);
 
-    local query = 'SELECT k.id AS kill_id, k.timestamp, COALESCE(k.battlefield, k.mob_name) AS mob_name, k.mob_server_id,'
-        .. ' k.zone_name, k.zone_id, k.th_level, k.source_type,'
-        .. ' k.vana_weekday, k.vana_hour, k.moon_phase, k.moon_percent,'
-        .. ' k.killer_id, k.killer_name, k.th_action_type, k.th_action_id, k.weather,'
-        .. " COALESCE(k.bf_name, '') AS bf_name, k.bf_difficulty,"
-        .. " COALESCE(k.content_type, '') AS content_type,"
-        .. ' COALESCE(k.is_distant, 0) AS is_distant, k.level_cap,'
-        .. ' COALESCE(k.th_estimated, 0) AS th_estimated,'
-        .. ' d.item_name, d.item_id, d.pool_slot, d.quantity, d.won, d.lot_value,'
-        .. ' d.winner_id, d.winner_name, d.player_lot, d.player_action,'
-        .. ' d.timestamp AS drop_timestamp'
-        .. ' FROM kills k ' .. join_type .. ' JOIN drops d ON d.kill_id = k.id';
+    local query = export_base_query(join_type);
 
     if (#conditions > 0) then
         query = query .. ' WHERE ' .. table.concat(conditions, ' AND ');
@@ -2428,9 +2307,7 @@ function db.stream_filtered_export(filters, write_row)
     stmt:finalize();
 end
 
--------------------------------------------------------------------------------
 -- TH Items Database (shared, addon-local)
--------------------------------------------------------------------------------
 
 db.th_conn = nil;       -- separate connection for th_items.db
 db.th_path = nil;
@@ -2446,8 +2323,8 @@ db.SLOT_NAMES = {
 };
 
 -- Retail TH gear seed data: { item_id, item_name, th_value, slot_id, notes }
--- Source: https://www.bg-wiki.com/ffxi/Treasure_Hunter (verified 2026-03-07)
--- Items with th_value=0 are augmentable — TH comes from augment, not intrinsic.
+-- Source: https://www.bg-wiki.com/ffxi/Treasure_Hunter
+-- Items with th_value=0 are augmentable, TH comes from augment, not intrinsic.
 -- Auto-detection reads augments from equipped gear at scan time.
 local RETAIL_TH_ITEMS = {
     -- Daggers (Main hand, slot 0)
@@ -2518,30 +2395,34 @@ function db.init_th_items(addon_path)
     if (db.th_conn ~= nil) then return true; end
     if (db._th_init_failed) then return false; end
 
-    -- Store in data/ subfolder to keep shm/wal files out of the addon root
+    -- Keep shipped th_items.default.db read-only and overrides in config/th_items.db.
+    -- User profiles shadow shipped names; editing copies the profile first, and reset deletes that copy.
     local th_dir = addon_path .. '\\data';
     ashita.fs.create_directory(th_dir);
-    db.th_path = th_dir .. '\\th_items.db';
+    db.th_default_path = th_dir .. '\\th_items.default.db';
 
-    -- Migration: move legacy th_items.db from addon root to data/ subfolder
-    local legacy_path = addon_path .. '\\th_items.db';
-    local legacy_file = io.open(legacy_path, 'rb');
-    if (legacy_file ~= nil) then
-        legacy_file:close();
-        -- Only migrate if new path doesn't already exist
-        local new_file = io.open(db.th_path, 'rb');
-        if (new_file == nil) then
-            os.rename(legacy_path, db.th_path);
-            -- Also move shm/wal if present
-            os.rename(legacy_path .. '-shm', db.th_path .. '-shm');
-            os.rename(legacy_path .. '-wal', db.th_path .. '-wal');
-        else
-            new_file:close();
-            -- Both exist — remove legacy (new location takes priority)
-            os.remove(legacy_path);
-            os.remove(legacy_path .. '-shm');
-            os.remove(legacy_path .. '-wal');
-        end
+    local user_dir = AshitaCore:GetInstallPath() .. '\\config\\addons\\lootscope';
+    ashita.fs.create_directory(user_dir);
+    db.th_path = user_dir .. '\\th_items.db';
+
+    -- Migration A:
+    local legacy_root = addon_path .. '\\th_items.db';
+    local legacy_data = th_dir .. '\\th_items.db';
+    local function exists(p) local f = io.open(p, 'rb'); if (f ~= nil) then f:close(); return true; end return false; end
+
+    if (exists(legacy_root) and not exists(legacy_data)) then
+        os.rename(legacy_root, legacy_data);
+        os.rename(legacy_root .. '-shm', legacy_data .. '-shm');
+        os.rename(legacy_root .. '-wal', legacy_data .. '-wal');
+    elseif (exists(legacy_root)) then
+        os.remove(legacy_root); os.remove(legacy_root .. '-shm'); os.remove(legacy_root .. '-wal');
+    end
+
+    -- Migration B
+    if (exists(legacy_data) and not exists(db.th_path)) then
+        os.rename(legacy_data, db.th_path);
+        os.rename(legacy_data .. '-shm', db.th_path .. '-shm');
+        os.rename(legacy_data .. '-wal', db.th_path .. '-wal');
     end
 
     local open_ok, open_err = pcall(function()
@@ -2558,6 +2439,28 @@ function db.init_th_items(addon_path)
         db.th_conn:exec('PRAGMA synchronous=NORMAL;');
         db.th_conn:exec('PRAGMA foreign_keys=ON;');
         db.th_conn:exec('PRAGMA busy_timeout=3000;');
+
+        -- Attach the shipped catalog read-only as `shipped`. Missing/unreadable is NOT fatal:
+        -- db.th_has_shipped gates every union so the addon degrades to user-only rather than
+        -- failing to start.
+        db.th_has_shipped = false;
+        local dpath = db.th_default_path;
+        if (dpath ~= nil) then
+            local f = io.open(dpath, 'rb');
+            if (f ~= nil) then
+                f:close();
+                local att_ok = pcall(function()
+                    db.th_conn:exec("ATTACH DATABASE '" .. dpath:gsub("'", "''") .. "' AS shipped;");
+                end);
+                if (att_ok) then
+                    -- confirm it really has the tables before trusting it
+                    local probe_ok = pcall(function()
+                        for _ in db.th_conn:nrows('SELECT 1 FROM shipped.th_profiles LIMIT 1') do end
+                    end);
+                    db.th_has_shipped = probe_ok;
+                end
+            end
+        end
 
         db.th_conn:exec([[
             CREATE TABLE IF NOT EXISTS th_profiles (
@@ -2644,27 +2547,137 @@ function db.init_th_items(addon_path)
     return true;
 end
 
--------------------------------------------------------------------------------
--- TH Items: Profile CRUD
--------------------------------------------------------------------------------
+-- TH catalog: shipped (read-only) + user (writable)
+db.TH_SHIPPED_BASE = 1000000;
+
+local function th_route(profile_id)
+    local id = tonumber(profile_id) or 0;
+    if (id >= db.TH_SHIPPED_BASE) then return 'shipped', id - db.TH_SHIPPED_BASE; end
+    return 'main', id;
+end
+
+--- Copy a shipped profile into the user store so it can be edited (copy-on-write).
+function db.materialize_th_profile(profile_id)
+    local schema, real = th_route(profile_id);
+    if (schema == 'main') then return real; end
+    if (not db.th_has_shipped) then return nil; end
+
+    local name = nil;
+    local s = db.th_conn:prepare('SELECT name FROM shipped.th_profiles WHERE id = ?');
+    if (s == nil) then return nil; end
+    s:bind_values(real);
+    for row in s:nrows() do name = row.name; end
+    s:finalize();
+    if (name == nil) then return nil; end
+
+    -- Already materialised under this name? use it.
+    local existing = nil;
+    local e = db.th_conn:prepare('SELECT id FROM main.th_profiles WHERE name = ?');
+    if (e ~= nil) then
+        e:bind_values(name);
+        for row in e:nrows() do existing = row.id; end
+        e:finalize();
+    end
+    if (existing ~= nil) then return existing; end
+
+    local ok = pcall(function()
+        db.th_conn:exec('BEGIN');
+        local ins = db.th_conn:prepare('INSERT INTO main.th_profiles (name, created_at) VALUES (?, ?)');
+        ins:bind_values(name, os_time()); ins:step(); ins:finalize();
+        local nid = db.th_conn:last_insert_rowid();
+        db.th_conn:exec(([[
+            INSERT INTO main.th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
+            SELECT %d, item_id, item_name, th_value, slot_id, notes FROM shipped.th_items WHERE profile_id = %d;
+        ]]):format(nid, real));
+        db.th_conn:exec(([[
+            INSERT INTO main.th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
+            SELECT %d, job_id, is_main, min_level, th_value, enabled FROM shipped.th_job_traits WHERE profile_id = %d;
+        ]]):format(nid, real));
+        db.th_conn:exec('COMMIT');
+        existing = nid;
+    end);
+    if (not ok) then pcall(function() db.th_conn:exec('ROLLBACK'); end); return nil; end
+    return existing;
+end
+
+--- Discard the user's copy of a profile, revealing the shipped one again.
+--- Returns false for a profile that only exists in the user store (nothing to fall back to).
+function db.reset_th_profile(profile_id)
+    local schema, real = th_route(profile_id);
+    if (schema ~= 'main' or db.th_conn == nil) then return false; end
+    if (not db.th_has_shipped) then return false; end
+
+    local name = nil;
+    local s = db.th_conn:prepare('SELECT name FROM main.th_profiles WHERE id = ?');
+    if (s == nil) then return false; end
+    s:bind_values(real);
+    for row in s:nrows() do name = row.name; end
+    s:finalize();
+    if (name == nil) then return false; end
+
+    local shipped_exists = false;
+    local c = db.th_conn:prepare('SELECT 1 AS x FROM shipped.th_profiles WHERE name = ?');
+    if (c ~= nil) then
+        c:bind_values(name);
+        for _ in c:nrows() do shipped_exists = true; end
+        c:finalize();
+    end
+    if (not shipped_exists) then return false; end   -- user-only profile: deleting would lose it
+
+    local ok = pcall(function()
+        db.th_conn:exec('BEGIN');
+        for _, sql in ipairs({
+            'DELETE FROM main.th_items WHERE profile_id = %d;',
+            'DELETE FROM main.th_job_traits WHERE profile_id = %d;',
+            'DELETE FROM main.th_profiles WHERE id = %d;',
+        }) do db.th_conn:exec(sql:format(real)); end
+        db.th_conn:exec('COMMIT');
+    end);
+    if (not ok) then pcall(function() db.th_conn:exec('ROLLBACK'); end); return false; end
+    return true;
+end
 
 function db.get_th_profiles()
     if (db.th_conn == nil) then return {}; end
     local results = {};
-    for row in db.th_conn:nrows('SELECT id, name, created_at FROM th_profiles ORDER BY id ASC') do
+    -- User profiles first; then shipped ones NOT shadowed by a user profile of the same name.
+    local uq = db.th_has_shipped
+        and [[SELECT id, name, created_at, 'user' AS origin,
+                     (SELECT COUNT(*) FROM shipped.th_profiles sp WHERE sp.name = p.name) AS has_default
+                FROM main.th_profiles p ORDER BY id ASC]]
+        or  "SELECT id, name, created_at, 'user' AS origin, 0 AS has_default FROM main.th_profiles ORDER BY id ASC";
+    for row in db.th_conn:nrows(uq) do
         results[#results + 1] = row;
+    end
+    if (db.th_has_shipped) then
+        local q = ([[SELECT id + %d AS id, name, created_at, 'shipped' AS origin, 0 AS has_default
+                     FROM shipped.th_profiles
+                     WHERE name NOT IN (SELECT name FROM main.th_profiles)
+                     ORDER BY id ASC]]):format(db.TH_SHIPPED_BASE);
+        local ok = pcall(function()
+            for row in db.th_conn:nrows(q) do results[#results + 1] = row; end
+        end);
+        if (not ok) then db.th_has_shipped = false; end
     end
     return results;
 end
 
 function db.get_th_profile_by_name(name)
     if (db.th_conn == nil or name == nil) then return nil; end
-    local stmt = db.th_conn:prepare('SELECT id, name, created_at FROM th_profiles WHERE name = ?');
-    if (stmt == nil) then return nil; end
-    stmt:bind_values(name);
     local result = nil;
-    for row in stmt:nrows() do result = row; end
-    stmt:finalize();
+    local stmt = db.th_conn:prepare("SELECT id, name, created_at, 'user' AS origin FROM main.th_profiles WHERE name = ?");
+    if (stmt ~= nil) then
+        stmt:bind_values(name);
+        for row in stmt:nrows() do result = row; end
+        stmt:finalize();
+    end
+    if (result ~= nil) then return result; end          -- user copy shadows shipped
+    if (not db.th_has_shipped) then return nil; end
+    local q = db.th_conn:prepare(("SELECT id + %d AS id, name, created_at, 'shipped' AS origin FROM shipped.th_profiles WHERE name = ?"):format(db.TH_SHIPPED_BASE));
+    if (q == nil) then return nil; end
+    q:bind_values(name);
+    for row in q:nrows() do result = row; end
+    q:finalize();
     return result;
 end
 
@@ -2682,6 +2695,11 @@ end
 function db.clone_th_profile(source_id, new_name)
     if (db.th_conn == nil) then return nil; end
 
+    -- The source may be a SHIPPED profile, whose id is offset by TH_SHIPPED_BASE and whose rows
+    -- live in the attached read-only catalog.
+    local src_schema, src_real = th_route(source_id);
+    if (src_schema == 'shipped' and not db.th_has_shipped) then return nil; end
+
     local ok, result = pcall(function()
         db.th_conn:exec('BEGIN TRANSACTION');
 
@@ -2692,12 +2710,12 @@ function db.clone_th_profile(source_id, new_name)
         end
 
         -- Clone items
-        local stmt = db.th_conn:prepare([[
-            INSERT INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
-            SELECT ?, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ?
-        ]]);
+        local stmt = db.th_conn:prepare(([[
+            INSERT INTO main.th_items (profile_id, item_id, item_name, th_value, slot_id, notes)
+            SELECT ?, item_id, item_name, th_value, slot_id, notes FROM %s.th_items WHERE profile_id = ?
+        ]]):format(src_schema));
         if (stmt ~= nil) then
-            stmt:bind_values(new_id, source_id);
+            stmt:bind_values(new_id, src_real);
             local rc = stmt:step();
             stmt:finalize();
             if (rc ~= sqlite3.DONE) then
@@ -2707,12 +2725,12 @@ function db.clone_th_profile(source_id, new_name)
         end
 
         -- Clone traits
-        local trait_stmt = db.th_conn:prepare([[
-            INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
-            SELECT ?, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ?
-        ]]);
+        local trait_stmt = db.th_conn:prepare(([[
+            INSERT INTO main.th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled)
+            SELECT ?, job_id, is_main, min_level, th_value, enabled FROM %s.th_job_traits WHERE profile_id = ?
+        ]]):format(src_schema));
         if (trait_stmt ~= nil) then
-            trait_stmt:bind_values(new_id, source_id);
+            trait_stmt:bind_values(new_id, src_real);
             local rc = trait_stmt:step();
             trait_stmt:finalize();
             if (rc ~= sqlite3.DONE) then
@@ -2734,7 +2752,12 @@ end
 
 function db.delete_th_profile(profile_id)
     if (db.th_conn == nil) then return false; end
-    local stmt = db.th_conn:prepare('DELETE FROM th_profiles WHERE id = ?');
+    -- A shipped profile cannot be deleted -- it lives in the read-only catalog. Removing a user
+    -- copy is db.reset_th_profile(), which reveals the shipped one again.
+    local sch, real = th_route(profile_id);
+    if (sch ~= 'main') then return false; end
+    profile_id = real;
+    local stmt = db.th_conn:prepare('DELETE FROM main.th_profiles WHERE id = ?');
     if (stmt == nil) then return false; end
     stmt:bind_values(profile_id);
     stmt:step();
@@ -2742,15 +2765,16 @@ function db.delete_th_profile(profile_id)
     return db.th_conn:changes() > 0;
 end
 
--------------------------------------------------------------------------------
 -- TH Items: Item CRUD
--------------------------------------------------------------------------------
 
 function db.get_th_items(profile_id)
     if (db.th_conn == nil) then return {}; end
+    -- shipped profiles carry an offset id; read from whichever schema owns it
+    local sch, profile_id = th_route(profile_id);
+    if (sch == 'shipped' and not db.th_has_shipped) then return {}; end
     local results = {};
     local stmt = db.th_conn:prepare(
-        'SELECT id, item_id, item_name, th_value, slot_id, notes FROM th_items WHERE profile_id = ? ORDER BY slot_id ASC, item_name ASC'
+        ('SELECT id, item_id, item_name, th_value, slot_id, notes FROM ' .. sch .. '.th_items WHERE profile_id = ? ORDER BY slot_id ASC, item_name ASC')
     );
     if (stmt == nil) then return results; end
     stmt:bind_values(profile_id);
@@ -2763,9 +2787,12 @@ end
 
 function db.get_th_items_by_item_id(profile_id)
     if (db.th_conn == nil) then return {}; end
+    -- shipped profiles carry an offset id; read from whichever schema owns it
+    local sch, profile_id = th_route(profile_id);
+    if (sch == 'shipped' and not db.th_has_shipped) then return {}; end
     local results = {};
     local stmt = db.th_conn:prepare(
-        'SELECT item_id, th_value, slot_id FROM th_items WHERE profile_id = ?'
+        ('SELECT item_id, th_value, slot_id FROM ' .. sch .. '.th_items WHERE profile_id = ?')
     );
     if (stmt == nil) then return results; end
     stmt:bind_values(profile_id);
@@ -2778,6 +2805,10 @@ end
 
 function db.add_th_item(profile_id, item_id, item_name, th_value, slot_id, notes)
     if (db.th_conn == nil) then return nil; end
+    -- Shipped profiles are read-only: materialise a user copy first so the shipped
+    -- original stays pristine and Reset can fall back to it.
+    profile_id = db.materialize_th_profile(profile_id);
+    if (profile_id == nil) then return nil; end
     local stmt = db.th_conn:prepare(
         'INSERT OR REPLACE INTO th_items (profile_id, item_id, item_name, th_value, slot_id, notes) VALUES (?, ?, ?, ?, ?, ?)'
     );
@@ -2789,37 +2820,44 @@ function db.add_th_item(profile_id, item_id, item_name, th_value, slot_id, notes
     return db.th_conn:last_insert_rowid();
 end
 
-function db.update_th_item(row_id, th_value, slot_id, notes)
-    if (db.th_conn == nil) then return false; end
+-- Resolve edits in the user store by profile and item/trait identity, never a shipped row ID.
+-- Materialize shipped profiles first and return the user profile ID for the editor to follow.
+function db.update_th_item(profile_id, item_id, th_value, slot_id, notes)
+    if (db.th_conn == nil) then return nil; end
+    local pid = db.materialize_th_profile(profile_id);
+    if (pid == nil) then return nil; end
     local stmt = db.th_conn:prepare(
-        'UPDATE th_items SET th_value = ?, slot_id = ?, notes = ? WHERE id = ?'
+        'UPDATE main.th_items SET th_value = ?, slot_id = ?, notes = ? WHERE profile_id = ? AND item_id = ?'
     );
-    if (stmt == nil) then return false; end
-    stmt:bind_values(th_value or 1, slot_id or -1, notes or '', row_id);
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(th_value or 1, slot_id or -1, notes or '', pid, item_id);
     stmt:step();
     stmt:finalize();
-    return db.th_conn:changes() > 0;
+    return pid;
 end
 
-function db.delete_th_item(row_id)
-    if (db.th_conn == nil) then return false; end
-    local stmt = db.th_conn:prepare('DELETE FROM th_items WHERE id = ?');
-    if (stmt == nil) then return false; end
-    stmt:bind_values(row_id);
+function db.delete_th_item(profile_id, item_id)
+    if (db.th_conn == nil) then return nil; end
+    local pid = db.materialize_th_profile(profile_id);
+    if (pid == nil) then return nil; end
+    local stmt = db.th_conn:prepare('DELETE FROM main.th_items WHERE profile_id = ? AND item_id = ?');
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(pid, item_id);
     stmt:step();
     stmt:finalize();
-    return db.th_conn:changes() > 0;
+    return pid;
 end
 
--------------------------------------------------------------------------------
 -- TH Items: Job Trait CRUD
--------------------------------------------------------------------------------
 
 function db.get_th_job_traits(profile_id)
     if (db.th_conn == nil) then return {}; end
+    -- shipped profiles carry an offset id; read from whichever schema owns it
+    local sch, profile_id = th_route(profile_id);
+    if (sch == 'shipped' and not db.th_has_shipped) then return {}; end
     local results = {};
     local stmt = db.th_conn:prepare(
-        'SELECT id, job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ? ORDER BY is_main DESC, min_level ASC'
+        ('SELECT id, job_id, is_main, min_level, th_value, enabled FROM ' .. sch .. '.th_job_traits WHERE profile_id = ? ORDER BY is_main DESC, min_level ASC')
     );
     if (stmt == nil) then return results; end
     stmt:bind_values(profile_id);
@@ -2832,6 +2870,10 @@ end
 
 function db.add_th_job_trait(profile_id, job_id, is_main, min_level, th_value, enabled)
     if (db.th_conn == nil) then return nil; end
+    -- Shipped profiles are read-only: materialise a user copy first so the shipped
+    -- original stays pristine and Reset can fall back to it.
+    profile_id = db.materialize_th_profile(profile_id);
+    if (profile_id == nil) then return nil; end
     local stmt = db.th_conn:prepare(
         'INSERT INTO th_job_traits (profile_id, job_id, is_main, min_level, th_value, enabled) VALUES (?, ?, ?, ?, ?, ?)'
     );
@@ -2843,37 +2885,47 @@ function db.add_th_job_trait(profile_id, job_id, is_main, min_level, th_value, e
     return db.th_conn:last_insert_rowid();
 end
 
-function db.set_th_job_trait_enabled(row_id, enabled)
-    if (db.th_conn == nil) then return false; end
-    local stmt = db.th_conn:prepare('UPDATE th_job_traits SET enabled = ? WHERE id = ?');
-    if (stmt == nil) then return false; end
-    stmt:bind_values(enabled and 1 or 0, row_id);
+-- Trait identity = (profile, job, role, level); see the F1 note above update_th_item.
+function db.set_th_job_trait_enabled(profile_id, job_id, is_main, min_level, enabled)
+    if (db.th_conn == nil) then return nil; end
+    local pid = db.materialize_th_profile(profile_id);
+    if (pid == nil) then return nil; end
+    local stmt = db.th_conn:prepare(
+        'UPDATE main.th_job_traits SET enabled = ? WHERE profile_id = ? AND job_id = ? AND is_main = ? AND min_level = ?'
+    );
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(enabled and 1 or 0, pid, job_id, is_main, min_level);
     stmt:step();
     stmt:finalize();
-    return db.th_conn:changes() > 0;
+    return pid;
 end
 
-function db.delete_th_job_trait(row_id)
-    if (db.th_conn == nil) then return false; end
-    local stmt = db.th_conn:prepare('DELETE FROM th_job_traits WHERE id = ?');
-    if (stmt == nil) then return false; end
-    stmt:bind_values(row_id);
+function db.delete_th_job_trait(profile_id, job_id, is_main, min_level)
+    if (db.th_conn == nil) then return nil; end
+    local pid = db.materialize_th_profile(profile_id);
+    if (pid == nil) then return nil; end
+    local stmt = db.th_conn:prepare(
+        'DELETE FROM main.th_job_traits WHERE profile_id = ? AND job_id = ? AND is_main = ? AND min_level = ?'
+    );
+    if (stmt == nil) then return nil; end
+    stmt:bind_values(pid, job_id, is_main, min_level);
     stmt:step();
     stmt:finalize();
-    return db.th_conn:changes() > 0;
+    return pid;
 end
 
--------------------------------------------------------------------------------
 -- TH Items: Compute TH from traits for given job/level
--------------------------------------------------------------------------------
 
 function db.compute_trait_th(profile_id, main_job, sub_job, main_level, sub_level, skip_blu)
     if (db.th_conn == nil) then return 0; end
 
+    local sch, profile_id = th_route(profile_id);
+    if (sch == 'shipped' and not db.th_has_shipped) then return 0; end
+
     local main_th = 0;
     local sub_th = 0;
     local stmt = db.th_conn:prepare(
-        'SELECT job_id, is_main, min_level, th_value, enabled FROM th_job_traits WHERE profile_id = ? ORDER BY min_level ASC'
+        ('SELECT job_id, is_main, min_level, th_value, enabled FROM ' .. sch .. '.th_job_traits WHERE profile_id = ? ORDER BY min_level ASC')
     );
     if (stmt == nil) then return 0; end
     stmt:bind_values(profile_id);
@@ -2897,9 +2949,7 @@ function db.compute_trait_th(profile_id, main_job, sub_job, main_level, sub_leve
     return math.max(main_th, sub_th);
 end
 
--------------------------------------------------------------------------------
 -- Cleanup
--------------------------------------------------------------------------------
 
 function db.get_file_size()
     if (db.path == nil) then return 0; end
@@ -2908,6 +2958,21 @@ function db.get_file_size()
     local size = f:seek('end');
     f:close();
     return size or 0;
+end
+
+--- Close ONLY the per-character database, leaving th_conn open.
+function db.close_character()
+    if (db.conn ~= nil) then
+        if (db._in_transaction) then
+            local ok = pcall(db.conn.exec, db.conn, 'COMMIT');
+            if (not ok) then pcall(db.conn.exec, db.conn, 'COMMIT'); end
+            db._in_transaction = false;
+        end
+        pcall(db.conn.close, db.conn);
+        db.conn = nil;
+    end
+    -- Invalidate all character caches on close; stats_dirty also invalidates UI analysis.
+    invalidate_all();
 end
 
 function db.close()
@@ -2924,6 +2989,7 @@ function db.close()
         pcall(db.conn.close, db.conn);
         db.conn = nil;
     end
+    invalidate_all();   -- same reason as close_character
     if (db.th_conn ~= nil) then
         pcall(db.th_conn.close, db.th_conn);
         db.th_conn = nil;

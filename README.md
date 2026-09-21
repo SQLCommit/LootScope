@@ -1,182 +1,110 @@
-# LootScope v1.4.2 - Loot Drop Tracker for Ashita v4.3
+<div align="center">
 
-Loot drop tracker for Ashita v4.3 with statistics, Treasure Hunter monitoring, and a full dashboard UI.
+# ![LootScope](https://readme-typing-svg.demolab.com/?font=Cinzel&size=48&duration=900&pause=0&color=C49B53&center=true&vCenter=true&repeat=false&width=600&height=78&lines=LootScope&letterSpacing=2px&weight=700)
+
+**Kills, drops, Treasure Hunter, and the numbers behind your farming.**
+
+[![Final Fantasy XI](https://custom-icon-badges.demolab.com/badge/Final_Fantasy-XI-90703D?style=flat-square&logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAADAFBMVEUAAABAMDBQODhgQDhYQEBQSFBoSEBgSEBoSEhgSEhoSEBoSEBgSFBoSEhoSEBwSDhoSEBoSEhoSEBoSEBwSDhgUFBoUEh4SDh4SEBwUFB4UECASDhoUFhwUEhgWGBwUFB4UEh4UEhgWGBwWFiAUEh4UFBoWGBoYGCIUEiAWFBwYGB4WFiAWFCIWEhwYGB4WFiAWFiAWFiIWFCAYFhwYGiAYFiQWFB4YGh4YGCAYGCQWFiQYFB4aGiIYFiYWFiIYGiIYGCIYFB4aGiQYFiAaGiIYGCYYFiYYFCIaGiQYGCYYFiAaGiQaGCQaGCYYGCgYFCQaGCYaGiYaFiIcGigYFB4cHCQaGCIaGiYaGigaFCYaHCgaFiYaGCIcHCQcGigaGi4YFCAeICoaGCIeHiIeHCgcGCYcHCoaHCgaHCAeICgcGCoaGCwaFigcHCIeHiQeHCYeHCQeHCgcHCwaGiIgICYeHCYeHCwcHCQgIC4aGi4cFiocHigeHCoeGC4cFiYeHi4cFjAaGioeHCQgICYgHigeHiYgICweHi4eGCogHC4cHiweHC4eGCggICggHiYiICYiICwgHCYgIC4eICgiICogIDAeICYiIi4gIDIeHCgiIi4gHDQeGCgiIiwgHi4gHCwiICoiICokICgkIi4gHigkIioiIigkJDAiHjgeHCwiIiokIi4iIC4iHjIiHi4iIDIiHiwkIC4kHiomJCokJDAiICwkIjAkIDAkIDAkIComJCwmIjAkIDIkIC4kIjogIDIkIi4mJCwmJi4mJC4mJDogIiwmJjgkIDQmJC4oKDAoJC4oJjAoJDImJC4oKDokJC4qKDAoJjQmJjwkIjIoJDAoKDokJjQqJjAqKjIqKDIqKDQqKDIsKjIsKjgoJjIsKjQsKjIsLDIsKjQsKjgsKjQuKjIwLjYuLDQuLjosKjYuLDYuLDYuLDguLDYwLjQyMDYyLjoyLjoyMDg0Mjg0Mjg0Mjo0Mjo2NDg2Njw2Mjw2NDw4ODw4ODw6Oj4%2BPD4%2BPg4jpSBAAAAAXRSTlMAQObYZgAAAphJREFUeJxjYMABOubX1XVU4ZB8dv%2FumddPn3%2F%2Bik1BVc%2BVVx9%2B%2Ffn7%2Fd37Hx%2BxKWi4fvPvv99flhzccvLYLSwKGq7fOvbzx4vNU9oWTzm0EFNB5PXHh3p%2Ff7vYNqmtvr6%2BFENB5L7HN%2BZufv%2FlxvLVffVlEydgyG989PDY5i%2BZwRcPblk96WFnAZq8e9btG7t63yV7ZNccvHj64bI1O9EUWB95e6j38SwXL3%2F%2FtFMPP124vQFVXrfgzsnewxdcDP2t%2FLVTfr588eAEiry04%2BFjCzffCpa3MrTSVmuZUnPnzSUUeaOFq3sPP%2FYRdTVUVVbL2%2BzTt%2BfAXiR5Tr55Zyt63y00lClWlFc22dUb27ljBbIBXE33Znm%2FeGJr31ipKK9%2BqDmxb83WHCR5JofebT7Lr86096z0U9TeMjfPp3P7WiR5RvbevOQpW7Qt7Isrk6xWrU4ujJtXi6xfYk1FaN7JVh7z9JXOdt6HUya1dAe5Iylgnr06MfTk%2BvSj6el%2BtmHbeqeevxyji2xB6rIKk8WrDKuv7XeWlJxVOLV1YqqCGJIFboenOx1abKWWe77RSjMlz8Ym3EcYWb7g3tTe3lOW8R6TLSIELZq1tGzCVQSQg3Dhwl7LU92W0yZHxScpt%2Bmph3sESIkhKyid1Lfcx6e8Kzcq3i%2FWUs1jBooFQAWHt%2B2KZeUJbM%2FwjJ%2BVZuKdFibLy4Cq4PQCbVHb9PjzrnFFRblx2gZcKPIMjDePW%2FHwRAQqa66aZKPlra3Pwomm4IGPoKS8c4Sq51QTJSUtS25UC4ARvfScjqQOh7xXvbeWkpyeMRsDOuAUX6TDoaNTH6wsE6vuy4whz8DJKbLdLGFdv4ug6JLZGpjyICX8B%2BbszjcVEjLDlAcA2agImHWK4wMAAAAASUVORK5CYII%3D)](https://www.playonline.com/ff11us/)
+[![Ashita v4.3.2.1](https://custom-icon-badges.demolab.com/badge/Ashita-v4.3.2.1-536B91?style=flat-square&logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGsklEQVR4nKxXf1CT9xl%2F8uYlgQoEXQyZhhJcqhxER4GmeHaacWttL0zwDsesbvaGzA1qtbc71ul2Z%2BvqfsnuWrubG1A9Zepg0tOeug5bZLGCJhIQKdKABAgSzI83P8mbvG%2Fy7N502PWWkFD6ufv%2BkXyf7%2Ft9vs%2Fz%2BX6%2Bz0MgIixm6PV6fkVp6a6nBCkt%2BalpDdXV1Ws8Hk%2FC6xe1%2BdDQEKGWrjht2LwFTaUa%2FLt8De54TDSt0WjWfiUOjI2N8RobGx%2BjKCrq%2FP59%2Bwou5BdhUNeLvtd%2Fi%2Fc3bsa3ln4ds%2Fhkk9FoTMgBAubBK3vrXnQ5naZvq9W%2F3L17d1FLS0sKy7KP5h9aLBKCYYA%2B9BsI9ejAGwjCLIZBRPBlZrN53m%2FPIabRuXPnxB63o%2FBnr%2B5frr99%2B%2FDBgwf1drvdoNFoiuacyFEoBtsfTLibBwygNY3ClZFhoDEM99lgv0KhCCfiABlr4t13m8sbGhr2T09NgKXzMgw9cMDL9QfX2KzWJrVafVQikaz1%2BXwpxmXpI5TdWuh2u8EeYsMXZz3X1peWHrPZbDyZTIbxHOBFiBAF27dvX3%2F0d4dv0IN3YQUwYOjphswf1IIwORkkEgkIBIKInV6vB7FYDEfefNPZ1Nx8pKCgILukpEQ1NWX2OByOt6qqvt8lk8lmKyoqmKgbxSJHXV3dN2csFqQutyH9QTuyM1MYDzqdjnE6nXjpzGkc6LiEw%2Fc%2Bwfb28wEej3d4cnJyYSSkaRotlmnwIAH8nCeAL1kRL5pQXFxMEiEWnqCmgDc%2BAt%2FIlgM%2F5IVVq1bpZTJZ1DUxHSgpKRn507E%2FmjLylEDKV8fdfA5py74G8vUbIT01FcIhFvoHR%2F3BAJ3V19fHW5ADO3funL0zaPzRL37fMA1JgoQd4MBLXwqhtAwghALIXf14it%2FvJ8VicXSyzScSAwMDUFtbe4PLbygUisuBOYQoO2KAxsNvHHJJpdLqzs5OQaw9Yl5DDj09PcmpqamZEGDh3x9r4aHNCiqVCqRSKbhcLsjMzIy67or2Wujs31omL17uaLhxo%2FuEUqmMrQmxPDMYDKBSFbd7XU7ECQrRQ0dO5%2FV6sWXHARwufA1NV29FImOxWJBl2UcRKCsr%2B2jPnj3LjUYj70u%2FBQzDgFKprDSNjX4hvC6XC99J24zvLdmKo%2B9fR6vVinfu3MHW1taIMz6fD0Ui0R%2BsVmtCb0HMFJAkyYkNcfN6hy%2Fr8eolBPGZKZ8gIPMnz8KSGRqyNz8N%2FCQyIkRrM3MAfAwcbzweLCgouMD9lwii3gLu9Fu%2BW6bisczy%2Btde%2F9gyaXw0p732IYgUSZD98zKwOWyfLxKSgLwwFBcqyZGRkfiiMR8HDAYDb%2BtThbqP3nk7dOb4n91btzzvtVomIynglO7US9uws70twofPEUYm4EX1pm8Nb9iwYd2i6oGhoSF4bl3eBUf%2FbQwxTCTv17WdSHvtGPQ7ccw48Nl1YwOR3x77OP7r4ml84bmNE8uWLT3S3d0dl3zzSnFubi4sX%2Ftk%2FdHTTePhcBDS09NhwzNquD8%2BDW5vAFZmZUNwlgKP0wa9hj74y1%2FPwfk3PgBmhvakC4SsyWSa93rHTcHcLcjPyf1pQ%2F0BDPpdSFEUXtd2Ie2zxxQgv9mMZw7UswKS%2F6vp6enFVURcsblySvTjsWOjsPfFPUAQBGStlALBT%2FqCXTAYANuDT8Excx%2BudnXA2UuX7JJMaS8nVouKwCt1ewu3Cb8TrE4pZ3%2B4qXIe3WXx1ZqXMIlPGjTCZ9wZooz9XC25KA5wGLh7V2CQmSrfE2qrWUnAHGYDUe2CfifkrVOE8pT5%2B3oEg4c2qTd1yOXyuJVQ3AhotVoel8e2tjaisuL5u56Hn%2F7f4VmGRmrKgPapQczPy2vctWuXUKfTLajXiGvAVTKr5FnnbaYedFkGkfbakKHd6HdbkDL3omPiFvqoCezv7w8UFRXVcr3CQhyIWRP%2BL9Rqtfp75eor2ys1ydEteEAK02B80sZu21FdOXTv3oVEM5BQ7X7y5Mmut4%2Bfren9xMySySKw2ii43TcYbj71D2ps3AyIYWADbsgIO0m35cELJpMp0f0Tb820Wi2%2FpqbmZjjEoGPiJqqK1nVVVVXlKBSKCpEo7derFfKmZ59%2BsjeJJF%2BO1Ul9KQ7MDb%2FfDyWqwlPuh8M43PtPFIvFNZxYzYkW14qdOHEiWavVkgvhQMKS6fV6gaYcKbdaW6Hp%2FasTGo3mQ%2B7Jhv8%2B3QqFght04rFfYAq4U2o0GqVQKKwtLy%2FPS1Rq443%2FBAAA%2F%2F%2BWk28F7WDfcAAAAABJRU5ErkJggg%3D%3D)](https://www.ashitaxi.com/)
+[![MIT License](https://custom-icon-badges.demolab.com/badge/License-MIT-90703D?style=flat-square&logo=law&logoColor=white)](LICENSE)
+
+[![Download](https://custom-icon-badges.demolab.com/badge/Download-8A652F?style=for-the-badge&logo=download&logoColor=white)](https://github.com/SQLCommit/LootScope/releases/latest)
+[![Changelog](https://custom-icon-badges.demolab.com/badge/Changelog-456487?style=for-the-badge&logo=history&logoColor=white)](CHANGELOG.md)
+[![Report an issue](https://custom-icon-badges.demolab.com/badge/Report_an_issue-596573?style=for-the-badge&logo=issue-opened&logoColor=white)](https://github.com/SQLCommit/LootScope/issues)
+
+</div>
 
 ---
 
-## Features
+<p align="center">
+LootScope records your FFXI loot history and turns it into searchable statistics. See what dropped, who won it, which Treasure Hunter levels were recorded, and how results compare across mobs, zones, and content.
+</p>
 
-- **Live Feed**: Real-time scrolling table of all loot drops with configurable columns. Tooltips show Mob ID, Vana'diel time, moon phase, and weather. Filterable: hide empty kills or mob gil drops.
-- **Statistics**: Per-mob kill counts (nearby + distant), drop rates (nearby rate + combined rate with distant bias), unique items, per-item breakdowns, and per-spawn (Mob ID) breakdown with sortable columns. Two-row grouped filter: Row 1 selects a category (Field, Battlefields, Instances, Events, Chest/Coffer), Row 2 shows context-sensitive sub-filters (Battlefields: All/BCNM/HTBF; Instances: 14-type combo dropdown; Events: Voidwatch/Domain Invasion/Wildskeeper). Each category has a `(?)` tooltip explaining detection methods. Filter combo dropdown below for zone/battlefield selection. The "All" Battlefields view shows battlefield names with both Lv Cap and Difficulty columns, grouping by battlefield + zone + level cap + difficulty. Instance content types: Dynamis, Omen, Einherjar, Nyzul, Salvage, Limbus, Sortie, Vagary, Legion, Assault, Walk of Echoes, Skirmish, Meeble Burrows, Odyssey.
-- **Slot Analysis**: Per-mob drop slot probability analysis. Wilson score 95% confidence intervals, slot count estimation (rate sum, empty kill model fit), items-per-kill distribution with Poisson Binomial expected values, co-occurrence analysis (deviation from independence), shared slot candidate detection (items that never co-occur), and drop arrival order tracking for drop table position inference. Battlefield mode (BCNM/HTBF/All Battlefields) automatically switches to specialized sections: Drop Structure (guaranteed vs variable items, items-per-encounter stats) and Inferred Drop Table (union-find grouping of co-occurrence data into probable slots). All data visible from the first kill — low-sample warnings shown when appropriate, but nothing gated behind minimum kill counts. Tooltips adapt to context (kills/runs, per-kill/per-encounter). Chest/Coffer excluded (independent slot model doesn't apply). Uses same category/zone/mob filter system as Statistics.
-- **Treasure Hunter Tracking**: Detects TH procs from action packets and records TH level at time of kill. Gear-based TH estimation scans equipped items on every offensive action (handles mid-fight gear swaps). Two-layer detection: intrinsic TH from profile gear list + augmented TH parsed from item augment data. Configurable profiles for retail vs private server TH gear and job traits. THF, BLU spell-set trait, trust/pet TH+1, and Treasure Hound kupower all supported. TH Management window for full profile/item/trait CRUD.
-- **Chest/Coffer Tracking**: Full chest and coffer event tracking via 0x002A (unlock/fail), 0x001E (gil inventory diff), and 0x0053 (system message). Four-layer gil detection with dedup. Records gil amount, container type, and failure reason (lockpick fail, trap, mimic, illusion).
-- **BCNM Detection**: Captures battlefield name from chat ("Entering the battlefield for X!"), detects level cap via two methods (chat text parsing of "{Name}'s level is currently restricted to {N}" + `GetJobLevel()` vs `GetMainJobLevel()` memory comparison fallback), tracks battlefield sessions in SQLite, and reconnects on addon reload via buff icon 254. Stale sessions auto-cleaned after 4 hours.
-- **Content Type Detection**: Classifies 21 content types. BCNM/HTBF via 0x0075 packet + chat detection. Dynamis via zone name prefix (14 zones). Voidwatch/Domain Invasion/Wildskeeper via buff detection at kill time. 14 instance types (Omen, Einherjar, Nyzul, Salvage, Limbus, Sortie, Vagary, Legion, Assault, Walk of Echoes, Skirmish, Meeble Burrows, Ambuscade) via zone ID lookup. Odyssey via source-zone tracking (Rabao entry). Walk of Echoes HTBFs (Odin/Cait Sith/Alexander/Lilith) via pending state that survives zone change from Selbina. Content type backfill migration retroactively tags old kills on DB open.
-- **Compact Mode**: Minimal overlay with configurable opacity and columns
-- **CSV Export**: Export all data or filtered subsets for external analysis
-- **Advanced Export**: Filter by source (Field/Chest-Coffer/All BF/BCNM/HTBF/Dynamis/Voidwatch/Domain Invasion/Wildskeeper), zone, mob, TH level, date range, Vana'diel day/hour/moon/weather, item, status, and more. Source filter uses content_type so mob kills inside BCNMs are correctly grouped with their content. Preview updates automatically as filters change.
-- **SQLite Storage**: All data persisted locally for cross-session analysis
+## ![Install](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Install&letterSpacing=0.5px&weight=700)
 
-## Requirements
+Developed with **Ashita v4.3.2.1**.
 
-- This release has only been tested with Ashita v4.3.1.2	
+1. [Download latest release of LootScope](https://github.com/SQLCommit/LootScope/releases/latest).
+2. Extract the release ZIP into `/ashita/`. The addon should be at `/ashita/addons/lootscope/`.
+3. In game, run `/addon load lootscope`.
+4. Use `/loot` to open or hide the window. Tracking continues while hidden.
 
-## Installation
+**Load automatically:** Add `/addon load lootscope` to your startup script in `/ashita/scripts/`.
 
-1. Copy the `lootscope` folder to your Ashita `addons` directory
-2. Load with `/addon load lootscope`
+## ![Features](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Features&letterSpacing=0.5px&weight=700)
 
-## Commands
+| Feature | What you can see and do |
+| :--- | :--- |
+| **Live feed** | Kills, treasure-pool drops, lot outcomes, winners, and gil. Customize columns and filter out empty kills or mob gil. |
+| **Statistics** | Browse Open World, Battlefields, Instances, or Chest/Coffer, then filter by zone and mob. Counts distinguish kills, opens, and runs; instance lists show only content with recorded data. |
+| **Treasure Hunter (Beta)** | Server-confirmed procs and a separate gear-based estimate, updated on actions. Edit TH profiles for retail or private servers. |
+| **Slot analysis** | Estimated drop slots, confidence intervals, items that drop together, shared-slot patterns, and drop order. Battlefield analysis adds an inferred drop table. |
+| **Battlefields** | Battlefield name, level cap, and difficulty. Active sessions survive an addon reload. |
+| **Chests and coffers** | Container type, gil rewards, and failed attempts, including traps, mimics, and illusions. Voidwatch and Walk of Echoes track offered items and what you took or left. |
+| **Compact mode** | A smaller overlay with adjustable opacity and columns. |
 
-| Command | Description |
-|---------|-------------|
-| `/loot` or `/lootscope` | Toggle the LootScope window |
-| `/loot show` | Show the window |
-| `/loot hide` | Hide the window |
+**Content coverage**
+
+- **Open World:** Mobs, Voidwatch, and Reives.
+- **Battlefields:** BCNM, HTBF, and Legion.
+- **Instances:** Dynamis, Omen, Sortie, Einherjar, Nyzul, Salvage, Vagary, Assault, Walk of Echoes, Skirmish, Meeble Burrows, and Odyssey. Walk of Echoes statistics use coffer rewards.
+- **Feed only:** Ambuscade, Domain Invasion, Limbus, and Besieged. Limbus chest rewards are recorded in the feed; these contents are excluded from Statistics and Slot Analysis.
+
+**Content labels:**
+Some content may be missing a label or labeled incorrectly. If you spot something you'd like labeled or corrected, let me know or [open an issue](https://github.com/SQLCommit/LootScope/issues).
+
+## ![Reading your results](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Reading+your+results&letterSpacing=0.5px&weight=700)
+
+- **Drop rates:** Nearby rates exclude distant kills. Combined rates include them and may look higher if distant kills with no drops go unseen. Unidentified distant kills do not affect a mob's drop rate.
+- **Treasure Hunter (Beta):** The TH column shows the higher of the server-confirmed proc level and the estimate. An asterisk (`*`) marks an estimate; hover to see the values separately. Exports retain both.
+- **Personal loot lists:** Voidwatch and Walk of Echoes show how often an item was offered, taken, or left. An open list may still have pending items. Colonization/Lair Reive statistics count recorded end-reward runs, not individual mob kills.
+- **Slot analysis:** Drop-slot patterns are estimates based on your recorded kills or runs. Chests, Voidwatch, and Reives use Statistics instead; Walk of Echoes shows offer frequency. [How slot analysis works](SLOT_ANALYSIS.md).
+- **Existing loot:** When loading or zoning with loot already in the pool, items that cannot be matched to a recorded kill appear in the feed but do not affect statistics.
+
+## ![Commands](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Commands&letterSpacing=0.5px&weight=700)
+
+| Command | Action |
+| :--- | :--- |
+| `/loot` or `/lootscope` | Show or hide the window |
+| `/loot show` / `/loot hide` | Show or hide it explicitly |
 | `/loot compact` | Toggle compact mode |
 | `/loot resetui` | Reset window size and position |
-| `/loot stats [mob]` | Print drop stats to chat window (nearby + combined rates) |
-| `/loot thaugs` | Dump augment IDs from all equipped gear (debug) |
-| `/loot bluspells` | Check BLU TH trait spell status - shows if required spells are set (debug) |
-| `/loot help` | Show available commands |
+| `/loot help` | Show all commands |
+| `/loot thaugs` | Dump augment IDs from equipped gear (debug) |
+| `/loot bluspells` | Check BLU Treasure Hunter trait spell status (debug) |
 
-### Data Flow
+## ![Export and saved data](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Export+and+saved+data&letterSpacing=0.5px&weight=700)
 
-1. During combat, 0x0028 action packets track TH procs per mob and mark mobs the player has personally attacked (`engaged_mobs`)
-2. Mob dies -> 0x0029 msg_id=6 is validated through a 3-tier kill attribution filter before recording: (1) player personally attacked the mob, (2) a party/alliance member or their pet landed the killing blow, or (3) Domain Invasion bypass (Elvorseal buff active in an Escha zone). Kills that don't match any tier are discarded. Entity index range guard also rejects trusts and PCs (index >= 1024) — only NPC/mob entities are recorded.
-3. If the mob dropped gil, 0x0029 msg_id=565 arrives with the exact amount (FIFO queue handles AoE)
-4. 0x00D2 packets arrive for each item drop, linking to the existing kill record via mob server ID
-5. Containers/chests that don't send 0x0029 get kill records created on first 0x00D2
-6. Chest/coffer interactions: 0x002A detects unlock/fail -> 0x001E or 0x0053 captures gil amount
-7. When lots resolve, 0x00D3 updates the drop's status (Got/Full/Lost) with winner info
-8. Voidwatch: Kill tagged as Voidwatch at defeat time via Voidwatcher buff (ID 475). Riftworn Pyxis interaction triggers 0x034 event with offered items. Three-layer selection tracking: (1) subsequent 0x034 param zeroing, (2) 0x01F stackable item delivery, (3) 0x020 equipment item delivery. Three-layer finalization: (1) C2S 0x05B EventEnd, (2) buff loss poll, (3) zone change.
-9. Wildskeeper Reive: Kill tagged as Wildskeeper when Reive Mark buff (511) active + Naakual name match. Items delivered via 0x034 Event 2007 with item IDs in params[1-3]. All auto-obtained (won=1). Addon reload recovery via DB query for recent Wildskeeper kill in zone.
-10. Zone changes mark any pending pool items as Zoned and clear in-memory tracking
-11. Distant kills detected via msg_id=37 are counted for drop rate adjustment (see below)
+**CSV exports**
 
-## The Distant Kill Problem
+- Open the **Export** tab, choose all data or filter your results, then preview and export.
+- Find your files in `/ashita/config/addons/lootscope/exports/`.
 
-### The Problem
+**Saved data**
 
-When farming mobs in a party, the player tracking loot may be far from where kills happen.
-This means **distant kills that produce no drops are invisible** to the tracking player. The kill count denominator is undercounted, inflating apparent drop rates.
+- Loot history is kept separately for each character and server.
+- Custom Treasure Hunter profiles survive addon updates.
 
-**Example**: A party kills 9 Nightmare Weapons. The tracker sees 3 kills with drops and 6 "too far" messages. Without correction: 3 drops / 3 kills = 100%. With correction: 3 drops / 9 kills = 33%.
+**Files**
 
-### The Solution: Two-Tier Distant Kill Tracking
+- **Loot database:** `/ashita/config/addons/lootscope/<CharName>_<ServerId>/lootscope.db`
+- **Your TH profiles:** `/ashita/config/addons/lootscope/th_items.db`
+- **Shipped TH catalog:** `/ashita/addons/lootscope/data/th_items.default.db` (read-only)
 
-LootScope uses a **two-tier system** to handle distant kills accurately:
+**Backup:** Copy `/ashita/config/addons/lootscope/` to keep your history and profiles.
 
-**Tier 1 — Per-mob distant kills WITH drops** (`is_distant=1` in kills table):
-When 0x00D2 creates a kill record WITHOUT a prior defeat message (msg_id=6), it's a distant kill that produced drops. These are flagged with `is_distant=1` and attributed to the specific mob (because 0x00D2 contains the mob's entity data). However, these kills are a **biased sample** — you only see them *because* they dropped loot. Mixing them into the main rate would inflate it upward.
+## ![Changelog](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Changelog&letterSpacing=0.5px&weight=700)
 
-**Tier 2 — Zone-level missed kills WITHOUT drops** (`missed_kills` table):
-When msg_id=37 fires with no matching credit, it's a distant kill that produced no drops. These can only be counted per-zone. They are **informational only** and are NOT applied to any mob's rate calculation.
+See the [changelog](CHANGELOG.md) for new features, improvements, and fixes in each release.
 
-**Credit/debit system** (prevents double-counting):
-1. When 0x00D2 creates a new kill record WITHOUT a prior defeat message (msg_id=6), it's a distant kill with drops. **Grant 1 credit** (`tracker.distant_kill_credits++`).
-2. When msg_id=37 arrives: if credits > 0, **consume 1 credit** (this kill was already tracked via 0x00D2). If credits = 0, **record as missed kill** in the `missed_kills` database table.
-3. Credits reset on zone change.
+---
 
-**Why the math works regardless of packet ordering**: The server processes mob death in order: `DropItems()` (sends 0x00D2) then `DistributeExperiencePoints()` (sends msg_id=37). Even if packets arrive interleaved for multiple simultaneous kills, the NET credit balance always equals the correct count because every distant-kill-with-drops produces exactly one 0x00D2 and one msg_id=37.
+## ![Thanks and credits](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=Thanks+and+credits&letterSpacing=0.5px&weight=700)
 
-**Drop rate formulas:**
-```
-nearby_kills = total_kills - distant_kills
-nearby_rate = nearby_drops / nearby_kills * 100      (unbiased — main rate, white text)
-combined_rate = all_drops / total_kills * 100         (biased — includes distant, blue text)
-```
+- **Thorny** — The original slot-analysis concept, ideas for drop-order tracking and chest detection, and ongoing feedback.
+- **Chihiro** — Suggestions and bug reports that help improve LootScope.
+- **The Ashita team** — atom0s, Thorny, and the [Ashita community](https://discord.gg/Ashita).
 
-The **nearby rate** is the primary statistic — it only counts kills where you witnessed the defeat (msg_id=6), giving an unbiased sample. The **combined rate** includes distant-with-drops kills for reference, but is biased upward because distant kills without drops are invisible at the per-mob level.
+## ![License](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=500&height=42&lines=License&letterSpacing=0.5px&weight=700)
 
-**Why the selection bias matters**: Imagine 100 distant kills. 30 drop loot (visible via 0x00D2), 70 drop nothing (invisible per-mob). If you count all 30 as kills, the rate looks like 30/30 = 100%. The combined rate (30/30) is better than nothing but still inflated. Only the nearby rate from witnessed kills is truly unbiased.
-
-## Other Edge Cases
-
-### Addon Reload Mid-Treasure Pool
-
-If LootScope is reloaded while items are still in the treasure pool, `scan_pool()` reads the client's active pool slots and attempts to reconnect each item with its existing database record via `find_pending_drop()`. Successfully reconnected items continue tracking normally with no impact on Statistics. Items that can't be matched (e.g., the original kill record was from a previous addon session) are created as `late_join` stubs -- they appear in Live Feed but do not create new kill or drop records, so Statistics are not inflated.
-
-### Late Loot (Zoning In After a Kill)
-
-When a player zones into an area where party members have active loot pools, the client receives 0x00D2 packets with `is_old=1` (pool refresh). LootScope handles these the same way as addon reload: it first tries to reconnect with existing database records, and falls back to `late_join` stubs if no match is found. Late-join items are visible in Live Feed but do not affect Statistics kill counts or drop rates.
-
-## Multi-Boxing / Multi-Server
-
-LootScope is fully safe for multi-boxing. Each Ashita instance detects the logged-in character name and opens a separate database. Two characters farming simultaneously will never conflict, even if using the same Ashita directory.
-
-Different private servers with the same character name will also get separate databases (server ID is included in the folder path).
-
-## Export
-
-CSV export path: `config/addons/lootscope/exports/lootscope_<CharName>_YYYYMMDD_HHMMSS.csv`
-
-Export options:
-- **Export All**: Exports every kill and drop to CSV (available from the Export tab)
-- **Advanced Export**: Filter window with auto-updating preview. Source filter: All, Field, Chest/Coffer, All BF, BCNM, HTBF, Dynamis, Voidwatch, Domain Invasion (uses content_type so mob kills inside instances are grouped correctly). Exports both `th_level` (server-confirmed) and `th_estimated` (gear-based) columns. Additional filters: zone, mob name, TH level, date range, Vana'diel time, moon phase, weather, item, status, winner, and more. Discrete filter changes (dropdowns, sliders) update instantly; text inputs debounce for 0.5 seconds.
-
-## File Structure
-
-```
-lootscope/
-  lootscope.lua   -- Main addon: metadata, events, commands, CSV export
-  db.lua          -- SQLite schema, migrations, queries, dirty-flag caching, transaction batching
-  tracker.lua     -- Packet parsing (0x0028/0x0029/0x002A/0x001E/0x001F/0x0020/0x0053/0x005B/0x005C/0x0075/0x0034/0x00D2/0x00D3), content detection, TH gear scanning, weather scan, DAT lookup, credit system, drop order tracking, Voidwatch Pyxis loot + Wildskeeper Reive loot + buff detection
-  analysis.lua    -- Statistical engine: Wilson CI, Poisson Binomial, co-occurrence, shared slot detection, battlefield drop structure, union-find inferred slots
-  datreader.lua   -- Zone dialog DAT reader: d_msg/event_msg parsing for HTBF battlefield name resolution
-  ui.lua          -- ImGui dashboard with tabs, compact mode, advanced export, TH management, nearby/combined rates, slot analysis (field + battlefield modes)
-  data/           -- Shared databases (auto-created)
-    th_items.db   -- TH gear profiles, items, and job traits (shared across characters)
-```
-
-## Data Storage
-
-Each character gets their own isolated database file, stored at `config/addons/lootscope/<CharName>_<ServerId>/lootscope.db` (SQLite with WAL mode). This matches Ashita's settings folder convention so the DB and settings live in the same folder. Prevents write contention when multi-boxing and keeps data separated across characters and servers.
-
-Database initialization is deferred until the character is fully logged in.
-
-### Tables
-
-**kills**: One row per mob killed (or chest/coffer opened)
-- `mob_name`, `mob_server_id`, `zone_id`, `zone_name`, `th_level`, `th_estimated` (gear-based TH estimate), `source_type`, `killer_id`, `killer_name`, `th_action_type`, `th_action_id`, `vana_weekday`, `vana_hour`, `moon_phase`, `moon_percent`, `weather`, `battlefield`, `level_cap`, `bf_name`, `bf_difficulty` (0=none, 1=VD, 2=D, 3=N, 4=E, 5=VE), `content_type` (Dynamis/Voidwatch/Domain Invasion/Wildskeeper/etc), `is_distant` (0=nearby, 1=distant kill with drops), `timestamp`
-
-**drops**: One row per item that appeared in the treasure pool (or mob gil drop)
-- `kill_id` (FK to kills), `pool_slot` (internal slot index used for lot matching; -1 for mob gil), `item_id` (65535 for gil), `item_name`, `quantity`, `won`, `lot_value`, `winner_id`, `winner_name`, `player_lot`, `player_action`, `drop_order` (arrival sequence per kill, -1 for pre-v1.1.1 data), `timestamp`
-
-**missed_kills**: One row per distant party kill with no mob identity and no drops (msg_id=37 with no matching credit). Informational only — not used in per-mob rate calculations.
-- `zone_id`, `zone_name`, `timestamp`
-
-**chest_events**: One row per chest/coffer interaction (gil or failure)
-- `zone_id`, `zone_name`, `container_type` (1=chest, 2=coffer), `result` (0=gil, 1-4=failures), `gil_amount`, `vana_weekday`, `vana_hour`, `moon_phase`, `moon_percent`, `weather`, `timestamp`
-
-**battlefield_sessions**: One row per BCNM entry (for reconnect on addon reload)
-- `battlefield_name`, `zone_id`, `zone_name`, `level_cap`, `entered_at`, `exited_at`
-- Stale sessions (older than 4 hours with no exit) are auto-cleaned on addon load
-
-### Migrations
-
-The database schema evolves automatically. Each migration checks for missing columns/tables before applying.
-Old databases are upgraded transparently. Missing values default to -1 (time/weather/drop_order) or 0 (IDs/TH).
-
-### TH Items Database
-
-Shared (not per-character) database at `data/th_items.db` inside the addon folder. Contains TH gear profiles, items, and job traits. Pre-populated with a "Retail" profile on first run. Supports custom profiles for private servers.
-
-## Version History
-
-See [CHANGELOG.md](CHANGELOG.md) for the full version history.
-
-## Slot Analysis Methodology
-
-See [SLOT_ANALYSIS.md](SLOT_ANALYSIS.md) for the statistical methodology behind the Slot Analysis tab — model assumptions, method choices, and alternatives considered.
-
-## Thanks
-
-- **Thorny** - Slot Analysis concept, drop order tracking idea, outgoing 0x1A chest pre-identification approach, and ongoing feedback
-- **Chihiro** - Many suggestions and bug reports!
-- **Ashita Team** - atom0s, thorny, and the [Ashita Discord](https://discord.gg/Ashita) community
-
-## License
-
-MIT License - See LICENSE file
+**LootScope is free and open source under the [MIT License](LICENSE).**

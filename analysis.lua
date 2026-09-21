@@ -1,25 +1,10 @@
---[[
-    LootScope v1.4.2 - Slot Analysis Engine
-    
-    Statistical computation for drop slot probability analysis.
-    Provides Wilson score confidence intervals, Poisson Binomial
-    distribution, co-occurrence testing, and shared slot detection.
-
-    Accepts db.conn and content_type_map via analysis.init(db_conn, ct_map),
-    owns all analysis SQL,
-    and returns pre-computed result tables for ui.lua to render.
-
-    Author: SQLCommit
-    Version: 1.4.2
-]]--
+-- Slot probability, confidence intervals and co-occurrence analysis. Return cached results for rendering.
 
 require 'common';
 
 local analysis = {};
 
--------------------------------------------------------------------------------
 -- Constants
--------------------------------------------------------------------------------
 local Z_95                    = 1.96;    -- 95% confidence z-score
 local GIL_ITEM_ID            = 65535;   -- excluded from all analysis
 local MIN_KILLS_CI            = 30;     -- minimum kills for CI display
@@ -30,15 +15,13 @@ local MIN_ITEM_DROPS_PAIR     = 5;      -- minimum drops per item in a pair
 analysis.MIN_KILLS_CI           = MIN_KILLS_CI;
 analysis.MIN_KILLS_COOCCURRENCE = MIN_KILLS_COOCCURRENCE;
 
--------------------------------------------------------------------------------
 -- Module State
--------------------------------------------------------------------------------
 local conn = nil;
 local cache = {};  -- keyed by composite filter string
 
 -- Fallbacks used if analysis.init() is never called. Must match db.lua's maps exactly.
-local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper', [13] = 'Einherjar', [14] = 'Nyzul', [15] = 'Salvage', [16] = 'Limbus', [17] = 'Vagary', [18] = 'Legion', [19] = 'Assault', [20] = 'Walk of Echoes', [21] = 'Skirmish', [22] = 'Meeble Burrows', [23] = 'Odyssey' };
-local instance_in_sql = "('Omen', 'Ambuscade', 'Sortie', 'Dynamis', 'Einherjar', 'Nyzul', 'Salvage', 'Limbus', 'Vagary', 'Legion', 'Assault', 'Walk of Echoes', 'Skirmish', 'Meeble Burrows', 'Odyssey')";
+local content_type_map = { [4] = 'Omen', [5] = 'Ambuscade', [6] = 'Sortie', [7] = 'Dynamis', [10] = 'Voidwatch', [11] = 'Domain Invasion', [12] = 'Wildskeeper', [13] = 'Einherjar', [14] = 'Nyzul', [15] = 'Salvage', [16] = 'Limbus', [17] = 'Vagary', [18] = 'Legion', [19] = 'Assault', [20] = 'Walk of Echoes', [21] = 'Skirmish', [22] = 'Meeble Burrows', [23] = 'Odyssey', [25] = 'Colonization Reive', [26] = 'Lair Reive' };
+local instance_in_sql = "('Omen', 'Sortie', 'Dynamis', 'Einherjar', 'Nyzul', 'Salvage', 'Vagary', 'Assault', 'Walk of Echoes', 'Skirmish', 'Meeble Burrows', 'Odyssey')";  -- Match db.INSTANCE_CONTENT_TYPES; exclude feed-only contents and battlefields.
 
 function analysis.init(db_conn, ct_map, inst_sql)
     conn = db_conn;
@@ -50,9 +33,7 @@ function analysis.invalidate()
     cache = {};
 end
 
--------------------------------------------------------------------------------
 -- Pure Lua Statistical Functions
--------------------------------------------------------------------------------
 
 --- Wilson score confidence interval for a binomial proportion.
 -- @param successes number of observed successes
@@ -133,12 +114,27 @@ local function poisson_binomial_pmf(probs)
     return dp;
 end
 
--------------------------------------------------------------------------------
 -- SQL WHERE Clause Builder
 -- Replicates db.lua's filter logic for all source_filter values.
 -- Returns (where_clause, bind_params_array) for kills table alias 'k'.
 -- content_type_map and instance_in_sql declared above init() for correct upvalue capture.
--------------------------------------------------------------------------------
+
+-- Prepare a statement and bind its parameters.
+local function add_mob_zone(parts, params, mob_name, zone_id)
+    parts[#parts + 1]   = 'k.mob_name = ?';
+    params[#params + 1] = mob_name;
+    parts[#parts + 1]   = 'k.zone_id = ?';
+    params[#params + 1] = zone_id;
+end
+
+local function prepare_bound(conn, sql, params)
+    local stmt = conn:prepare(sql);
+    if (stmt == nil) then return nil; end
+    if (#params > 0) then
+        stmt:bind_values(unpack(params));
+    end
+    return stmt;
+end
 
 local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
     local parts = {};
@@ -154,27 +150,26 @@ local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
         parts[#parts + 1] = 'k.bf_difficulty = ?';
         params[#params + 1] = level_cap;
     elseif (source_filter == 2) then
-        -- BCNM: match by battlefield name + zone + source_type=3 + bf_difficulty=0
-        -- Must match get_all_mob_stats(2) which filters bf_difficulty = 0
-        parts[#parts + 1] = "COALESCE(k.battlefield, 'Unknown BCNM') = ?";
+        -- Match Statistics by battlefield name, including coffers and crates.
+        -- Trial denominators are calculated separately by get_all_mob_stats.
+        parts[#parts + 1] = "COALESCE(NULLIF(k.battlefield, ''), NULLIF(k.bf_name, ''), 'Unknown BCNM') = ?";
         params[#params + 1] = mob_name;
         parts[#parts + 1] = 'k.zone_id = ?';
         params[#params + 1] = zone_id;
-        parts[#parts + 1] = 'k.source_type = 3';
+        parts[#parts + 1] = 'k.source_type IN (2, 3)';
         parts[#parts + 1] = 'k.bf_difficulty = 0';
-        if (level_cap ~= nil) then
+        parts[#parts + 1] = "COALESCE(k.content_type, '') IN ('', 'BCNM')";   -- an instance's crate is not a BCNM
+        -- Treat NULL and zero as the same uncapped value; callers normalize absent caps to zero.
+        if (level_cap ~= nil and level_cap > 0) then
             parts[#parts + 1] = 'k.level_cap = ?';
             params[#params + 1] = level_cap;
         else
-            parts[#parts + 1] = 'k.level_cap IS NULL';
+            parts[#parts + 1] = '(k.level_cap IS NULL OR k.level_cap = 0)';
         end
     elseif (content_type_map[source_filter] ~= nil) then
         -- Content types (all entries in content_type_map: instances + events)
         local ct = content_type_map[source_filter];
-        parts[#parts + 1] = 'k.mob_name = ?';
-        params[#params + 1] = mob_name;
-        parts[#parts + 1] = 'k.zone_id = ?';
-        params[#params + 1] = zone_id;
+        add_mob_zone(parts, params, mob_name, zone_id);
         parts[#parts + 1] = "COALESCE(k.content_type, '') = ?";
         params[#params + 1] = ct;
     elseif (source_filter == 8) then
@@ -191,25 +186,18 @@ local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
         parts[#parts + 1] = '((k.source_type = 3 AND k.bf_difficulty = 0) OR k.bf_difficulty > 0)';
     elseif (source_filter == 9) then
         -- All Instances
-        parts[#parts + 1] = 'k.mob_name = ?';
-        params[#params + 1] = mob_name;
-        parts[#parts + 1] = 'k.zone_id = ?';
-        params[#params + 1] = zone_id;
+        add_mob_zone(parts, params, mob_name, zone_id);
         parts[#parts + 1] = "COALESCE(k.content_type, '') IN " .. instance_in_sql;
     elseif (source_filter == 1) then
         -- Chest/Coffer: must match get_all_mob_stats(1) which filters source_type IN (1,2)
-        parts[#parts + 1] = 'k.mob_name = ?';
-        params[#params + 1] = mob_name;
-        parts[#parts + 1] = 'k.zone_id = ?';
-        params[#params + 1] = zone_id;
+        add_mob_zone(parts, params, mob_name, zone_id);
         parts[#parts + 1] = 'k.source_type IN (1, 2)';
+        -- open-world only; instanced containers belong to their own content view (see db.lua)
+        parts[#parts + 1] = "COALESCE(k.content_type, '') = ''";
     else
         -- Field (value 0): exclude content-tagged kills AND non-mob source types
         -- Must match db.get_mob_stats() and get_all_mob_stats() Field branch exactly
-        parts[#parts + 1] = 'k.mob_name = ?';
-        params[#params + 1] = mob_name;
-        parts[#parts + 1] = 'k.zone_id = ?';
-        params[#params + 1] = zone_id;
+        add_mob_zone(parts, params, mob_name, zone_id);
         parts[#parts + 1] = 'k.source_type = 0';
         parts[#parts + 1] = "COALESCE(k.content_type, '') = ''";
     end
@@ -221,9 +209,7 @@ local function build_kill_where(mob_name, zone_id, source_filter, level_cap)
     return table.concat(parts, ' AND '), params;
 end
 
--------------------------------------------------------------------------------
 -- Query: Items per kill (for histogram + empty rate)
--------------------------------------------------------------------------------
 local function query_items_per_kill(mob_name, zone_id, source_filter, level_cap)
     local where, params = build_kill_where(mob_name, zone_id, source_filter, level_cap);
 
@@ -233,11 +219,8 @@ local function query_items_per_kill(mob_name, zone_id, source_filter, level_cap)
         .. ' WHERE ' .. where
         .. ' GROUP BY k.id';
 
-    local stmt = conn:prepare(sql);
+    local stmt = prepare_bound(conn, sql, params);
     if (stmt == nil) then return {}; end
-    if (#params > 0) then
-        stmt:bind_values(unpack(params));
-    end
 
     local results = {};
     for row in stmt:nrows() do
@@ -247,9 +230,7 @@ local function query_items_per_kill(mob_name, zone_id, source_filter, level_cap)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Query: Co-occurrence pairs (self-join on drops)
--------------------------------------------------------------------------------
 local function query_cooccurrence(mob_name, zone_id, source_filter, level_cap)
     local where, params = build_kill_where(mob_name, zone_id, source_filter, level_cap);
 
@@ -266,11 +247,8 @@ local function query_cooccurrence(mob_name, zone_id, source_filter, level_cap)
         GROUP BY d1.item_id, d2.item_id
     ]];
 
-    local stmt = conn:prepare(sql);
+    local stmt = prepare_bound(conn, sql, params);
     if (stmt == nil) then return {}; end
-    if (#params > 0) then
-        stmt:bind_values(unpack(params));
-    end
 
     local results = {};
     for row in stmt:nrows() do
@@ -286,9 +264,7 @@ local function query_cooccurrence(mob_name, zone_id, source_filter, level_cap)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Query: Drop arrival ordering (uses drop_order column)
--------------------------------------------------------------------------------
 local function query_drop_ordering(mob_name, zone_id, source_filter, level_cap)
     local where, params = build_kill_where(mob_name, zone_id, source_filter, level_cap);
 
@@ -308,11 +284,8 @@ local function query_drop_ordering(mob_name, zone_id, source_filter, level_cap)
         GROUP BY d1.item_id, d2.item_id
     ]];
 
-    local stmt = conn:prepare(sql);
+    local stmt = prepare_bound(conn, sql, params);
     if (stmt == nil) then return {}; end
-    if (#params > 0) then
-        stmt:bind_values(unpack(params));
-    end
 
     local results = {};
     for row in stmt:nrows() do
@@ -330,9 +303,7 @@ local function query_drop_ordering(mob_name, zone_id, source_filter, level_cap)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Query: Drop order position distribution per item
--------------------------------------------------------------------------------
 local function query_drop_positions(mob_name, zone_id, source_filter, level_cap)
     local where, params = build_kill_where(mob_name, zone_id, source_filter, level_cap);
 
@@ -346,11 +317,8 @@ local function query_drop_positions(mob_name, zone_id, source_filter, level_cap)
         ORDER BY d.item_id, d.drop_order
     ]];
 
-    local stmt = conn:prepare(sql);
+    local stmt = prepare_bound(conn, sql, params);
     if (stmt == nil) then return {}; end
-    if (#params > 0) then
-        stmt:bind_values(unpack(params));
-    end
 
     -- Group by item_id
     local items = {};
@@ -372,9 +340,7 @@ local function query_drop_positions(mob_name, zone_id, source_filter, level_cap)
     return results;
 end
 
--------------------------------------------------------------------------------
 -- Main Computation Function
--------------------------------------------------------------------------------
 
 --- Compute all slot analysis statistics for a given mob.
 -- @param mob_name string mob name (or battlefield name for BCNM/HTBF)
@@ -396,10 +362,8 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
 
     local items = mob_stats.items or T{};
 
-    ---------------------------------------------------------------------------
     -- Query kill count from DB (authoritative — mob_stats.kills may include
     -- chest_events that aren't in kills table).
-    ---------------------------------------------------------------------------
     local ipk_raw = query_items_per_kill(mob_name, zone_id, source_filter, level_cap);
     local max_observed = 0;
     local empty_observed_count = 0;
@@ -421,17 +385,17 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
     local empty_observed_rate = empty_observed_count / kills;
     local avg_items_per_kill = total_items_sum / kills;
 
-    ---------------------------------------------------------------------------
     -- Section 1: Confidence Intervals
-    ---------------------------------------------------------------------------
     local confidence = T{};
     local item_rates = {};  -- for Poisson Binomial and empty rate
     local item_drops_map = {};  -- item_id -> drops count (for co-occurrence expected)
 
     for _, item in ipairs(items) do
         if (item.item_id ~= GIL_ITEM_ID and not item.is_chest_event) then
-            -- Use nearby drops only — distant kills have partial drop visibility
-            local drops = item.nearby_times_dropped or item.times_dropped or 0;
+            -- Use nearby kills yielding the item as successes, never drop-row counts.
+            -- Repeated items on one kill are one success; distant kills have incomplete visibility.
+            local drops = item.nearby_kills_with_drop or item.nearby_times_dropped or item.times_dropped or 0;
+            if (drops > kills) then drops = kills; end   -- successes can never exceed trials
             if (drops > 0) then
                 local rate = drops / kills;
                 local ci_center, ci_lower, ci_upper = wilson_ci(drops, kills);
@@ -455,9 +419,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         end
     end
 
-    ---------------------------------------------------------------------------
     -- Section 2: Slot Count Estimation
-    ---------------------------------------------------------------------------
     local rate_sum = 0;
     for i = 1, #item_rates do
         rate_sum = rate_sum + item_rates[i];
@@ -509,9 +471,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         slot_estimate.items_std_dev = std_dev;
     end
 
-    ---------------------------------------------------------------------------
     -- Section 3: Items-Per-Kill Distribution
-    ---------------------------------------------------------------------------
     -- Build observed histogram
     local dist_bins = {};
     for i = 1, #ipk_raw do
@@ -534,9 +494,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
             diff     = obs_rate - exp_rate,
         });
     end
-    ---------------------------------------------------------------------------
     -- Section 4: Co-occurrence Analysis
-    ---------------------------------------------------------------------------
     local cooccurrence = T{};
     local shared_slot_candidates = T{};
     if (kills >= 2) then  -- need at least 2 kills for co-occurrence to be meaningful
@@ -597,9 +555,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
             end
         end
 
-        -----------------------------------------------------------------------
         -- Section 5: Shared Slot Candidates (items that NEVER co-occur)
-        -----------------------------------------------------------------------
         -- Check all pairs of items that both have enough drops but zero co-occurrence
         local item_list = {};
         for _, item in ipairs(items) do
@@ -653,9 +609,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         end
     end
 
-    ---------------------------------------------------------------------------
     -- Section 6: Drop Position Data
-    ---------------------------------------------------------------------------
     local drop_positions = T{};
 
     if (kills >= 2) then  -- need at least 2 kills for positions to be meaningful
@@ -665,10 +619,8 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         end
     end
 
-    ---------------------------------------------------------------------------
     -- Section 5b: Inferred Battlefield Drop Table (union-find grouping)
     -- Uses shared_slot_candidates (Section 5) + confidence data (Section 1)
-    ---------------------------------------------------------------------------
     local inferred_slots = T{};
 
     if (is_battlefield and kills >= 2 and #confidence > 0) then
@@ -736,9 +688,7 @@ function analysis.compute(mob_name, zone_id, source_filter, level_cap, mob_stats
         table.sort(inferred_slots, function(a, b) return a.total_rate > b.total_rate; end);
     end
 
-    ---------------------------------------------------------------------------
     -- Assemble result
-    ---------------------------------------------------------------------------
     local result = {
         confidence           = confidence,
         slot_estimate        = slot_estimate,
